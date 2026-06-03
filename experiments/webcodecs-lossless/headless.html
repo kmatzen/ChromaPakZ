@@ -49,6 +49,38 @@ window.__runWebM = async (W=256, H=256, N=30) => {
     rgbDecoded: dec.rgb?dec.rgb.length:0, trackInfo, metadata:dec.metadata };
 };
 
+// What pixel format does this engine's VP9 decoder actually hand back? (explains readback bugs)
+window.__decodeFormatProbe = async (webmB64) => {
+  const webm = Uint8Array.from(atob(webmB64), c=>c.charCodeAt(0));
+  const dm = demux(webm); const thi = dm.metadata.depth.trackHi;
+  const frames = dm.frames.filter(f=>f.track===thi).sort((a,b)=>a.timeMs-b.timeMs);
+  return await new Promise((res,rej)=>{
+    let info=null;
+    const dec=new VideoDecoder({ output:f=>{ if(!info) info={ format:f.format, cw:f.codedWidth, ch:f.codedHeight,
+        colorSpace:f.colorSpace }; f.close(); }, error:e=>rej(String(e)) });
+    dec.configure({ codec:'vp09.00.10.08', codedWidth:dm.metadata.width, codedHeight:dm.metadata.height });
+    dec.decode(new EncodedVideoChunk({ type:'key', timestamp:0, data:frames[0].data }));
+    dec.flush().then(()=>{ dec.close(); res(info); }).catch(rej);
+  });
+};
+window.__caps = async () => {
+  const out = { hasEncoder:'VideoEncoder' in self, hasDecoder:'VideoDecoder' in self,
+                secure: self.isSecureContext, codecs:{} };
+  if(!out.hasEncoder) return out;
+  const tests = {
+    'vp9-8bit-quant':  {codec:'vp09.00.10.08', bitrateMode:'quantizer'},
+    'vp9-8bit-vbr':    {codec:'vp09.00.10.08'},
+    'vp9-10bit-quant': {codec:'vp09.02.10.10', bitrateMode:'quantizer'},
+    'av1-8bit-quant':  {codec:'av01.0.04M.08', bitrateMode:'quantizer'},
+    'h264-8bit-quant': {codec:'avc1.42001f',   bitrateMode:'quantizer'},
+  };
+  for(const [k,cfg] of Object.entries(tests)){
+    try{ const s=await VideoEncoder.isConfigSupported({width:256,height:256,...cfg});
+      out.codecs[k]= s.supported===true; }
+    catch(e){ out.codecs[k]='err:'+(e.name||String(e)); }
+  }
+  return out;
+};
 window.__runProbe = async (W=256, H=256) => runProbe(makeDepth(W,H), W, H);
 window.__runProbeGOP = async (W=256, H=256, N=30) => runProbeGOP(W,H,N);
 window.__runProbe10GOP = async (W=256, H=256, N=30) => runProbe10GOP(W,H,N);
