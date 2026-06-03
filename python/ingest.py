@@ -1,4 +1,4 @@
-"""depthcodec ingestion — turn real RGBD data into a depthcodec .webm.
+"""chromapakz ingestion — turn real RGBD data into a chromapakz .webm.
 
 Loads depth (EXR float / .npy / .npz / 16-bit PNG-TIFF / raw) and optional RGB
 (image sequence / video / array), applies inverse-depth quantization (auto near/far
@@ -20,7 +20,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-import depthcodec as dc
+import chromapakz as dc
 import webm_inspect
 
 
@@ -178,7 +178,7 @@ def print_report(stats):
 
 def _main(argv):
     import argparse
-    ap = argparse.ArgumentParser(description="Ingest RGBD data into a depthcodec .webm")
+    ap = argparse.ArgumentParser(description="Ingest RGBD data into a chromapakz .webm")
     ap.add_argument("--depth", help="depth file or glob (.exr/.npy/.npz/.png/.tif/.raw)")
     ap.add_argument("--rgb", help="rgb file/glob/video")
     ap.add_argument("--near", type=float)

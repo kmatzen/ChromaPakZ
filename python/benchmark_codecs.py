@@ -1,4 +1,4 @@
-"""Head-to-head lossless-depth compression benchmark: depthcodec vs every credible alternative.
+"""Head-to-head lossless-depth compression benchmark: chromapakz vs every credible alternative.
 
 Same uint16 depth fed to each codec; reports bits/pixel. Run from python/:
     python benchmark_codecs.py
@@ -7,7 +7,7 @@ Requires ffmpeg (ffv1/x265/x264), Pillow (PNG-16); JPEG-XL/AV1 noted if absent.
 import os, subprocess, tempfile, lzma, zlib, bz2, sys
 import numpy as np
 sys.path.insert(0, ".")
-import depthcodec as dc, webm_inspect
+import chromapakz as dc, webm_inspect
 
 NPZ = "sample_rgbd.npz"
 if not os.path.exists(NPZ):
@@ -53,7 +53,7 @@ def png16_size(codes16):
     return total
 
 
-def depthcodec_size(c16, levels):
+def chromapakz_size(c16, levels):
     data = dc.encode_depth(c16, fps=30, near=near, far=far, levels=levels)
     ts = webm_inspect.track_sizes(data)
     return sum(t["bytes"] for t in ts.values() if t["name"].startswith("depth"))
@@ -63,7 +63,7 @@ def bench(levels, label):
     bits = levels.bit_length() - 1
     c16 = codes(levels)
     rows = []
-    rows.append(("depthcodec (VP9 lossless, tri-fold 8+8, inter)", depthcodec_size(c16, levels), "video"))
+    rows.append(("chromapakz (VP9 lossless, tri-fold 8+8, inter)", chromapakz_size(c16, levels), "video"))
     s, _ = ffmpeg_size(c16, ["-c:v", "ffv1", "-level", "3", "-g", "1"]); rows.append(("FFV1 (16-bit, intra)", s, "intra"))
     rows.append(("PNG-16 per frame (intra)", png16_size(c16), "intra"))
     if bits <= 12:
@@ -85,9 +85,9 @@ def bench(levels, label):
     rows.append(("raw uint16 (uncompressed)", len(raw), "—"))
 
     print(f"\n=== {label}: {W}×{H}×{N}, near={near:.2f} far={far:.2f}, ~{bits}-bit grid, {100*valid.mean():.0f}% valid ===")
-    print(f"{'codec':<48}{'bpp':>9}   {'vs depthcodec':>14}")
+    print(f"{'codec':<48}{'bpp':>9}   {'vs chromapakz':>14}")
     print("-" * 76)
-    base = next(b for n, b, _ in rows if n.startswith("depthcodec"))
+    base = next(b for n, b, _ in rows if n.startswith("chromapakz"))
     for name, b, kind in rows:
         if b is None:
             print(f"{name:<48}{'—':>9}   (unavailable)")

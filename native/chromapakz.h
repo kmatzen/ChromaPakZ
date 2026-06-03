@@ -1,8 +1,8 @@
-// depthcodec native C ABI — VP9-lossless RGBD-in-WebM, shared by C++ and Python (ctypes).
+// chromapakz native C ABI — VP9-lossless RGBD-in-WebM, shared by C++ and Python (ctypes).
 // All functions return 0 on success, nonzero on error. Buffers returned via out-params are
 // malloc'd and must be released with dc_free().
-#ifndef DEPTHCODEC_H
-#define DEPTHCODEC_H
+#ifndef CHROMAPAKZ_H
+#define CHROMAPAKZ_H
 #include <stddef.h>
 #include <stdint.h>
 
@@ -10,14 +10,14 @@
 extern "C" {
 #endif
 
-// Encode a uint16 depth sequence (row-major, W*H per frame, N frames) into a depthcodec .webm.
+// Encode a uint16 depth sequence (row-major, W*H per frame, N frames) into a chromapakz .webm.
 // Depth codes are carried bit-exactly (triangle-fold 8+8 → two VP9 lossless inter tracks).
 // near/far/levels are stored as the inverse-depth quantization contract (metadata only).
 // levels is the number of quantization steps (65536 == full 16-bit; pass 0 for the default).
 int dc_encode_depth(const uint16_t* depth, int W, int H, int N, int fps,
                     double near_, double far_, int levels, uint8_t** out, size_t* out_len);
 
-// Read the depthcodec header from a .webm (works on files made by any depthcodec impl).
+// Read the chromapakz header from a .webm (works on files made by any chromapakz impl).
 int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
              double* near_, double* far_, int* levels, int* has_rgb);
 

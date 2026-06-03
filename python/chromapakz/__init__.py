@@ -26,7 +26,7 @@ def _find_lib():
     """Locate the native core: bundled in the installed package, else a CMake dev build."""
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(os.path.dirname(here))           # python/chromapakz -> python -> repo
-    pats = ("_core*.so", "_core*.dylib", "_core*.pyd", "libchromapakz*.*", "libdepthcodec*.*")
+    pats = ("_core*.so", "_core*.dylib", "_core*.pyd", "libchromapakz*.*", "libchromapakz*.*")
     for d in (here, os.path.join(repo, "build"), os.path.join(repo, "native")):
         for pat in pats:
             hits = [h for h in sorted(glob.glob(os.path.join(d, pat)))

@@ -1,4 +1,4 @@
-// depthcodec: RGB + bit-exact 16-bit depth in one WebM, encode+decode in-browser, no WASM.
+// chromapakz: RGB + bit-exact 16-bit depth in one WebM, encode+decode in-browser, no WASM.
 // Depth path (proven in experiments/): inverse-depth uint16 → triangle-fold 8+8 →
 // two VP9 lossless inter-coded tracks. RGB is a normal VP9 track (track 1 → legacy fallback).
 import { mux, demux } from './webm.js';
