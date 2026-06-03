@@ -1,39 +1,40 @@
-// chromapakz: RGB + bit-exact 16-bit depth in one WebM, encode+decode in-browser, no WASM.
-// Depth path (proven in experiments/): inverse-depth uint16 → triangle-fold 8+8 →
-// two VP9 lossless inter-coded tracks. RGB is a normal VP9 track (track 1 → legacy fallback).
-import { mux, demux } from './webm.js';
+// chromapakz: RGB + bit-exact lossless signals in one WebM (depth, object IDs, normals, …).
+// API reference: docs/API.md
+import { mux, demux, createStreamMux, createStreamDemux, concatChunks } from './webm.js';
+import {
+  LEVELS_FULL,
+  quantizeInverseDepth,
+  dequantizeInverseDepth,
+  autoNearFar,
+  triFoldPack,
+  triFoldUnpack,
+} from './chromapakz-core.js';
+import {
+  planSignals,
+  buildTracksFromPlan,
+  buildFileMetadata,
+  defaultDepthSpec,
+  normalizeMetadata,
+  u16FromFramePayload,
+  materializeSignal,
+  blocksByTime,
+  slotKeysForMetadata,
+  isSlotComplete,
+  collectFrameInputs,
+  SIGNAL_DEPTH,
+  SIGNAL_RAW_U16,
+} from './signals.js';
 
-const VP9 = 'vp09.00.10.08';
-const FOLD_BITS = 8;
-
-// ── quantization: float depth/disparity → uint16, precision packed by inverse-depth ──
-// Code 0 is reserved for "invalid" (z<=0 / NaN). Valid codes span 1..65535.
-export const LEVELS_FULL = 65536;   // full 16-bit (default); fewer levels = coarser grid
-
-export function quantizeInverseDepth(z, near, far, levels=LEVELS_FULL){
-  const M=levels-2, maxc=levels-1, out=new Uint16Array(z.length), a=1/near, b=1/far, inv=1/(a-b);
-  for(let i=0;i<z.length;i++){ const v=z[i];
-    if(!(v>0)) { out[i]=0; continue; }
-    let q=Math.round((1/v - b)*inv*M)+1;              // map to 1..levels-1
-    out[i]=q<1?1:(q>maxc?maxc:q);
-  }
-  return out;
-}
-export function dequantizeInverseDepth(d, near, far, levels=LEVELS_FULL){
-  const M=levels-2, out=new Float32Array(d.length), a=1/near, b=1/far;
-  for(let i=0;i<d.length;i++){ const c=d[i];
-    out[i]= c===0 ? NaN : 1/(((c-1)/M)*(a-b)+b);
-  }
-  return out;
-}
-
-// ── triangle-fold 8+8 (reversible; keeps each 8-bit plane spatially coherent) ──
-export function triFoldPack(d){ const hi=new Uint8Array(d.length), lo=new Uint8Array(d.length);
-  for(let i=0;i<d.length;i++){ const h=d[i]>>FOLD_BITS, l=d[i]&0xff; hi[i]=h; lo[i]=(h&1)?(255-l):l; }
-  return {hi,lo}; }
-export function triFoldUnpack(hi,lo){ const d=new Uint16Array(hi.length);
-  for(let i=0;i<d.length;i++){ const h=hi[i], l=(h&1)?(255-lo[i]):lo[i]; d[i]=(h<<FOLD_BITS)|l; }
-  return d; }
+export {
+  LEVELS_FULL,
+  quantizeInverseDepth,
+  dequantizeInverseDepth,
+  autoNearFar,
+  triFoldPack,
+  triFoldUnpack,
+  SIGNAL_DEPTH,
+  SIGNAL_RAW_U16,
+};
 
 // ── WebCodecs helpers ──
 function lumaFrame(plane, W, H, tsUs){
@@ -46,9 +47,6 @@ function rgbaFrame(rgba, W, H, tsUs){
   return new VideoFrame(rgba,{ format:'RGBA', codedWidth:W, codedHeight:H, timestamp:tsUs });
 }
 async function readLuma(frame, W, H){
-  // Read luma = plane 0, which holds Y for I420 (Chromium) and NV12 (WebKit/Safari) alike.
-  // Firefox decodes VP9 to colour-converted BGRX (studio-range) — luma is not bit-exact
-  // recoverable there, and its copyTo cannot convert formats; Firefox decode is unsupported.
   const dst=new Uint8Array(frame.allocationSize()); const lay=await frame.copyTo(dst); const y=lay[0];
   const out=new Uint8Array(W*H);
   for(let r=0;r<H;r++) out.set(dst.subarray(y.offset+r*y.stride, y.offset+r*y.stride+W), r*W);
@@ -59,70 +57,405 @@ async function readRGBA(frame, W, H){
   return buf;
 }
 
-// keyEvery: keyframe interval in frames. Lossless depth keeps a single keyframe (max compression);
-// the RGB track uses a periodic interval so its Cues land on decodable points and <video> can seek.
-async function encodeTrack({ srcs, makeFrame, lossless, W, H, fps, bitrate, keyEvery=Infinity }){
-  const chunks=[]; const usPerFrame=1e6/fps;
+function createTrackEncoder({ makeFrame, lossless, W, H, fps, bitrate, keyEvery=Infinity }){
+  let i=0; const usPerFrame=1e6/fps; const outQ=[]; let waitOut=null;
   const enc=new VideoEncoder({ output:(c)=>{ const data=new Uint8Array(c.byteLength); c.copyTo(data);
-    chunks.push({ key:c.type==='key', timeMs:Math.round(c.timestamp/1000), data }); }, error:e=>{ throw e; } });
-  const cfg={ codec:VP9, width:W, height:H, framerate:fps };
+    const chunk={ key:c.type==='key', timeMs:Math.round(c.timestamp/1000), data };
+    if(waitOut){ const w=waitOut; waitOut=null; w(chunk); } else outQ.push(chunk);
+  }, error:e=>{ throw e; } });
+  const cfg={ codec:'vp09.00.10.08', width:W, height:H, framerate:fps };
   if(lossless) cfg.bitrateMode='quantizer'; else cfg.bitrate=bitrate||2_000_000;
   enc.configure(cfg);
-  srcs.forEach((s,i)=>{ const f=makeFrame(s, i*usPerFrame); const isKey = i===0 || i%keyEvery===0;
-    enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); });
-  await enc.flush(); enc.close();
-  return chunks;
-}
-function decodeTrack(track, W, H, readFn){
-  return new Promise((res,rej)=>{ const out=[];
-    const dec=new VideoDecoder({ output:async f=>{ try{ out.push(await readFn(f,W,H)); } finally{ f.close(); } }, error:rej });
-    dec.configure({ codec:VP9, codedWidth:W, codedHeight:H });
-    [...track.frames].sort((a,b)=>a.timeMs-b.timeMs).forEach(fr=>
-      dec.decode(new EncodedVideoChunk({ type:fr.key?'key':'delta', timestamp:fr.timeMs*1000, data:fr.data })));
-    dec.flush().then(()=>{ dec.close(); res(out); }).catch(rej);
-  });
+  return {
+    async push(src){
+      const f=makeFrame(src, i*usPerFrame); const isKey=i===0 || i%keyEvery===0;
+      enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); i++;
+      if(outQ.length) return outQ.shift();
+      return new Promise(res=>{ waitOut=res; });
+    },
+    async close(){
+      await enc.flush(); enc.close();
+      const rest=outQ.splice(0);
+      if(waitOut){ const w=waitOut; waitOut=null; if(rest.length) w(rest.shift()); else w(null); }
+      return rest;
+    },
+  };
 }
 
-// ── public API ──
-// rgbFrames: array of RGBA Uint8Array (W*H*4) or null. depthU16: array of Uint16Array (W*H).
-// (Pass float depth through quantizeInverseDepth first, or pass {depthFloat, near, far}.)
-export async function encode({ W, H, fps=30, rgbFrames=null, depthU16=null, depthFloat=null, near=0.2, far=10, levels=LEVELS_FULL }){
-  if(!depthU16 && depthFloat) depthU16 = depthFloat.map(z=>quantizeInverseDepth(z, near, far, levels));
-  const N = depthU16 ? depthU16.length : rgbFrames.length;
-  const packed = depthU16 ? depthU16.map(triFoldPack) : null;
+function createTrackDecoder(W, H, readFn){
+  const queue=[]; let wait=null, err=null, closed=false;
+  const dec=new VideoDecoder({ output:async f=>{ try{
+    queue.push(await readFn(f,W,H));
+    if(wait){ const w=wait; wait=null; w(); }
+  } finally{ f.close(); } }, error:e=>{ err=e; if(wait){ const w=wait; wait=null; w(); } } });
+  dec.configure({ codec:'vp09.00.10.08', codedWidth:W, codedHeight:H });
+  return {
+    push(fr){
+      if(err) throw err;
+      if(closed) throw new Error('track decoder closed');
+      dec.decode(new EncodedVideoChunk({ type:fr.key?'key':'delta', timestamp:fr.timeMs*1000, data:fr.data }));
+    },
+    async next(){
+      if(err) throw err;
+      if(queue.length) return queue.shift();
+      if(closed) return null;
+      await new Promise(res=>{ wait=res; });
+      if(err) throw err;
+      return queue.length ? queue.shift() : null;
+    },
+    async close(){ await dec.flush(); dec.close(); closed=true;
+      if(wait){ wait(); wait=null; } },
+  };
+}
 
-  const frames=[]; const tracks=[];
-  if(rgbFrames){
-    tracks.push({ number:1, codecID:'V_VP9', name:'rgb', width:W, height:H });
-    const c=await encodeTrack({ srcs:rgbFrames, makeFrame:(s,ts)=>rgbaFrame(s,W,H,ts), lossless:false, W,H,fps,
-      keyEvery: Math.max(1, Math.round(fps)) });   // ~1s keyframe interval → seekable RGB
-    c.forEach(x=>frames.push({ track:1, ...x }));
+function resolveSignalSpecs({ signals, near, far, levels }){
+  if(signals?.length) return signals;
+  if(near !== undefined || far !== undefined) return [defaultDepthSpec(near, far, levels)];
+  return [];
+}
+
+function makeFrameReader({ meta, W, H, blocks }){
+  let i=0, shut=false;
+  const rgbDec={};
+  const sigDec={}; // id → { hi, lo }
+  const signals=meta.signals;
+
+  return {
+    get frameCount(){ return blocks.length; },
+    get meta(){ return meta; },
+
+    async readFrame(){
+      if(shut) throw new Error('decoder closed');
+      if(i>=blocks.length) return null;
+      const slot=blocks[i++];
+      const out={ rgb: null, signals: {} };
+
+      if(slot.rgb){
+        if(!rgbDec.dec) rgbDec.dec=createTrackDecoder(W,H,readRGBA);
+        rgbDec.dec.push(slot.rgb);
+        out.rgb=await rgbDec.dec.next();
+      }
+
+      for(const s of signals){
+        const hiKey=`${s.id}:hi`, loKey=`${s.id}:lo`;
+        if(!slot[hiKey]) continue;
+        if(!sigDec[s.id]) sigDec[s.id]={ hi: createTrackDecoder(W,H,readLuma), lo: createTrackDecoder(W,H,readLuma) };
+        sigDec[s.id].hi.push(slot[hiKey]);
+        sigDec[s.id].lo.push(slot[loKey]);
+        const hi=await sigDec[s.id].hi.next();
+        const lo=await sigDec[s.id].lo.next();
+        if(hi && lo) out.signals[s.id]=materializeSignal(triFoldUnpack(hi, lo), s);
+      }
+
+      if(out.signals.depth){
+        out.depthU16=out.signals.depth.u16;
+        if(out.signals.depth.float) out.depthFloat=out.signals.depth.float;
+      }
+      return out;
+    },
+
+    async close(){
+      if(shut) return;
+      shut=true;
+      if(rgbDec.dec) await rgbDec.dec.close();
+      for(const d of Object.values(sigDec)){
+        if(d.hi) await d.hi.close();
+        if(d.lo) await d.lo.close();
+      }
+    },
+
+    [Symbol.asyncIterator](){
+      const self=this;
+      return { async next(){
+        const frame=await self.readFrame();
+        return frame ? { value:frame, done:false } : { done:true };
+      }};
+    },
+  };
+}
+
+// ── streaming encode ──
+/**
+ * @param signals — e.g. [{ id:'depth', near, far }, { id:'objectId' }] or use legacy near/far for depth only
+ */
+export function createEncoder({ W, H, fps=30, signals=null, near, far, levels=LEVELS_FULL,
+  rgbKbps=2_000_000, onChunk=null }){
+  const specList=resolveSignalSpecs({ signals, near, far, levels });
+  let n=0, hasRgb=false;
+  let signalPlan=null;
+  let rgbEnc=null;
+  const sigEnc={}; // id → { hi, lo }
+  let streamMux=null, byteParts=null;
+  const muxFrames=[];
+  const rgbKeyEvery=Math.max(1, Math.round(fps));
+
+  function ensurePlan(){
+    if(signalPlan) return;
+    signalPlan=planSignals(specList, hasRgb);
   }
-  if(packed){
-    tracks.push({ number:2, codecID:'V_VP9', name:'depth-hi', width:W, height:H });
-    tracks.push({ number:3, codecID:'V_VP9', name:'depth-lo', width:W, height:H });
-    const chi=await encodeTrack({ srcs:packed.map(p=>p.hi), makeFrame:(s,ts)=>lumaFrame(s,W,H,ts), lossless:true, W,H,fps });
-    const clo=await encodeTrack({ srcs:packed.map(p=>p.lo), makeFrame:(s,ts)=>lumaFrame(s,W,H,ts), lossless:true, W,H,fps });
-    chi.forEach(x=>frames.push({ track:2, ...x })); clo.forEach(x=>frames.push({ track:3, ...x }));
+
+  function ensureStreamMux(){
+    if(streamMux) return;
+    ensurePlan();
+    const tracks=buildTracksFromPlan(W, H, hasRgb, signalPlan);
+    const metadata=buildFileMetadata({ W, H, fps, n:0, hasRgb, signals: signalPlan, streaming:true });
+    streamMux=createStreamMux({ tracks, metadata, durationMs:0 });
+    byteParts=[streamMux.header];
+    if(onChunk) onChunk(streamMux.header);
   }
-  const metadata={ version:1, width:W, height:H, fps, frames:N,
-    rgb: rgbFrames ? { track:1, codec:VP9 } : null,
-    depth: packed ? { trackHi:2, trackLo:3, codec:VP9, lossless:true, scheme:'tri-fold-8+8',
-      quant:'inverse-depth', near, far, levels, invalidCode:0, dtype:'uint16' } : null };
-  return mux({ tracks, frames, metadata, durationMs: Math.round(N * 1000 / fps) });
+
+  function getSigEnc(id){
+    if(!sigEnc[id]){
+      sigEnc[id]={
+        hi: createTrackEncoder({ makeFrame:(s,ts)=>lumaFrame(s,W,H,ts), lossless:true, W,H,fps }),
+        lo: createTrackEncoder({ makeFrame:(s,ts)=>lumaFrame(s,W,H,ts), lossless:true, W,H,fps }),
+      };
+    }
+    return sigEnc[id];
+  }
+
+  function emitMuxFrames(writes){
+    if(!streamMux) return;
+    for(const f of writes.sort((a,b)=>a.timeMs-b.timeMs || a.track-b.track)){
+      const c=streamMux.writeFrame(f);
+      if(c){ byteParts.push(c); if(onChunk) onChunk(c); }
+    }
+  }
+
+  const depthSig=()=>signalPlan?.find(s=>s.id==='depth');
+
+  return {
+    get signalPlan(){ ensurePlan(); return signalPlan; },
+    get near(){ return depthSig()?.quant?.near; },
+    get far(){ return depthSig()?.quant?.far; },
+    get frameCount(){ return n; },
+
+    setNearFar(near_, far_){
+      const d=specList.find(s=>(s.id ?? 'depth')==='depth');
+      const qType=d?.quant?.type ?? (d?.near !== undefined ? 'inverse-depth' : null);
+      if(!d || qType !== 'inverse-depth')
+        throw new Error('no inverse-depth signal configured');
+      if(d.quant) { d.quant.near=near_; d.quant.far=far_; }
+      else { d.near=near_; d.far=far_; }
+      signalPlan=null;
+    },
+
+    async addFrame(frame){
+      const writes=[];
+      if(frame.rgb){
+        if(!rgbEnc) rgbEnc=createTrackEncoder({ makeFrame:(s,ts)=>rgbaFrame(s,W,H,ts), lossless:false,
+          W,H,fps, bitrate:rgbKbps, keyEvery:rgbKeyEvery });
+        hasRgb=true;
+      }
+      ensurePlan();
+      const inputs=collectFrameInputs(frame, signalPlan);
+      let anySignal=false;
+      for(const s of signalPlan){
+        const u16=u16FromFramePayload(inputs[s.id], s);
+        if(!u16) continue;
+        anySignal=true;
+        const enc=getSigEnc(s.id);
+        const { hi, lo }=triFoldPack(u16);
+        const chi=await enc.hi.push(hi), clo=await enc.lo.push(lo);
+        writes.push({ track:s.tracks.hi, ...chi }, { track:s.tracks.lo, ...clo });
+      }
+      if(!frame.rgb && !anySignal) throw new Error('addFrame: pass rgb and/or signals');
+      if(onChunk) ensureStreamMux();
+
+      if(frame.rgb){
+        const c=await rgbEnc.push(frame.rgb);
+        writes.push({ track:1, ...c });
+      }
+      if(onChunk) emitMuxFrames(writes);
+      else muxFrames.push(...writes);
+      n++;
+    },
+
+    async finish(){
+      if(!n) throw new Error('no frames encoded');
+      ensurePlan();
+      if(onChunk){
+        ensureStreamMux();
+        const tailWrites=[];
+        if(hasRgb) (await rgbEnc.close()).forEach(c=>tailWrites.push({ track:1, ...c }));
+        for(const s of signalPlan){
+          if(!sigEnc[s.id]) continue;
+          (await sigEnc[s.id].hi.close()).forEach(c=>tailWrites.push({ track:s.tracks.hi, ...c }));
+          (await sigEnc[s.id].lo.close()).forEach(c=>tailWrites.push({ track:s.tracks.lo, ...c }));
+        }
+        emitMuxFrames(tailWrites);
+        const tail=streamMux.finish(Math.round(n*1000/fps));
+        if(tail.length){ byteParts.push(tail); onChunk(tail); }
+        return concatChunks(byteParts);
+      }
+      if(hasRgb) await rgbEnc.close();
+      for(const s of signalPlan){ if(sigEnc[s.id]){ await sigEnc[s.id].hi.close(); await sigEnc[s.id].lo.close(); } }
+      const tracks=buildTracksFromPlan(W, H, hasRgb, signalPlan);
+      const metadata=buildFileMetadata({ W, H, fps, n, hasRgb, signals: signalPlan });
+      return mux({ tracks, frames:muxFrames, metadata, durationMs: Math.round(n*1000/fps) });
+    },
+  };
+}
+
+export async function encode({ W, H, fps=30, rgbFrames=null, depthU16=null, depthFloat=null, signals=null,
+  near, far, levels=LEVELS_FULL, rgbKbps=2_000_000, onChunk=null }){
+  if(!signals?.length && (depthU16 || depthFloat)){
+    if(depthFloat && (near===undefined || far===undefined)) ({ near, far }=autoNearFar(depthFloat));
+    if(near===undefined || far===undefined) throw new Error('near and far required for depth');
+  }
+  const N=depthU16 ? depthU16.length : depthFloat ? depthFloat.length
+    : rgbFrames ? rgbFrames.length : 0;
+  const enc=createEncoder({ W, H, fps, signals, near, far, levels, rgbKbps, onChunk });
+  for(let i=0;i<N;i++){
+    await enc.addFrame({
+      rgb: rgbFrames?.[i] ?? null,
+      signals: depthU16 || depthFloat ? {
+        depth: depthU16 ? { u16: depthU16[i] } : { float: depthFloat[i] },
+      } : null,
+      depthU16: depthU16?.[i] ?? null,
+      depthFloat: depthFloat?.[i] ?? null,
+    });
+  }
+  return enc.finish();
+}
+
+// ── streaming decode ──
+export function createDecoder(bytes){
+  if(bytes!==undefined) return createDecoderFromBytes(bytes);
+  return createNetworkDecoder();
+}
+
+function createDecoderFromBytes(bytes){
+  const { tracks, metadata:raw }=demux(bytes);
+  const meta=normalizeMetadata(raw);
+  const W=meta.width, H=meta.height;
+  const blocks=blocksByTime(tracks, meta);
+  const core=makeFrameReader({ meta, W, H, blocks });
+  const depth=meta.signals.find(s=>s.id==='depth');
+  return {
+    get metadata(){ return meta; },
+    get signals(){ return meta.signals; },
+    get width(){ return W; },
+    get height(){ return H; },
+    get near(){ return depth?.quant?.near; },
+    get far(){ return depth?.quant?.far; },
+    get levels(){ return depth?.quant?.levels ?? LEVELS_FULL; },
+    get frameCount(){ return core.frameCount; },
+    readFrame:()=>core.readFrame(),
+    close:()=>core.close(),
+    [Symbol.asyncIterator]:()=>core[Symbol.asyncIterator](),
+    push(){ throw new Error('buffered decoder: pass bytes to createDecoder(), not push()'); },
+    finish(){ throw new Error('buffered decoder: already complete'); },
+  };
+}
+
+function createNetworkDecoder(){
+  const sdm=createStreamDemux();
+  let meta=null, W=0, H=0, keys=null;
+  const slotPending=new Map();
+  const blockQueue=[];
+  let streamDone=false, shut=false;
+  let core=null, waitBlock=null;
+
+  function notify(){ if(waitBlock){ const w=waitBlock; waitBlock=null; w(); } }
+
+  function onBlock(block){
+    if(!meta) return;
+    const rgbT=meta.rgb?.track;
+    let key=null;
+    if(block.track===rgbT) key='rgb';
+    else{
+      for(const s of meta.signals){
+        if(block.track===s.tracks.hi) key=`${s.id}:hi`;
+        else if(block.track===s.tracks.lo) key=`${s.id}:lo`;
+      }
+    }
+    if(!key) return;
+    let slot=slotPending.get(block.timeMs);
+    if(!slot){ slot={ timeMs:block.timeMs }; slotPending.set(block.timeMs, slot); }
+    slot[key]=block;
+    if(isSlotComplete(slot, keys)){
+      blockQueue.push(slot);
+      slotPending.delete(block.timeMs);
+      notify();
+    }
+  }
+
+  function ingest(events){
+    for(const ev of events){
+      if(ev.type==='metadata'){
+        meta=normalizeMetadata(ev.metadata);
+        W=meta.width; H=meta.height;
+        keys=slotKeysForMetadata(meta);
+      }else if(ev.type==='block') onBlock(ev.block);
+      else if(ev.type==='end'){ streamDone=true; notify(); }
+    }
+  }
+
+  const depth=()=>meta?.signals.find(s=>s.id==='depth');
+
+  return {
+    get metadata(){ return meta; },
+    get signals(){ return meta?.signals ?? []; },
+    get width(){ return W; },
+    get height(){ return H; },
+    get near(){ return depth()?.quant?.near; },
+    get far(){ return depth()?.quant?.far; },
+    get levels(){ return depth()?.quant?.levels ?? LEVELS_FULL; },
+    get frameCount(){ return meta?.frames ?? blockQueue.length; },
+    get ready(){ return !!meta; },
+
+    push(chunk){ ingest(sdm.push(chunk)); },
+    finish(){ ingest(sdm.finish()); streamDone=true; notify(); },
+
+    async readFrame(){
+      if(shut) throw new Error('decoder closed');
+      if(!meta) throw new Error('waiting for metadata');
+      while(!core && blockQueue.length===0){
+        if(streamDone) return null;
+        await new Promise(res=>{ waitBlock=res; });
+      }
+      if(!core && blockQueue.length) core=makeFrameReader({ meta, W, H, blocks:blockQueue });
+      if(!core) return null;
+      return core.readFrame();
+    },
+
+    async close(){
+      if(shut) return;
+      shut=true; notify();
+      if(core) await core.close();
+    },
+
+    [Symbol.asyncIterator](){
+      const self=this;
+      return { async next(){
+        const frame=await self.readFrame();
+        return frame ? { value:frame, done:false } : { done:true };
+      }};
+    },
+  };
 }
 
 export async function decode(bytes){
-  const { tracks, metadata } = demux(bytes);
-  const W=metadata.width, H=metadata.height;
-  const result={ metadata, width:W, height:H, rgb:null, depthU16:null, depthFloat:null };
-  if(metadata.rgb) result.rgb = await decodeTrack(tracks[metadata.rgb.track], W, H, readRGBA);
-  if(metadata.depth){
-    const hi = await decodeTrack(tracks[metadata.depth.trackHi], W, H, readLuma);
-    const lo = await decodeTrack(tracks[metadata.depth.trackLo], W, H, readLuma);
-    result.depthU16 = hi.map((h,i)=>triFoldUnpack(h, lo[i]));
-    const lv = metadata.depth.levels ?? LEVELS_FULL;
-    result.depthFloat = result.depthU16.map(d=>dequantizeInverseDepth(d, metadata.depth.near, metadata.depth.far, lv));
+  const dec=createDecoder(bytes);
+  const rgb=[], depthU16=[], depthFloat=[];
+  const signalSeries={};
+  for await (const frame of dec){
+    if(frame.rgb) rgb.push(frame.rgb);
+    if(frame.depthU16) depthU16.push(frame.depthU16);
+    if(frame.depthFloat) depthFloat.push(frame.depthFloat);
+    for(const [id, sig] of Object.entries(frame.signals ?? {})){
+      if(!signalSeries[id]) signalSeries[id]=[];
+      signalSeries[id].push(sig);
+    }
   }
-  return result;
+  await dec.close();
+  return { metadata:dec.metadata, width:dec.width, height:dec.height, signals:dec.signals,
+    rgb: rgb.length ? rgb : null,
+    depthU16: depthU16.length ? depthU16 : null,
+    depthFloat: depthFloat.length ? depthFloat : null,
+    signalSeries: Object.keys(signalSeries).length ? signalSeries : null };
 }
+
+export { createStreamMux, createStreamDemux, concatChunks } from './webm.js';
+export { normalizeMetadata, planSignals } from './signals.js';

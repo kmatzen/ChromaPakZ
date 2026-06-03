@@ -20,7 +20,7 @@ static void writeFile(const char* p, const uint8_t* d, size_t n){
 }
 
 int main(int argc, char** argv){
-  if(argc<2){ fprintf(stderr,"usage: dccli <selftest|decode|encode|info> ...\n"); return 2; }
+  if(argc<2){ fprintf(stderr,"usage: dccli <selftest|decode|decodesignal|encode|info|...> ...\n"); return 2; }
   std::string cmd=argv[1];
 
   if(cmd=="selftest"){
@@ -41,6 +41,16 @@ int main(int argc, char** argv){
     printf("selftest: %dx%d x%d  file=%.1f KiB  bit-exact=%s (maxΔ=%d)\n",
            W,H,N,len/1024.0, dMax==0?"YES":"NO", dMax);
     dc_free(buf); return dMax==0?0:1;
+  }
+
+  if(cmd=="decodesignal"){
+    if(argc<5){ fprintf(stderr,"decodesignal <in.webm> <signal-id> <out.u16>\n"); return 2; }
+    auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
+    if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
+    std::vector<uint16_t> out((size_t)W*H*N);
+    if(dc_decode_signal(webm.data(),webm.size(),argv[3],out.data())){ fprintf(stderr,"decode signal failed\n"); return 1; }
+    writeFile(argv[4],(uint8_t*)out.data(),out.size()*2);
+    printf("decoded signal %s %dx%d x%d → %s\n",argv[3],W,H,N,argv[4]); return 0;
   }
 
   if(cmd=="decode"){
@@ -89,7 +99,11 @@ int main(int argc, char** argv){
     if(argc<3){ fprintf(stderr,"info <in.webm>\n"); return 2; }
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
+    char* meta=0; size_t mlen=0;
+    if(!dc_get_metadata(webm.data(),webm.size(),&meta,&mlen))
+      printf("metadata: %.*s\n",(int)mlen,meta);
     printf("chromapakz: %dx%d, %d frames @ %dfps, near=%g far=%g, levels=%d, rgb=%s\n",W,H,N,fps,near_,far_,levels,rgb?"yes":"no");
+    if(meta) dc_free((uint8_t*)meta);
     return 0;
   }
   fprintf(stderr,"unknown command: %s\n",cmd.c_str()); return 2;

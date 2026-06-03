@@ -44,6 +44,7 @@ jobs:
           python -m pip install numpy
           python -m pip install . --no-build-isolation || python -m pip install .
           python tests/roundtrip.py
+          python tests/cross_interop.py
 
       - name: ffmpeg decode-interop (full-range / bit-exact regression guard)
         run: python tests/ffmpeg_interop.py
@@ -64,5 +65,16 @@ jobs:
           npm init -y >/dev/null 2>&1
           npm i -D playwright
           npx playwright install --with-deps chromium
+          node ../../tests/js_quant.mjs
+          node ../../tests/js_signals.mjs
+          node ../../tests/webm_stream.mjs
           BROWSER=chromium node run.mjs single 256 | tee out.txt
           grep -q "EXACT" out.txt
+          BROWSER=chromium node run.mjs streaming 256 12 | tee stream.txt
+          grep -q "YES ✓" stream.txt
+          BROWSER=chromium node run.mjs network 256 8 | tee network.txt
+          grep -q "YES ✓" network.txt
+          BROWSER=chromium node run.mjs multisignal 128 6 | tee multi.txt
+          grep -q "YES ✓" multi.txt
+          node smoke-demo.mjs | tee demo.txt
+          grep -q "bit-exact" demo.txt

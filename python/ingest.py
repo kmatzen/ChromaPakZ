@@ -1,8 +1,11 @@
-"""chromapakz ingestion — turn real RGBD data into a chromapakz .webm.
+"""chromapakz ingestion — turn real RGBD (and optional extra signals) into a chromapakz .webm.
 
 Loads depth (EXR float / .npy / .npz / 16-bit PNG-TIFF / raw) and optional RGB
 (image sequence / video / array), applies inverse-depth quantization (auto near/far
 by default), encodes, and reports real per-track bits-per-pixel.
+
+For multiple lossless signals (object IDs, etc.) use ``chromapakz.encode({...})`` directly;
+this CLI is depth + RGB focused.
 
 API:
     from ingest import encode_clip, load_depth, load_rgb, auto_near_far
