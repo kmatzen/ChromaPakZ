@@ -59,15 +59,17 @@ async function readRGBA(frame, W, H){
   return buf;
 }
 
-async function encodeTrack({ srcs, makeFrame, lossless, W, H, fps, bitrate }){
+// keyEvery: keyframe interval in frames. Lossless depth keeps a single keyframe (max compression);
+// the RGB track uses a periodic interval so its Cues land on decodable points and <video> can seek.
+async function encodeTrack({ srcs, makeFrame, lossless, W, H, fps, bitrate, keyEvery=Infinity }){
   const chunks=[]; const usPerFrame=1e6/fps;
   const enc=new VideoEncoder({ output:(c)=>{ const data=new Uint8Array(c.byteLength); c.copyTo(data);
     chunks.push({ key:c.type==='key', timeMs:Math.round(c.timestamp/1000), data }); }, error:e=>{ throw e; } });
   const cfg={ codec:VP9, width:W, height:H, framerate:fps };
   if(lossless) cfg.bitrateMode='quantizer'; else cfg.bitrate=bitrate||2_000_000;
   enc.configure(cfg);
-  srcs.forEach((s,i)=>{ const f=makeFrame(s, i*usPerFrame);
-    enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:i===0 }); f.close(); });
+  srcs.forEach((s,i)=>{ const f=makeFrame(s, i*usPerFrame); const isKey = i===0 || i%keyEvery===0;
+    enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); });
   await enc.flush(); enc.close();
   return chunks;
 }
@@ -92,7 +94,8 @@ export async function encode({ W, H, fps=30, rgbFrames=null, depthU16=null, dept
   const frames=[]; const tracks=[];
   if(rgbFrames){
     tracks.push({ number:1, codecID:'V_VP9', name:'rgb', width:W, height:H });
-    const c=await encodeTrack({ srcs:rgbFrames, makeFrame:(s,ts)=>rgbaFrame(s,W,H,ts), lossless:false, W,H,fps });
+    const c=await encodeTrack({ srcs:rgbFrames, makeFrame:(s,ts)=>rgbaFrame(s,W,H,ts), lossless:false, W,H,fps,
+      keyEvery: Math.max(1, Math.round(fps)) });   // ~1s keyframe interval → seekable RGB
     c.forEach(x=>frames.push({ track:1, ...x }));
   }
   if(packed){
@@ -106,7 +109,7 @@ export async function encode({ W, H, fps=30, rgbFrames=null, depthU16=null, dept
     rgb: rgbFrames ? { track:1, codec:VP9 } : null,
     depth: packed ? { trackHi:2, trackLo:3, codec:VP9, lossless:true, scheme:'tri-fold-8+8',
       quant:'inverse-depth', near, far, levels, invalidCode:0, dtype:'uint16' } : null };
-  return mux({ tracks, frames, metadata });
+  return mux({ tracks, frames, metadata, durationMs: Math.round(N * 1000 / fps) });
 }
 
 export async function decode(bytes){

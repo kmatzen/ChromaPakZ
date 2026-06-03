@@ -38,7 +38,7 @@ native/dccli decode clip.webm depth.u16           # depth track of any ChromaPak
 
 | Layer | Choice |
 |---|---|
-| **Container** | WebM / Matroska, multi-track. RGB is track 1, so any player shows it; depth tracks are ignored by players that don't know them. |
+| **Container** | WebM / Matroska, multi-track. RGB is track 1, so any player shows it; depth tracks are ignored by players that don't know them. A Duration, a Cues index, and ~1 s RGB keyframes make it **seekable** in `<video>` (depth stays single-keyframe — it isn't what `<video>` plays). |
 | **RGB track** | 8-bit VP9, YUV 4:2:0, BT.709 full-range — a normal, viewable video stream. |
 | **Depth** | float depth → **inverse-depth uint16** → **triangle-fold into two 8-bit planes** → two **VP9 lossless** tracks, inter-coded. |
 | **Metadata** | A WebM tag carries the quantization contract (`near`/`far`/`levels`, scheme, units) so any decoder can reconstruct float depth. |
@@ -198,6 +198,5 @@ Working end-to-end and verified across all three implementations. Honest caveats
   lossless *decode* works on Chromium and WebKit/Safari. Firefox decodes VP9 to color-converted BGRX, so
   it needs a fallback. These are Playwright engine builds — reconfirm on shipping browsers before hard
   claims.
-- **No Cues/Duration yet**, so `<video>` seeking isn't smooth; the native RGB GOP uses a single keyframe.
 - **"Royalty-free"** reflects the AOMedia/Google position on VP9; Sisvel operates pools that dispute it.
 - An **auto precision picker** (estimate the sensor noise floor to choose `--depth-bits`) is future work.

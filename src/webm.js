@@ -10,7 +10,8 @@ const ID = {
   Tracks:0x1654AE6B, TrackEntry:0xAE, TrackNumber:0xD7, TrackUID:0x73C5, TrackType:0x83,
   FlagLacing:0x9C, CodecID:0x86, Name:0x536E, Video:0xE0, PixelWidth:0xB0, PixelHeight:0xBA,
   Tags:0x1254C367, Tag:0x7373, Targets:0x63C0, SimpleTag:0x67C8, TagName:0x45A3, TagString:0x4487,
-  Cluster:0x1F43B675, Timestamp:0xE7, SimpleBlock:0xA3,
+  Cluster:0x1F43B675, Timestamp:0xE7, SimpleBlock:0xA3, Duration:0x4489,
+  Cues:0x1C53BB6B, CuePoint:0xBB, CueTime:0xB3, CueTrackPositions:0xB7, CueTrack:0xF7, CueClusterPosition:0xF1,
 };
 
 // ── encoders ──
@@ -30,6 +31,7 @@ function uintBytes(n){ // minimal big-endian unsigned (>=1 byte)
   const b=[]; let v=n; while(v>0){ b.unshift(v&0xff); v=Math.floor(v/256); } return Uint8Array.from(b);
 }
 const strBytes = s => new TextEncoder().encode(s);
+const f8 = v => { const b=new Uint8Array(8); new DataView(b.buffer).setFloat64(0, v, false); return b; }; // EBML float (Duration)
 // One element: ID + size(vint) + payload.
 function el(id, payload){ const i=idBytes(id); return cat([i, vint(payload.length), payload]); }
 const elU = (id,n) => el(id, uintBytes(n));
@@ -50,29 +52,46 @@ function simpleBlock(track, relTime, key, data){
 
 // frames: [{track, key, timeMs, data:Uint8Array}] across all tracks, any order.
 // tracks: [{number, codecID, name, width, height}]. metadata: JSON-serializable or null.
-export function mux({ tracks, frames, metadata, timestampScaleNs=1_000_000, clusterSpanMs=30_000 }){
+// durationMs: total length (enables a correct <video> timeline). Clusters start on a keyframe of the
+// "cue" track (the RGB track if present), and a Cues index points at them → seekable playback.
+export function mux({ tracks, frames, metadata, durationMs=0, timestampScaleNs=1_000_000, clusterSpanMs=30_000 }){
   const header = el(ID.EBML, cat([
     elU(ID.EBMLVersion,1), elU(ID.EBMLReadVersion,1), elU(ID.EBMLMaxIDLength,4), elU(ID.EBMLMaxSizeLength,8),
     elS(ID.DocType,'webm'), elU(ID.DocTypeVersion,2), elU(ID.DocTypeReadVersion,2) ]));
-  const info = el(ID.Info, cat([ elU(ID.TimestampScale,timestampScaleNs),
-    elS(ID.MuxingApp,'chromapakz'), elS(ID.WritingApp,'chromapakz') ]));
-  const tracksEl = el(ID.Tracks, cat(tracks.map(trackEntry)));
-  const segChildren=[info, tracksEl];
+  const infoParts=[ elU(ID.TimestampScale,timestampScaleNs) ];
+  if(durationMs>0) infoParts.push(el(ID.Duration, f8(durationMs)));
+  infoParts.push(elS(ID.MuxingApp,'chromapakz'), elS(ID.WritingApp,'chromapakz'));
+  const pre=[ el(ID.Info, cat(infoParts)), el(ID.Tracks, cat(tracks.map(trackEntry))) ];
   if(metadata!=null){
     const tag = el(ID.Tag, cat([ el(ID.Targets, new Uint8Array(0)),
       el(ID.SimpleTag, cat([ elS(ID.TagName,'CHROMAPAKZ'), elS(ID.TagString, JSON.stringify(metadata)) ])) ]));
-    segChildren.push(el(ID.Tags, tag));
+    pre.push(el(ID.Tags, tag));
   }
-  // Cluster splitting so SimpleBlock relative timecodes stay within int16.
+  const rgb = tracks.find(t=>t.name==='rgb');
+  const cueTrack = rgb ? rgb.number : tracks[0].number;
+
+  // Build clusters, starting a new one at each cue-track keyframe (also cap span to keep timecodes
+  // within int16). Track each cluster's byte offset from the start of the Segment data, for the Cues.
   const ordered=[...frames].sort((a,b)=> a.timeMs-b.timeMs);
-  let i=0;
-  while(i<ordered.length){
-    const base=ordered[i].timeMs; const blocks=[elU(ID.Timestamp, base)];
-    while(i<ordered.length && ordered[i].timeMs-base < clusterSpanMs){
-      const f=ordered[i++]; blocks.push(simpleBlock(f.track, f.timeMs-base, f.key, f.data));
-    }
-    segChildren.push(el(ID.Cluster, cat(blocks)));
+  let off = pre.reduce((a,b)=>a+b.length,0);   // offset of the first cluster (Segment-data-relative)
+  const clusterEls=[], cues=[];
+  let cur=null, base=0, hasCue=false;
+  const flush=()=>{ if(!cur) return;
+    const e=el(ID.Cluster, cat([elU(ID.Timestamp, base), ...cur]));
+    if(hasCue) cues.push({ t:base, pos:off }); off+=e.length; clusterEls.push(e); cur=null; };
+  for(const f of ordered){
+    const cueKey = f.track===cueTrack && f.key;
+    if(cur && (cueKey || f.timeMs-base>=clusterSpanMs)) flush();
+    if(!cur){ cur=[]; base=f.timeMs; hasCue=false; }
+    if(cueKey) hasCue=true;
+    cur.push(simpleBlock(f.track, f.timeMs-base, f.key, f.data));
   }
+  flush();
+
+  const segChildren=[...pre, ...clusterEls];
+  if(cues.length) segChildren.push(el(ID.Cues, cat(cues.map(c =>
+    el(ID.CuePoint, cat([ elU(ID.CueTime, c.t),
+      el(ID.CueTrackPositions, cat([ elU(ID.CueTrack, cueTrack), elU(ID.CueClusterPosition, c.pos) ])) ]))))));
   return cat([header, el(ID.Segment, cat(segChildren))]);
 }
 
