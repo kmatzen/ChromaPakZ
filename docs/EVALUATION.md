@@ -176,12 +176,12 @@ scope of the recommendation is clear:
   periodic/triangle-wave packing of 16-bit depth into 8-bit channels to survive *lossy* codecs.
   Near-lossless; ours adapts the triangle idea but stays **bit-exact** via a lossless codec.
 - **Intel RealSense "colorized depth"** — Hue encoding (~10.5 effective bits), lossy, ~80× with commodity
-  codecs. Caps precision; not lossless. (https://dev.intelrealsense.com/docs/depth-image-compression-by-colorization-for-intel-realsense-depth-cameras)
+  codecs. Caps precision; not lossless. ([Intel docs](https://dev.intelrealsense.com/docs/depth-image-compression-by-colorization-for-intel-realsense-depth-cameras))
 - **Azure Kinect / RGBD datasets** — Azure Kinect records to **Matroska (.mkv)**, multi-track, with a
   16-bit-grayscale depth track; the lossless route is 16-bit **PNG (MPNG)** per frame inside the MKV.
   TUM RGB-D / NYU / ScanNet store depth as 16-bit PNG sequences — bit-exact but intra-only. This both
   **validates the container choice** (Matroska = WebM's basis) and marks the gap ChromaPakZ fills:
-  lossless *inter-frame* compression + a browser path. (https://learn.microsoft.com/en-us/azure/kinect-dk/record-file-format)
+  lossless *inter-frame* compression + a browser path. ([Microsoft docs](https://learn.microsoft.com/en-us/azure/kinect-dk/record-file-format))
 - **MPEG Immersive Video (MIV) / 3D-HEVC / MV-HEVC** — standardized multi-view-video-plus-depth for
   volumetric/6-DoF. Heavyweight, HEVC-based (patent pool), not browser-native; overkill for one RGBD stream.
 - **Google Draco** — mesh/point-cloud geometry compression, *not* depth-video. Out of scope.
@@ -240,18 +240,19 @@ Findings:
 
 ## 13. Sources
 
-VP9 https://en.wikipedia.org/wiki/VP9 · AV1 https://en.wikipedia.org/wiki/AV1 ·
-VP8 https://en.wikipedia.org/wiki/VP8 · AVC pool https://www.via-la.com/licensing-2/avc-h-264/ ·
-x264 GPL https://x264.org/licensing/ · HEVC https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding ·
-VVC pool https://accessadvance.com/licensing-programs/vvc-advance/ · JPEG-XL https://jpegxl.info/ ·
-FFV1 RFC 9043 https://datatracker.ietf.org/doc/rfc9043/ · PNG https://www.w3.org/TR/png/ ·
-WebP https://developers.google.com/speed/webp/docs/riff_container ·
-WebCodecs support https://caniuse.com/webcodecs ,
-https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API ·
-per-frame quantizer https://gist.github.com/Djuffin/3722232679b977058be787be0dff4254 ,
-https://groups.google.com/a/chromium.org/g/blink-dev/c/UZWH1LuwBas ·
-VideoFrame formats (I420P10/12) https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame/format ·
-Pece 2011 https://jankautz.com/publications/depth-streaming.pdf ·
-RealSense colorized depth https://dev.intelrealsense.com/docs/depth-image-compression-by-colorization-for-intel-realsense-depth-cameras ·
-MPEG-MIV https://mpeg-miv.org/index.php/overview/ · Draco https://github.com/google/draco ·
-Dynamic Depth https://developer.android.com/media/camera/camera2/Dynamic-depth-v1.0.pdf
+**Codecs & licensing**
+- [VP9](https://en.wikipedia.org/wiki/VP9), [AV1](https://en.wikipedia.org/wiki/AV1), [VP8](https://en.wikipedia.org/wiki/VP8)
+- [AVC patent pool (Via LA)](https://www.via-la.com/licensing-2/avc-h-264/), [x264 (GPL)](https://x264.org/licensing/)
+- [HEVC](https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding), [VVC patent pool (Access Advance)](https://accessadvance.com/licensing-programs/vvc-advance/)
+- [JPEG XL](https://jpegxl.info/), [FFV1 — RFC 9043](https://datatracker.ietf.org/doc/rfc9043/), [PNG](https://www.w3.org/TR/png/), [WebP](https://developers.google.com/speed/webp/docs/riff_container)
+
+**WebCodecs & browser support**
+- [WebCodecs (Can I use)](https://caniuse.com/webcodecs), [WebCodecs API (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API)
+- [Per-frame quantizer explainer](https://gist.github.com/Djuffin/3722232679b977058be787be0dff4254), [Chromium intent-to-ship](https://groups.google.com/a/chromium.org/g/blink-dev/c/UZWH1LuwBas)
+- [VideoFrame pixel formats — I420P10/12 (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame/format)
+
+**Prior art**
+- [Pece, Kautz & Weyrich (2011) — depth streaming](https://jankautz.com/publications/depth-streaming.pdf)
+- [Intel RealSense — colorized depth](https://dev.intelrealsense.com/docs/depth-image-compression-by-colorization-for-intel-realsense-depth-cameras)
+- [Azure Kinect — record file format](https://learn.microsoft.com/en-us/azure/kinect-dk/record-file-format)
+- [MPEG Immersive Video](https://mpeg-miv.org/index.php/overview/), [Google Draco](https://github.com/google/draco), [Google Dynamic Depth](https://developer.android.com/media/camera/camera2/Dynamic-depth-v1.0.pdf)
