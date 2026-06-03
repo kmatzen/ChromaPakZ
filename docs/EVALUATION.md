@@ -12,7 +12,7 @@ win if the constraints changed, and what remains unverified.
   `experiments/webcodecs-lossless/run.mjs` (WebCodecs probes, headless Chromium 148),
   `python/benchmark_codecs.py` (codec head-to-head), `experiments/webcodecs-lossless/png16-test.mjs`
   (browser 16-bit fidelity), `native/dccli selftest` (native bit-exactness).
-- **Cited** = external authoritative source, URL in §10.
+- **Cited** = external authoritative source, URL in §13.
 - All depth benchmarks use the same realistic synthetic clip (`make_synthetic_rgbd.py`: smooth surfaces,
   sharp depth edges, **disparity-domain sensor noise**, occlusion shadows, 5% dropout holes) — chosen to be
   *adversarial-but-realistic*, not flattering.
@@ -223,7 +223,9 @@ Findings:
 - These are Playwright engine builds, not the exact shipping browsers; re-confirm on real Chrome stable,
   Safari 26 on a Mac/iPhone, and Firefox release before publishing hard support claims.
 - **"Royalty-free" for VP9/AV1 is the AOMedia/Google position; Sisvel operates pools disputing it.** *(cited)*
-- Synthetic data only so far — real-sensor bitrate will differ (noise-dominated; §7 shows the trend).
+- The §7 benchmark uses a synthetic clip; real-sensor depth is validated separately on TUM RGB-D
+  `fr1/desk` (≈5 bpp lossless RGBD, bit-exact — `examples/tum_fr1desk.py`). Bitrate is noise-dominated, so
+  it varies by sensor; §7 shows the trend.
 - No Cues/Duration yet (seekable `<video>` playback); native RGB GOP mirrors the browser (one keyframe).
 
 ### Tooling caveats (found while validating)

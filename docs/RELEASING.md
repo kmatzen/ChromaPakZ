@@ -3,9 +3,10 @@
 ## Continuous integration (`.github/workflows/ci.yml`)
 
 Runs on every push to `main` and every PR:
-- **build + test** on Linux and macOS — installs libvpx, builds the native lib with CMake, runs the C++
-  `dccli selftest` (bit-exact), then `pip install .` (compiles via CMake/scikit-build-core) and
-  `tests/roundtrip.py`.
+- **build + test** on Linux and macOS — installs libvpx + ffmpeg, builds the native lib with CMake, runs
+  the C++ `dccli selftest` (bit-exact), then `pip install .` (compiles via CMake/scikit-build-core),
+  `tests/roundtrip.py`, and `tests/ffmpeg_interop.py` (guards the full-color-range / bit-exact contract
+  against an external decoder).
 - **browser** — installs Playwright Chromium and runs the headless WebCodecs probe, asserting VP9 lossless
   encode→decode is bit-exact in a real browser.
 
