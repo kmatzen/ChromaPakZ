@@ -95,19 +95,18 @@ Matching the code step to the noise collapses the cost:
 | 11 | ~56 mm | 8.1 |
 | 10 | ~112 mm | 6.9 |
 
-![ChromaPakZ rate-distortion](docs/rate-distortion.svg)
+That table is the *rate* lever (how fine a grid to keep). The **codec's** own job is separate: carry the
+chosen quantized codes faithfully. This rate-distortion curve measures exactly that — the **encode/decode
+path on already-quantized depth**, PSNR of decoded-vs-source codes as the VP9 quantizer sweeps:
 
-The y-axis is PSNR of the reconstructed depth **vs the original float** — i.e. the float→uint16
-*quantization* distortion, **not** codec loss. The codec is lossless: all three encoders reconstruct the
-**identical** uint16 codes, so at each bit depth they land at the **same PSNR** and differ only
-horizontally (file size) — which is exactly why they share one plateau. It's finite and flat past ~11 bits
-because **(1)** auto `near/far` use the 1st/99th percentiles, so ~2% of pixels (the near/far tails) are
-**clamped** to the end codes — a bit-independent error that caps PSNR ~41 dB (with `near/far` = true
-min/max, PSNR climbs the textbook ~6 dB/bit to ~94 dB at 16-bit); and **(2)** mapping continuous float onto
-any finite grid is itself quantization. **File size**, by contrast, keeps growing with bits — lossless
-coding faithfully stores more sensor *noise*. So past ~11 bits you pay bits for neither fidelity
-(clamp-capped) nor signal (noise): the knee. ChromaPakZ tracks/beats FFV1 and beats PNG-16 at every point.
-Regenerate with `python python/plot_rd.py`.
+![ChromaPakZ codec rate-distortion](docs/rate-distortion.svg)
+
+ChromaPakZ's operating point is **QP 0 — bit-exact (∞ dB)**, the green marker at the top: the codec adds
+*zero* distortion to the quantized depth. The blue curve shows what allowing loss would buy (QP 4 → ~68 dB
+at 7.2 bpp, down to QP 63 → ~51 dB at 3.9 bpp) — i.e. near-lossless depth is available from the same
+pipeline if a use-case wants it, but the default is exact. (Other lossless codecs — FFV1, PNG-16 — also sit
+at ∞ dB; they differ only in file size, which is the §7 benchmark.) Regenerate with
+`node experiments/webcodecs-lossless/run.mjs rd`.
 
 This is *not* lossy depth — it's choosing a uint16 grid matched to real precision, then carrying it
 bit-exact. **`levels` is a first-class, metadata-stored quantization parameter** (default 65536 =
