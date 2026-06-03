@@ -33,31 +33,19 @@ export const SIGNAL_RAW_U16 = {
 
 export function normalizeMetadata(meta){
   if(!meta) throw new Error('missing CHROMAPAKZ metadata');
-  const signals=[];
-  if(Array.isArray(meta.signals)){
-    for(const s of meta.signals){
-      const quant=s.quant && typeof s.quant === 'object'
-        ? { ...s.quant, type: s.quant.type ?? (s.quant.near !== undefined ? QUANT_INVERSE_DEPTH : null) }
-        : s.quant === QUANT_INVERSE_DEPTH ? { type: QUANT_INVERSE_DEPTH, near: s.near, far: s.far, levels: s.levels } : s.quant;
-      signals.push({ ...s, tracks: { hi: s.tracks.hi, lo: s.tracks.lo }, quant });
-    }
-  }else if(meta.depth){
-    const d=meta.depth;
-    signals.push({
-      id: 'depth',
-      tracks: { hi: d.trackHi, lo: d.trackLo },
-      codec: d.codec ?? VP9,
-      lossless: d.lossless !== false,
-      scheme: d.scheme ?? SCHEME_TRIFOLD,
-      dtype: d.dtype ?? 'uint16',
-      invalidCode: d.invalidCode ?? 0,
-      quant: { type: QUANT_INVERSE_DEPTH, near: d.near, far: d.far, levels: d.levels ?? LEVELS_FULL },
-    });
-  }
+  if(!Array.isArray(meta.signals) || !meta.signals.length)
+    throw new Error('metadata must include signals[] (v2)');
+  const signals=meta.signals.map(s=>{
+    const quant=s.quant && typeof s.quant === 'object'
+      ? { ...s.quant, type: s.quant.type ?? (s.quant.near !== undefined ? QUANT_INVERSE_DEPTH : null) }
+      : s.quant === QUANT_INVERSE_DEPTH ? { type: QUANT_INVERSE_DEPTH, near: s.near, far: s.far, levels: s.levels } : s.quant;
+    return { ...s, tracks: { hi: s.tracks.hi, lo: s.tracks.lo }, quant };
+  });
   return { ...meta, signals };
 }
 
 export function planSignals(specs, hasRgb){
+  if(!specs?.length) throw new Error('planSignals: need at least one signal spec');
   const signals=[];
   let next=hasRgb ? 2 : 1;
   for(const raw of specs){
@@ -107,26 +95,13 @@ export function buildFileMetadata({ W, H, fps, n, hasRgb, signals, streaming=fal
     invalidCode: s.invalidCode,
     quant: s.quant,
   }));
-  const depthSig=signals.find(s=>s.id==='depth' && s.quant?.type === QUANT_INVERSE_DEPTH);
-  const legacyDepth=depthSig ? {
-    trackHi: depthSig.tracks.hi, trackLo: depthSig.tracks.lo,
-    codec: VP9, lossless: true, scheme: SCHEME_TRIFOLD, quant: QUANT_INVERSE_DEPTH,
-    near: depthSig.quant.near, far: depthSig.quant.far, levels: depthSig.quant.levels,
-    invalidCode: depthSig.invalidCode, dtype: 'uint16',
-  } : null;
   return {
     version: 2, width: W, height: H, fps,
     frames: streaming ? null : n,
     streaming: streaming || undefined,
     rgb: hasRgb ? { track: 1, codec: VP9 } : null,
     signals: sigMeta,
-    depth: legacyDepth,
   };
-}
-
-export function defaultDepthSpec(near, far, levels=LEVELS_FULL){
-  return { id: 'depth', scheme: SCHEME_TRIFOLD, dtype: 'uint16', invalidCode: 0,
-    quant: { type: QUANT_INVERSE_DEPTH, near, far, levels } };
 }
 
 export function u16FromFramePayload(payload, signal){
@@ -183,12 +158,7 @@ export function isSlotComplete(slot, keys){
 
 export function collectFrameInputs(frame, signalPlan){
   const byId={};
-  if(frame.signals){
-    for(const s of signalPlan) byId[s.id]=frame.signals[s.id] ?? null;
-  }
-  if(frame.depthU16 !== undefined && frame.depthU16 !== null)
-    byId.depth={ u16: frame.depthU16 };
-  if(frame.depthFloat)
-    byId.depth={ ...(byId.depth ?? {}), float: frame.depthFloat };
+  if(!frame.signals) return byId;
+  for(const s of signalPlan) byId[s.id]=frame.signals[s.id] ?? null;
   return byId;
 }

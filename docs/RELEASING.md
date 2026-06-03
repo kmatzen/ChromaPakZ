@@ -5,7 +5,7 @@
 Runs on every push to `main` and every PR:
 - **build + test** on Linux and macOS — CMake + `dccli selftest`, `pip install .`,
   `tests/roundtrip.py`, `tests/cross_interop.py`, and `tests/ffmpeg_interop.py`.
-- **browser** — `tests/js_quant.mjs`, `tests/js_signals.mjs`, `tests/webm_stream.mjs`, Playwright
+- **browser** — `tests/js_quant.mjs`, `tests/js_signals.mjs`, `tests/js_metadata_v2.mjs`, `tests/webm_stream.mjs`, Playwright
   probes (`single`, `streaming`, `network`, `multisignal`), and `smoke-demo.mjs`.
 
 Suggested branch flow: protect `main`, do work on feature branches, open PRs, require the `ci` checks to

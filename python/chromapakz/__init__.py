@@ -1,22 +1,14 @@
 """ChromaPakZ — lossless RGB + bit-exact auxiliary signals in one WebM.
 
-`pip install .` compiles the native libvpx core; this module binds it via ctypes.
-
     import chromapakz as cz
 
-    # Multi-signal encode (depth + object IDs, etc.)
     data = cz.encode(
         {"depth": depth_u16, "objectId": ids_u16},
-        specs={"depth": {"inverse_depth": True, "near": 0.3, "far": 9.0, "levels": 2048}},
-        rgb=rgba_NHWc4,
+        specs={"depth": {"inverse_depth": True, "near": 0.3, "far": 9.0}},
+        rgb=rgba,
     )
     out = cz.decode(data)
-    out["signals"]["depth"]          # (N, H, W) uint16
-    out["signals"]["objectId"]
-
-    # Legacy depth-only sugar still works
-    data = cz.encode_rgbd(rgb, depth, near=0.2, far=10.0)
-    depth = cz.decode_depth(data)
+    out["signals"]["depth"]
 """
 import ctypes
 import glob
@@ -30,10 +22,9 @@ LEVELS_FULL = 65536
 
 
 def _find_lib():
-    """Locate the native core: bundled in the installed package, else a CMake dev build."""
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(os.path.dirname(here))
-    pats = ("_core*.so", "_core*.dylib", "_core*.pyd", "libchromapakz*.*")
+    pats = ("_core*.so", "_core*.dylib", "_core*.pyd")
     for d in (here, os.path.join(repo, "build"), os.path.join(repo, "native")):
         for pat in pats:
             hits = [h for h in sorted(glob.glob(os.path.join(d, pat)))
@@ -61,23 +52,17 @@ class _SignalSpec(ctypes.Structure):
     ]
 
 
-_lib.dc_encode_depth.argtypes = [u16p, _I, _I, _I, _I, _D, _D, _I, ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
-_lib.dc_encode_rgbd.argtypes = [u8p, u16p, _I, _I, _I, _I, _I, _D, _D, _I, ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
 _lib.dc_encode_multi.argtypes = [
     u8p, _I, ctypes.POINTER(_SignalSpec), _I, _I, _I, _I, _I,
     ctypes.POINTER(u8p), ctypes.POINTER(_Z),
 ]
 _lib.dc_probe.argtypes = [u8p, _Z, intp, intp, intp, intp, dblp, dblp, intp, intp]
-_lib.dc_decode_depth.argtypes = [u8p, _Z, u16p]
 _lib.dc_decode_signal.argtypes = [u8p, _Z, ctypes.c_char_p, u16p]
 _lib.dc_decode_rgb.argtypes = [u8p, _Z, u8p]
 _lib.dc_get_metadata.argtypes = [u8p, _Z, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_Z)]
 _lib.dc_quantize_inverse.argtypes = [f32p, _I, _D, _D, _I, u16p]
 _lib.dc_dequantize_inverse.argtypes = [u16p, _I, _D, _D, _I, f32p]
-for fn in (
-    "dc_encode_depth", "dc_encode_rgbd", "dc_encode_multi", "dc_probe",
-    "dc_decode_depth", "dc_decode_signal", "dc_decode_rgb", "dc_get_metadata",
-):
+for fn in ("dc_encode_multi", "dc_probe", "dc_decode_signal", "dc_decode_rgb", "dc_get_metadata"):
     getattr(_lib, fn).restype = ctypes.c_int
 _lib.dc_free.argtypes = [u8p]
 
@@ -92,85 +77,71 @@ def _buf(data):
     return (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
 
 
-def _default_depth_spec(near, far, levels):
+def inverse_depth_spec(near, far, levels=LEVELS_FULL):
+    """Spec dict for a depth signal with inverse-depth quant."""
     return {"inverse_depth": True, "near": near, "far": far, "levels": levels}
 
 
-def encode(signals, specs=None, rgb=None, fps=30, rgb_kbps=2000, near=0.2, far=10.0, levels=LEVELS_FULL):
-    """Encode lossless uint16 signals (+ optional RGB) to WebM bytes.
-
-    Args:
-        signals: dict mapping signal id -> (N, H, W) uint16 array.
-        specs: optional per-id dict with ``inverse_depth``, ``near``, ``far``, ``levels``.
-            Raw signals omit ``inverse_depth`` (default False).
-        rgb: optional (N, H, W, 4) uint8 RGBA view track.
-    """
-    if not signals:
-        raise ValueError("need at least one signal")
+def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
+    """Encode lossless uint16 signals (+ optional RGB) to WebM bytes."""
+    signals = dict(signals or {})
+    if not signals and rgb is None:
+        raise ValueError("need at least one signal or rgb")
     specs = dict(specs or {})
     ids = list(signals.keys())
     arrays = []
     dims = None
-    for sid in ids:
-        arr = np.ascontiguousarray(signals[sid], dtype=np.uint16)
-        if arr.ndim != 3:
-            raise ValueError(f"signal {sid!r} must be (N, H, W)")
-        if dims is None:
-            dims = arr.shape
-        elif dims != arr.shape:
-            raise ValueError(f"signal {sid!r} shape {arr.shape} != {dims}")
-        arrays.append(arr)
-    N, H, W = dims
+    if not ids:
+        if rgb is None:
+            raise ValueError("need at least one signal or rgb")
+        N, H, W = rgb.shape[:3]
+    else:
+        for sid in ids:
+            arr = np.ascontiguousarray(signals[sid], dtype=np.uint16)
+            if arr.ndim != 3:
+                raise ValueError(f"signal {sid!r} must be (N, H, W)")
+            if dims is None:
+                dims = arr.shape
+            elif dims != arr.shape:
+                raise ValueError(f"signal {sid!r} shape {arr.shape} != {dims}")
+            arrays.append(arr)
+        N, H, W = dims
 
     rgb_p = u8p()
     if rgb is not None:
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         if rgb.ndim != 4 or rgb.shape[3] != 4:
             raise ValueError("rgb must be (N, H, W, 4) RGBA")
-        if rgb.shape[:3] != dims:
-            raise ValueError(f"rgb {rgb.shape[:3]} vs signals {dims}")
+        if ids and rgb.shape[:3] != (N, H, W):
+            raise ValueError(f"rgb {rgb.shape[:3]} vs signals {(N, H, W)}")
         rgb_p = rgb.ctypes.data_as(u8p)
+        if not ids:
+            N, H, W = rgb.shape[:3]
 
     c_specs = (_SignalSpec * len(ids))()
     for i, sid in enumerate(ids):
         sp = specs.get(sid, {})
-        if sid == "depth" and "inverse_depth" not in sp and not sp:
-            sp = _default_depth_spec(near, far, levels)
         inv = bool(sp.get("inverse_depth", False))
+        if inv and ("near" not in sp or "far" not in sp):
+            raise ValueError(f"signal {sid!r}: inverse_depth requires near and far in specs")
         c_specs[i].id = sid.encode("utf-8")
         c_specs[i].data = arrays[i].ctypes.data_as(u16p)
         c_specs[i].inverse_depth = 1 if inv else 0
-        c_specs[i].near_ = sp.get("near", near)
-        c_specs[i].far_ = sp.get("far", far)
-        c_specs[i].levels = sp.get("levels", levels)
+        c_specs[i].near_ = sp.get("near", 0.0)
+        c_specs[i].far_ = sp.get("far", 0.0)
+        c_specs[i].levels = sp.get("levels", LEVELS_FULL)
     out, out_len = u8p(), _Z()
     rc = _lib.dc_encode_multi(
-        rgb_p, rgb_kbps, c_specs, len(ids), W, H, N, fps, ctypes.byref(out), ctypes.byref(out_len),
+        rgb_p, rgb_kbps, c_specs if ids else None, len(ids), W, H, N, fps,
+        ctypes.byref(out), ctypes.byref(out_len),
     )
     if rc:
         raise RuntimeError(f"encode failed ({rc})")
     return _take(out, out_len)
 
 
-def encode_depth(depth, fps=30, near=0.2, far=10.0, levels=LEVELS_FULL):
-    """Encode a (N, H, W) uint16 depth array to ChromaPakZ WebM bytes."""
-    return encode({"depth": depth}, specs={"depth": _default_depth_spec(near, far, levels)}, fps=fps)
-
-
-def encode_rgbd(rgb, depth, fps=30, near=0.2, far=10.0, rgb_kbps=2000, levels=LEVELS_FULL):
-    """Encode RGB + depth. rgb/depth may be None (track omitted)."""
-    if rgb is None and depth is None:
-        raise ValueError("need rgb and/or depth")
-    sigs = {}
-    specs = {}
-    if depth is not None:
-        sigs["depth"] = depth
-        specs["depth"] = _default_depth_spec(near, far, levels)
-    return encode(sigs, specs=specs, rgb=rgb, fps=fps, rgb_kbps=rgb_kbps)
-
-
 def parse_metadata(data):
-    """Return the CHROMAPAKZ metadata dict (v2 ``signals[]`` or legacy ``depth``)."""
+    """Return the CHROMAPAKZ metadata dict (v2 ``signals[]``)."""
     buf = _buf(data)
     json_out, json_len = ctypes.c_char_p(), _Z()
     rc = _lib.dc_get_metadata(buf, len(data), ctypes.byref(json_out), ctypes.byref(json_len))
@@ -210,13 +181,8 @@ def decode_signal(data, signal_id):
     return out
 
 
-def decode_depth(data):
-    """Decode the depth signal to (N, H, W) uint16."""
-    return decode_signal(data, "depth")
-
-
 def decode_rgb(data):
-    """Decode the RGB track to (N, H, W, 4) uint8 RGBA (raises if no RGB track)."""
+    """Decode the RGB track to (N, H, W, 4) uint8 RGBA."""
     info = probe(data)
     if not info["has_rgb"]:
         raise RuntimeError("file has no RGB track")
@@ -229,14 +195,9 @@ def decode_rgb(data):
 
 
 def decode(data, signal_ids=None):
-    """Decode all (or selected) signals and optional RGB.
-
-    Returns dict with ``metadata``, ``signals`` (id -> ndarray), and ``rgb`` if present.
-    """
+    """Decode selected or all signals and optional RGB."""
     info = probe(data)
-    ids = signal_ids
-    if ids is None:
-        ids = [s["id"] for s in info["signals"]]
+    ids = signal_ids if signal_ids is not None else [s["id"] for s in info["signals"]]
     out = {"metadata": info["metadata"], "signals": {}, "width": info["width"],
            "height": info["height"], "frames": info["frames"], "fps": info["fps"]}
     for sid in ids:

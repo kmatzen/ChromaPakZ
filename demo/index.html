@@ -201,7 +201,6 @@ function depthColor(z,near,far,out,o){
 function depthQuant(meta){
   const s=meta.signals?.find(x=>x.id==='depth');
   if(s?.quant?.type==='inverse-depth') return { near:s.quant.near, far:s.quant.far };
-  if(meta.depth?.near!=null) return { near:meta.depth.near, far:meta.depth.far };
   return null;
 }
 
@@ -216,7 +215,7 @@ function render(){
   else if(S.rgb){ const id=new ImageData(new Uint8ClampedArray(S.rgb[f]),W,H);
     rgbCanvas.getContext('2d').putImageData(id,0,0); }
   // Depth (prefer decoded float; fall back to source)
-  const Zf=S.dec&&S.dec.depthFloat?S.dec.depthFloat[f]:(S.depthFloat?S.depthFloat[f]:null);
+  const Zf=S.dec?.signalSeries?.depth?.[f]?.float ?? (S.depthFloat?S.depthFloat[f]:null);
   if(Zf){ const buf=new Uint8ClampedArray(W*H*4);
     const q=S.dec?depthQuant(S.dec.metadata):null;
     const near=q?q.near:S.near, far=q?q.far:S.far;
@@ -227,13 +226,13 @@ function render(){
   $('#rgbDims').textContent=`${W}×${H}`;
 }
 function showViewer(src){ S.src=src; $('#viewerCard').style.display=''; $('#viewerSrc').textContent='· '+src;
-  const N=S.dec?S.dec.depthU16.length:S.N; $('#frame').max=N-1; setupCanvases(S.dec?S.dec.width:S.W,S.dec?S.dec.height:S.H);
+  const N=S.dec?(S.dec.signalSeries?.depth?.length??0):S.N; $('#frame').max=N-1; setupCanvases(S.dec?S.dec.width:S.W,S.dec?S.dec.height:S.H);
   S.frame=Math.min(S.frame,N-1); render(); }
 
 $('#frame').oninput=e=>{S.frame=+e.target.value;render();};
 let raf=0;
 $('#play').onclick=()=>{ S.playing=!S.playing; $('#play').textContent=S.playing?'❚❚ Pause':'▶ Play';
-  const N=()=>S.dec?S.dec.depthU16.length:S.N; let last=0;
+  const N=()=>S.dec?(S.dec.signalSeries?.depth?.length??0):S.N; let last=0;
   const tick=ts=>{ if(!S.playing)return; if(ts-last>1000/S.fps){last=ts;S.frame=(S.frame+1)%N();render();}
     raf=requestAnimationFrame(tick); }; if(S.playing)raf=requestAnimationFrame(tick); else cancelAnimationFrame(raf); };
 
@@ -247,8 +246,8 @@ $('#encode').onclick=async()=>{ $('#encode').disabled=true; $('#hint').textConte
   const levels=1<<S.bits;
   S.refCodes=S.depthFloat.map(z=>DC.quantizeInverseDepth(z,S.near,S.far,levels));
   const t0=performance.now();
-  const enc=DC.createEncoder({W:S.W,H:S.H,fps:S.fps,near:S.near,far:S.far,levels,rgbKbps:S.kbps*1000});
-  for(let i=0;i<S.N;i++) await enc.addFrame({rgb:S.rgb[i],depthFloat:S.depthFloat[i]});
+  const enc=DC.createEncoder({W:S.W,H:S.H,fps:S.fps,signals:[{id:'depth',near:S.near,far:S.far,levels}],rgbKbps:S.kbps*1000});
+  for(let i=0;i<S.N;i++) await enc.addFrame({rgb:S.rgb[i],signals:{depth:{float:S.depthFloat[i]}}});
   S.bytes=await enc.finish();
   const encMs=performance.now()-t0;
   reportEncode(encMs); $('#decode').disabled=false; $('#encode').disabled=false;
@@ -257,18 +256,21 @@ $('#encode').onclick=async()=>{ $('#encode').disabled=true; $('#hint').textConte
 $('#decode').onclick=async()=>{ $('#decode').disabled=true; $('#hint').textContent='decoding…';
   const t0=performance.now();
   const dec=DC.createDecoder(S.bytes);
-  const out={metadata:dec.metadata,width:dec.width,height:dec.height,rgb:[],depthU16:[],depthFloat:[]};
+  const out={metadata:dec.metadata,width:dec.width,height:dec.height,rgb:[],signalSeries:{}};
   for await (const frame of dec){
     if(frame.rgb) out.rgb.push(frame.rgb);
-    if(frame.depthU16) out.depthU16.push(frame.depthU16);
-    if(frame.depthFloat) out.depthFloat.push(frame.depthFloat);
+    for(const [id,sig] of Object.entries(frame.signals??{})){
+      if(!out.signalSeries[id]) out.signalSeries[id]=[];
+      out.signalSeries[id].push(sig);
+    }
   }
   await dec.close();
-  S.dec=out; const decMs=performance.now()-t0;
+  S.dec=out;
+  const depthSeries=out.signalSeries.depth??[]; const decMs=performance.now()-t0;
   $('#sDec').textContent=decMs.toFixed(0)+' ms';
   // bit-exact check vs source codes (only when we generated the source)
   let exact=null,dMax=0;
-  if(S.refCodes){ exact=true; for(let i=0;i<S.refCodes.length;i++){const A=S.refCodes[i],B=S.dec.depthU16[i];
+  if(S.refCodes){ exact=true; for(let i=0;i<S.refCodes.length;i++){const A=S.refCodes[i],B=depthSeries[i]?.u16;
     for(let j=0;j<A.length;j++){const d=Math.abs(A[j]-B[j]);if(d>dMax)dMax=d;if(d)exact=false;}}}
   $('#sVerify').innerHTML = exact===null?'<span class="muted">n/a (loaded)</span>'
     : exact?'<span class="pill ok">bit-exact ✓</span>':`<span class="pill bad">Δ=${dMax}</span>`;

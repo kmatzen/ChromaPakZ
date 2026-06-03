@@ -110,8 +110,8 @@ if (MODE === 'caps') {
   if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
   console.log(`\nStreaming API round-trip · ${SIZE}×${SIZE} × ${N} frames\n`);
   console.log(`  createEncoder→createDecoder depth bit-exact: ${out.exact ? 'YES ✓' : 'NO ✗ (max Δ=' + out.dMax + ')'}`);
-  console.log(`  batch encode(depthFloat, auto near/far) bit-exact: ${out.batchExact ? 'YES ✓' : 'NO ✗'}`);
-  console.log(`  encode(depthU16) without near/far throws: ${out.throwsMissing ? 'YES ✓' : 'NO ✗'}`);
+  console.log(`  batch encode(signals+frames) bit-exact: ${out.batchExact ? 'YES ✓' : 'NO ✗'}`);
+  console.log(`  createEncoder without signals throws: ${out.throwsMissing ? 'YES ✓' : 'NO ✗'}`);
   console.log(`  metadata signals: ${out.signalCount}`);
   console.log(`  near/far metadata: ${out.near.toFixed(3)}–${out.far.toFixed(3)}`);
   if (!out.exact || !out.batchExact || !out.throwsMissing) process.exitCode = 1;
@@ -145,7 +145,7 @@ if (MODE === 'caps') {
     console.log(`  ${String(t.n).padEnd(6)} ${(t.name||'').padEnd(11)} ${t.codec.padEnd(7)} ` +
       `${(t.w+'×'+t.h).padEnd(11)} ${String(t.frames).padStart(4)}   ${String(t.bytes).padStart(8)}   ` +
       `${(t.bytes*8/(out.W*out.H*out.N)).toFixed(3)}`);
-  console.log(`\n  metadata signals: ${JSON.stringify(out.metadata.signals?.map(s=>s.id) ?? out.metadata.depth)}`);
+  console.log(`\n  metadata signals: ${JSON.stringify(out.metadata.signals?.map(s=>s.id))}`);
   const [b64, depthB64] = await page.evaluate(() => [window.__lastWebM, window.__lastDepth]);
   fs.writeFileSync(path.join(dir, 'sample.webm'), Buffer.from(b64, 'base64'));
   fs.writeFileSync(path.join(dir, 'sample.u16'), Buffer.from(depthB64, 'base64'));

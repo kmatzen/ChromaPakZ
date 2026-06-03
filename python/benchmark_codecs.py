@@ -54,7 +54,7 @@ def png16_size(codes16):
 
 
 def chromapakz_size(c16, levels):
-    data = dc.encode_depth(c16, fps=30, near=near, far=far, levels=levels)
+    data = dc.encode({"depth": c16}, specs={"depth": dc.inverse_depth_spec(near, far, levels)}, fps=30)
     ts = webm_inspect.track_sizes(data)
     return sum(t["bytes"] for t in ts.values() if t["name"].startswith("depth"))
 

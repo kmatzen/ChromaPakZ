@@ -152,8 +152,13 @@ def encode_clip(depth=None, rgb=None, near=None, far=None, fps=30, rgb_kbps=2000
     if codes is not None and rgba is not None and codes.shape != rgba.shape[:3]:
         raise ValueError(f"depth {codes.shape} vs rgb {rgba.shape[:3]} dimension mismatch")
 
-    data = dc.encode_rgbd(rgba, codes, fps=fps, near=near or 0.2, far=far or 10.0,
-                          rgb_kbps=rgb_kbps, levels=levels)
+    data = dc.encode(
+        {"depth": codes} if codes is not None else {},
+        specs={"depth": dc.inverse_depth_spec(near or 0.2, far or 10.0, levels)} if codes is not None else None,
+        rgb=rgba,
+        fps=fps,
+        rgb_kbps=rgb_kbps,
+    )
 
     shape = (codes if codes is not None else rgba).shape
     N, H, W = shape[0], shape[1], shape[2]
@@ -213,7 +218,7 @@ def _main(argv):
     if a.verify and depth is not None:
         codes = depth.astype(np.uint16) if not np.issubdtype(depth.dtype, np.floating) \
             else to_codes(depth, stats["near"], stats["far"], levels)
-        back = dc.decode_depth(data)
+        back = dc.decode_signal(data, "depth")
         ok = np.array_equal(back, codes)
         print(f"  verify: depth codes bit-exact = {'YES' if ok else 'NO (maxΔ=%d)' % np.abs(back.astype(int)-codes).max()}")
 

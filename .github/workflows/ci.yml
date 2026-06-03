@@ -67,6 +67,7 @@ jobs:
           npx playwright install --with-deps chromium
           node ../../tests/js_quant.mjs
           node ../../tests/js_signals.mjs
+          node ../../tests/js_metadata_v2.mjs
           node ../../tests/webm_stream.mjs
           BROWSER=chromium node run.mjs single 256 | tee out.txt
           grep -q "EXACT" out.txt

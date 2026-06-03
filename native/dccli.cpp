@@ -19,6 +19,12 @@ static void writeFile(const char* p, const uint8_t* d, size_t n){
   FILE* f=fopen(p,"wb"); if(!f){ perror(p); exit(1); } fwrite(d,1,n,f); fclose(f);
 }
 
+static int encodeDepthOnly(const uint16_t* depth, int W, int H, int N, int fps,
+                           double near_, double far_, int levels, uint8_t** out, size_t* out_len){
+  dc_signal_spec_t spec{"depth", depth, 1, near_, far_, levels>0?levels:65536};
+  return dc_encode_multi(nullptr, 0, &spec, 1, W, H, N, fps, out, out_len);
+}
+
 int main(int argc, char** argv){
   if(argc<2){ fprintf(stderr,"usage: dccli <selftest|decode|decodesignal|encode|info|...> ...\n"); return 2; }
   std::string cmd=argv[1];
@@ -34,9 +40,9 @@ int main(int argc, char** argv){
         long zi=(long)(z<0?0:(z>65535?65535:z)); depth[(size_t)f*px+r*W+c]=(uint16_t)zi; } }
 
     uint8_t* buf; size_t len;
-    if(dc_encode_depth(depth.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
+    if(encodeDepthOnly(depth.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
     std::vector<uint16_t> back((size_t)px*N);
-    if(dc_decode_depth(buf,len,back.data())){ fprintf(stderr,"decode failed\n"); return 1; }
+    if(dc_decode_signal(buf,len,"depth",back.data())){ fprintf(stderr,"decode failed\n"); return 1; }
     int dMax=0; for(size_t i=0;i<back.size();i++){ int dd=abs((int)depth[i]-(int)back[i]); if(dd>dMax) dMax=dd; }
     printf("selftest: %dx%d x%d  file=%.1f KiB  bit-exact=%s (maxΔ=%d)\n",
            W,H,N,len/1024.0, dMax==0?"YES":"NO", dMax);
@@ -58,7 +64,7 @@ int main(int argc, char** argv){
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
     std::vector<uint16_t> depth((size_t)W*H*N);
-    if(dc_decode_depth(webm.data(),webm.size(),depth.data())){ fprintf(stderr,"decode failed\n"); return 1; }
+    if(dc_decode_signal(webm.data(),webm.size(),"depth",depth.data())){ fprintf(stderr,"decode failed\n"); return 1; }
     writeFile(argv[3],(uint8_t*)depth.data(),depth.size()*2);
     printf("decoded %dx%d x%d → %s\n",W,H,N,argv[3]); return 0;
   }
@@ -69,7 +75,7 @@ int main(int argc, char** argv){
     double near_=atof(argv[7]),far_=atof(argv[8]);
     if(raw.size()!=(size_t)W*H*N*2){ fprintf(stderr,"size mismatch: %zu vs %d\n",raw.size(),W*H*N*2); return 1; }
     uint8_t* buf; size_t len;
-    if(dc_encode_depth((const uint16_t*)raw.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
+    if(encodeDepthOnly((const uint16_t*)raw.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
     writeFile(argv[9],buf,len); printf("encoded → %s (%.1f KiB)\n",argv[9],len/1024.0); dc_free(buf); return 0;
   }
 
@@ -81,7 +87,8 @@ int main(int argc, char** argv){
     if(rgb.size()!=(size_t)W*H*N*4){ fprintf(stderr,"rgba size mismatch\n"); return 1; }
     if(dep.size()!=(size_t)W*H*N*2){ fprintf(stderr,"depth size mismatch\n"); return 1; }
     uint8_t* buf; size_t len;
-    if(dc_encode_rgbd(rgb.data(),(const uint16_t*)dep.data(),W,H,N,fps,kbps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
+    dc_signal_spec_t spec{"depth", (const uint16_t*)dep.data(), 1, near_, far_, 65536};
+    if(dc_encode_multi(rgb.data(), kbps, &spec, 1, W, H, N, fps, &buf, &len)){ fprintf(stderr,"encode failed\n"); return 1; }
     writeFile(argv[11],buf,len); printf("encoded RGBD → %s (%.1f KiB)\n",argv[11],len/1024.0); dc_free(buf); return 0;
   }
 

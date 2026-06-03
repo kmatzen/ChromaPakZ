@@ -13,7 +13,6 @@ import {
   planSignals,
   buildTracksFromPlan,
   buildFileMetadata,
-  defaultDepthSpec,
   normalizeMetadata,
   u16FromFramePayload,
   materializeSignal,
@@ -108,10 +107,9 @@ function createTrackDecoder(W, H, readFn){
   };
 }
 
-function resolveSignalSpecs({ signals, near, far, levels }){
-  if(signals?.length) return signals;
-  if(near !== undefined || far !== undefined) return [defaultDepthSpec(near, far, levels)];
-  return [];
+function resolveSignalSpecs(signals){
+  if(!signals?.length) throw new Error('createEncoder: signals[] required');
+  return signals;
 }
 
 function makeFrameReader({ meta, W, H, blocks }){
@@ -146,11 +144,6 @@ function makeFrameReader({ meta, W, H, blocks }){
         const lo=await sigDec[s.id].lo.next();
         if(hi && lo) out.signals[s.id]=materializeSignal(triFoldUnpack(hi, lo), s);
       }
-
-      if(out.signals.depth){
-        out.depthU16=out.signals.depth.u16;
-        if(out.signals.depth.float) out.depthFloat=out.signals.depth.float;
-      }
       return out;
     },
 
@@ -176,11 +169,10 @@ function makeFrameReader({ meta, W, H, blocks }){
 
 // ── streaming encode ──
 /**
- * @param signals — e.g. [{ id:'depth', near, far }, { id:'objectId' }] or use legacy near/far for depth only
+ * @param signals — e.g. [{ id:'depth', near, far }, { id:'objectId' }]
  */
-export function createEncoder({ W, H, fps=30, signals=null, near, far, levels=LEVELS_FULL,
-  rgbKbps=2_000_000, onChunk=null }){
-  const specList=resolveSignalSpecs({ signals, near, far, levels });
+export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null }){
+  const specList=resolveSignalSpecs(signals);
   let n=0, hasRgb=false;
   let signalPlan=null;
   let rgbEnc=null;
@@ -297,25 +289,11 @@ export function createEncoder({ W, H, fps=30, signals=null, near, far, levels=LE
   };
 }
 
-export async function encode({ W, H, fps=30, rgbFrames=null, depthU16=null, depthFloat=null, signals=null,
-  near, far, levels=LEVELS_FULL, rgbKbps=2_000_000, onChunk=null }){
-  if(!signals?.length && (depthU16 || depthFloat)){
-    if(depthFloat && (near===undefined || far===undefined)) ({ near, far }=autoNearFar(depthFloat));
-    if(near===undefined || far===undefined) throw new Error('near and far required for depth');
-  }
-  const N=depthU16 ? depthU16.length : depthFloat ? depthFloat.length
-    : rgbFrames ? rgbFrames.length : 0;
-  const enc=createEncoder({ W, H, fps, signals, near, far, levels, rgbKbps, onChunk });
-  for(let i=0;i<N;i++){
-    await enc.addFrame({
-      rgb: rgbFrames?.[i] ?? null,
-      signals: depthU16 || depthFloat ? {
-        depth: depthU16 ? { u16: depthU16[i] } : { float: depthFloat[i] },
-      } : null,
-      depthU16: depthU16?.[i] ?? null,
-      depthFloat: depthFloat?.[i] ?? null,
-    });
-  }
+export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000, onChunk=null }){
+  if(!signals?.length) throw new Error('encode: signals[] required');
+  if(!frames?.length) throw new Error('encode: frames[] required');
+  const enc=createEncoder({ W, H, fps, signals, rgbKbps, onChunk });
+  for(const fr of frames) await enc.addFrame(fr);
   return enc.finish();
 }
 
@@ -438,12 +416,9 @@ function createNetworkDecoder(){
 
 export async function decode(bytes){
   const dec=createDecoder(bytes);
-  const rgb=[], depthU16=[], depthFloat=[];
-  const signalSeries={};
+  const rgb=[], signalSeries={};
   for await (const frame of dec){
     if(frame.rgb) rgb.push(frame.rgb);
-    if(frame.depthU16) depthU16.push(frame.depthU16);
-    if(frame.depthFloat) depthFloat.push(frame.depthFloat);
     for(const [id, sig] of Object.entries(frame.signals ?? {})){
       if(!signalSeries[id]) signalSeries[id]=[];
       signalSeries[id].push(sig);
@@ -452,8 +427,6 @@ export async function decode(bytes){
   await dec.close();
   return { metadata:dec.metadata, width:dec.width, height:dec.height, signals:dec.signals,
     rgb: rgb.length ? rgb : null,
-    depthU16: depthU16.length ? depthU16 : null,
-    depthFloat: depthFloat.length ? depthFloat : null,
     signalSeries: Object.keys(signalSeries).length ? signalSeries : null };
 }
 

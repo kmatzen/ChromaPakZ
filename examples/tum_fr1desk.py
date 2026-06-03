@@ -37,9 +37,9 @@ N, H, W = depth.shape
 valid = depth > 0
 rgba = np.concatenate([rgb, np.full((N, H, W, 1), 255, np.uint8)], axis=-1)
 
-data = cz.encode_rgbd(rgba, depth, fps=30, near=0.5, far=5.0)
+data = cz.encode({"depth": depth}, specs={"depth": cz.inverse_depth_spec(0.5, 5.0)}, rgb=rgba, fps=30)
 px = N * W * H
-ok = np.array_equal(cz.decode_depth(data), depth)
+ok = np.array_equal(cz.decode_signal(data, "depth"), depth)
 
 print(f"TUM fr1/desk · {N} frames {W}×{H} · valid depth {100*valid.mean():.0f}% · "
       f"range {depth[valid].min()/5000:.2f}–{depth[valid].max()/5000:.2f} m")
