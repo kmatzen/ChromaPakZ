@@ -226,6 +226,16 @@ Findings:
 - Synthetic data only so far — real-sensor bitrate will differ (noise-dominated; §7 shows the trend).
 - No Cues/Duration yet (seekable `<video>` playback); native RGB GOP mirrors the browser (one keyframe).
 
+### Tooling caveats (found while validating)
+- **Full color range must be signaled.** Depth luma is packed full-range 0–255; the streams now emit
+  `VP9E_SET_COLOR_RANGE = full` so range-honouring decoders (ffmpeg) return the luma unscaled. Without it
+  the bitstream defaults to limited ("tv") range and ffmpeg rescales/clips depth on decode (measured
+  maxΔ=20). Our own/WebCodecs readers only escaped this by reading the raw plane; the flag is the robust fix.
+- **Don't encode with the ffmpeg CLI.** `ffmpeg -c:v libvpx-vp9 -lossless 1` is bit-exact but ~3× larger
+  (≈39 vs ≈13 bpp) than ChromaPakZ's direct-libvpx settings — same library, far worse lossless decisions,
+  and no flag tested closed the gap. Encode with ChromaPakZ (native libvpx / WebCodecs); **decode** with any
+  conformant VP9 decoder is fine. CI guards this with an ffmpeg decode-interop check.
+
 ## 13. Sources
 
 VP9 https://en.wikipedia.org/wiki/VP9 · AV1 https://en.wikipedia.org/wiki/AV1 ·

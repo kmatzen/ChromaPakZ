@@ -5,35 +5,40 @@ import * as DC from '../../src/chromapakz.js';
 import { demux } from '../../src/webm.js';
 import { SCHEMES } from './probe.js';
 
-// True codec rate-distortion: feed ALREADY-QUANTIZED uint16 depth through the VP9 encode/decode
-// path at varying QP, measure PSNR of decoded-vs-source codes (QP0 = lossless = exact).
-window.__rdSweep = async (W=256, H=256) => {
-  const depth = makeDepth(W, H);                 // uint16 codes (already quantized)
+// True codec rate-distortion: feed ALREADY-QUANTIZED uint16 depth (a multi-frame clip) through the
+// real VP9 encode/decode path (inter-coded) at varying QP; measure PSNR of decoded-vs-source codes
+// (QP0 = lossless = exact). Also export the exact codes so Python can score FFV1/PNG on the same data.
+window.__rdSweep = async (W=256, H=256, N=12) => {
+  const seq = makeDepthSeq(W, H, N);             // array of uint16 code frames (already quantized)
   const sch = SCHEMES['triangle-fold'];
-  const { hi, lo } = sch.pack(depth);
-  const codec = 'vp09.00.10.08', PEAK = 65535;
-  const frame = plane => { const buf=new Uint8Array(W*H+2*(W>>1)*(H>>1));
+  const packed = seq.map(sch.pack);
+  const hiSeq = packed.map(p=>p.hi), loSeq = packed.map(p=>p.lo);
+  const codec = 'vp09.00.10.08', PEAK = 65535, PX = W*H*N;
+  const frame = (plane,i) => { const buf=new Uint8Array(W*H+2*(W>>1)*(H>>1));
     buf.set(plane,0); buf.fill(128,W*H);
-    return new VideoFrame(buf,{format:'I420',codedWidth:W,codedHeight:H,timestamp:0,
+    return new VideoFrame(buf,{format:'I420',codedWidth:W,codedHeight:H,timestamp:i*1000,
       colorSpace:{primaries:'bt709',transfer:'iec61966-2-1',matrix:'bt709',fullRange:true}}); };
   const readY = async f => { const d=new Uint8Array(f.allocationSize()); const L=await f.copyTo(d); const y=L[0];
     const o=new Uint8Array(W*H); for(let r=0;r<H;r++) o.set(d.subarray(y.offset+r*y.stride,y.offset+r*y.stride+W),r*W); return o; };
-  const rt = (plane, qp) => new Promise((res,rej)=>{ let bytes=0, rec=null;
-    const dec=new VideoDecoder({output:async f=>{try{rec=await readY(f);}finally{f.close();}},error:rej});
+  const rtSeq = (planes, qp) => new Promise((res,rej)=>{ let bytes=0; const rec=[];
+    const dec=new VideoDecoder({output:async f=>{try{rec.push(await readY(f));}finally{f.close();}},error:rej});
     const enc=new VideoEncoder({output:(c,m)=>{if(m?.decoderConfig)dec.configure(m.decoderConfig);bytes+=c.byteLength;dec.decode(c);},error:rej});
     enc.configure({codec,width:W,height:H,bitrateMode:'quantizer',latencyMode:'quality'});
-    const fr=frame(plane); enc.encode(fr,{keyFrame:true,vp9:{quantizer:qp}}); fr.close();
+    planes.forEach((p,i)=>{const fr=frame(p,i);enc.encode(fr,{keyFrame:i===0,vp9:{quantizer:qp}});fr.close();});
     enc.flush().then(()=>dec.flush()).then(()=>{enc.close();dec.close();res({bytes,rec});}).catch(rej); });
   const rows=[];
-  for(const qp of [0,4,8,16,24,32,48,63]){
-    const rhi=await rt(hi,qp), rlo=await rt(lo,qp);
-    const d2=sch.unpack(rhi.rec, rlo.rec);
-    let se=0; for(let i=0;i<depth.length;i++){ const e=depth[i]-d2[i]; se+=e*e; }
-    const mse=se/depth.length;
-    rows.push({ qp, bpp:(rhi.bytes+rlo.bytes)*8/(W*H), mse, exact:mse===0,
+  for(const qp of [0,8,16,24,32,48,63]){
+    const rh=await rtSeq(hiSeq,qp), rl=await rtSeq(loSeq,qp);
+    let se=0; for(let i=0;i<N;i++){ const d2=sch.unpack(rh.rec[i], rl.rec[i]), src=seq[i];
+      for(let j=0;j<src.length;j++){ const e=src[j]-d2[j]; se+=e*e; } }
+    const mse=se/PX;
+    rows.push({ qp, bpp:(rh.bytes+rl.bytes)*8/PX, mse, exact:mse===0,
       psnr: mse===0 ? null : 10*Math.log10(PEAK*PEAK/mse) });
   }
-  return rows;
+  const raw=new Uint8Array(PX*2); const dv=new DataView(raw.buffer);
+  for(let i=0;i<N;i++) for(let j=0;j<W*H;j++) dv.setUint16((i*W*H+j)*2, seq[i][j], true);
+  let bin=''; for(let i=0;i<raw.length;i++) bin+=String.fromCharCode(raw[i]);
+  return { rows, codesB64: btoa(bin), W, H, N };
 };
 
 // Decode an externally-supplied .webm (e.g. made by the C++/Python impl) and, if a raw
