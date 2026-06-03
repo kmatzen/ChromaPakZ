@@ -175,10 +175,145 @@ Demuxed demux(const uint8_t* b, size_t len){
   return d;
 }
 
-// ── tiny JSON field extractor for our own deterministic metadata ──
+// ── metadata (v2 signals + v1 depth legacy) ──
 bool jnum(const std::string& j, const char* key, double& out){
   std::string k = std::string("\"")+key+"\":"; auto p=j.find(k); if(p==std::string::npos) return false;
-  p+=k.size(); out=strtod(j.c_str()+p, nullptr); return true;
+  p+=k.size(); while(p<j.size() && (j[p]==' '||j[p]=='\t')) p++;
+  out=strtod(j.c_str()+p, nullptr); return true;
+}
+bool jstr(const std::string& j, const char* key, std::string& out){
+  std::string k = std::string("\"")+key+"\":"; auto p=j.find(k); if(p==std::string::npos) return false;
+  p+=k.size(); while(p<j.size() && (j[p]==' '||j[p]=='\t')) p++;
+  if(p>=j.size() || j[p]!='"') return false; p++;
+  auto e=j.find('"',p); if(e==std::string::npos) return false;
+  out=j.substr(p,e-p); return true;
+}
+bool jint(const std::string& j, const char* key, int& out){
+  double v; if(!jnum(j,key,v)) return false; out=(int)v; return true;
+}
+
+struct SignalQuantMeta { bool inverse_depth=false; double near_=0, far_=0; int levels=65536; };
+struct SignalMeta { std::string id; int track_hi=0, track_lo=0; SignalQuantMeta quant; };
+struct FileMeta {
+  int version=1, width=0, height=0, fps=30, frames=0;
+  bool has_rgb=false; int rgb_track=1;
+  std::vector<SignalMeta> signals;
+};
+
+void parseSignalsV2(const std::string& j, FileMeta& m){
+  auto start=j.find("\"signals\":[");
+  if(start==std::string::npos) return;
+  start+=11;
+  auto arr_end=j.find(']', start);
+  if(arr_end==std::string::npos) return;
+  size_t pos=start;
+  while(pos<arr_end){
+    auto idk=j.find("\"id\":", pos);
+    if(idk==std::string::npos || idk>=arr_end) break;
+    SignalMeta s;
+    size_t p=idk+5; while(p<j.size() && j[p]==' ') p++;
+    if(j[p]!='"'){ pos=idk+1; continue; }
+    p++; auto e=j.find('"', p); if(e==std::string::npos) break;
+    s.id=j.substr(p,e-p);
+    size_t chunk_end=std::min(arr_end, e+480);
+    std::string chunk=j.substr(idk, chunk_end-idk);
+    double hi=0, lo=0;
+    if(jnum(chunk,"hi",hi)) s.track_hi=(int)hi;
+    if(jnum(chunk,"lo",lo)) s.track_lo=(int)lo;
+    if(chunk.find("inverse-depth")!=std::string::npos){
+      s.quant.inverse_depth=true;
+      jnum(chunk,"near",s.quant.near_); jnum(chunk,"far",s.quant.far_);
+      double lv; if(jnum(chunk,"levels",lv)) s.quant.levels=(int)lv;
+    }
+    m.signals.push_back(s);
+    pos=e+1;
+  }
+}
+
+void parseLegacyDepth(const std::string& j, FileMeta& m){
+  if(j.find("\"depth\":null")!=std::string::npos) return;
+  if(j.find("\"depth\":") == std::string::npos) return;
+  SignalMeta s; s.id="depth"; s.quant.inverse_depth=true;
+  double hi=2, lo=3, lv=65536;
+  jnum(j,"trackHi",hi); jnum(j,"trackLo",lo);
+  s.track_hi=(int)hi; s.track_lo=(int)lo;
+  jnum(j,"near",s.quant.near_); jnum(j,"far",s.quant.far_);
+  if(jnum(j,"levels",lv)) s.quant.levels=(int)lv;
+  m.signals.push_back(s);
+}
+
+FileMeta parseMetadata(const std::string& j){
+  FileMeta m; m.has_rgb = j.find("\"rgb\":null")==std::string::npos && j.find("\"rgb\":")!=std::string::npos;
+  double v;
+  jnum(j,"width",v); m.width=(int)v;
+  jnum(j,"height",v); m.height=(int)v;
+  jnum(j,"fps",v); m.fps=(int)v;
+  jnum(j,"frames",v); m.frames=(int)v;
+  jnum(j,"version",v); m.version = v>0 ? (int)v : 1;
+  if(m.version>=2) parseSignalsV2(j,m);
+  if(m.signals.empty()) parseLegacyDepth(j,m);
+  return m;
+}
+
+const SignalMeta* findSignal(const FileMeta& m, const char* id){
+  for(auto& s : m.signals) if(s.id==id) return &s;
+  return nullptr;
+}
+
+std::string quantJson(const SignalQuantMeta& q){
+  if(!q.inverse_depth) return "null";
+  char buf[128];
+  snprintf(buf,sizeof buf,"{\"type\":\"inverse-depth\",\"near\":%g,\"far\":%g,\"levels\":%d}",
+           q.near_, q.far_, q.levels);
+  return buf;
+}
+
+std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::vector<SignalMeta>& signals){
+  std::string sigs="[";
+  for(size_t i=0;i<signals.size();i++){
+    if(i) sigs+=",";
+    const auto& s=signals[i];
+    char buf[512];
+    snprintf(buf,sizeof buf,
+      "{\"id\":\"%s\",\"tracks\":{\"hi\":%d,\"lo\":%d},\"codec\":\"vp09.00.10.08\","
+      "\"lossless\":true,\"scheme\":\"tri-fold-8+8\",\"dtype\":\"uint16\",\"invalidCode\":0,\"quant\":%s}",
+      s.id.c_str(), s.track_hi, s.track_lo, quantJson(s.quant).c_str());
+    sigs+=buf;
+  }
+  sigs+="]";
+  const SignalMeta* depthSig=nullptr;
+  for(auto& s : signals) if(s.id=="depth" && s.quant.inverse_depth){ depthSig=&s; break; }
+  std::string legacy="null";
+  if(depthSig){
+    char dep[460];
+    snprintf(dep,sizeof dep,
+      "{\"trackHi\":%d,\"trackLo\":%d,\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
+      "\"quant\":\"inverse-depth\",\"near\":%g,\"far\":%g,\"levels\":%d,\"invalidCode\":0,\"dtype\":\"uint16\"}",
+      depthSig->track_hi, depthSig->track_lo, depthSig->quant.near_, depthSig->quant.far_, depthSig->quant.levels);
+    legacy=dep;
+  }
+  std::string rgb = hasRgb ? "{\"track\":1,\"codec\":\"vp09.00.10.08\"}" : "null";
+  char out[4096];
+  snprintf(out,sizeof out,
+    "{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":%s,\"signals\":%s,\"depth\":%s}",
+    W,H,fps,N,rgb.c_str(),sigs.c_str(),legacy.c_str());
+  return out;
+}
+
+struct SignalEncodeSpec {
+  std::string id;
+  const uint16_t* data=nullptr;
+  SignalQuantMeta quant;
+};
+
+std::vector<SignalMeta> planSignalTracks(const std::vector<SignalEncodeSpec>& specs, bool hasRgb){
+  std::vector<SignalMeta> out;
+  int next=hasRgb?2:1;
+  for(auto& sp : specs){
+    SignalMeta s; s.id=sp.id; s.track_hi=next++; s.track_lo=next++; s.quant=sp.quant;
+    out.push_back(s);
+  }
+  return out;
 }
 
 // ── triangle-fold 8+8 ──
@@ -301,47 +436,65 @@ bool decodeRGBTrack(std::vector<Frame>& frs, int W, int H, std::vector<Bytes>& o
   vpx_codec_destroy(&c); return ok;
 }
 
-std::string makeMeta(int W,int H,int N,int fps,double near_,double far_,int levels,bool hasRgb,bool hasDepth){
-  std::string rgb = hasRgb ? "{\"track\":1,\"codec\":\"vp09.00.10.08\"}" : "null";
-  char dep[460];
-  if(hasDepth) snprintf(dep,sizeof dep,
-    "{\"trackHi\":2,\"trackLo\":3,\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
-    "\"quant\":\"inverse-depth\",\"near\":%g,\"far\":%g,\"levels\":%d,\"invalidCode\":0,\"dtype\":\"uint16\"}",
-    near_,far_,levels);
-  else snprintf(dep,sizeof dep,"null");
-  char buf[760];
-  snprintf(buf,sizeof buf,"{\"version\":1,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":%s,\"depth\":%s}",
-           W,H,fps,N,rgb.c_str(),dep);
-  return buf;
-}
-
-// Build a full file from optional RGB and/or depth. Buffers live for the duration of mux().
-int buildFile(const uint8_t* rgba, const uint16_t* depth, int W, int H, int N, int fps,
-              int kbps, double near_, double far_, int levels, Bytes& file){
+// Build a full file from optional RGB and lossless signals.
+int buildFileMulti(const uint8_t* rgba, int kbps,
+                   const std::vector<SignalEncodeSpec>& specs,
+                   int W, int H, int N, int fps, Bytes& file){
+  if(specs.empty() && !rgba) return 1;
   std::vector<Track> tracks; std::vector<Frame> frames;
-  std::vector<Bytes> rgbF, hiF, loF, hiP, loP; std::vector<bool> rgbK, hiK, loK;
+  bool hasRgb=rgba!=nullptr;
+  auto sigMeta=planSignalTracks(specs, hasRgb);
+  std::vector<Bytes> rgbF; std::vector<bool> rgbK;
   if(rgba){
     std::vector<const uint8_t*> p(N); for(int i=0;i<N;i++) p[i]=rgba+(size_t)i*W*H*4;
     if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbF,rgbK)) return 2;
     if((int)rgbF.size()!=N) return 6;
     tracks.push_back({1,"V_VP9","rgb",W,H});
   }
-  if(depth){
-    int px=W*H; hiP.resize(N); loP.resize(N); std::vector<const uint8_t*> hp(N),lp(N);
-    for(int i=0;i<N;i++){ hiP[i].resize(px); loP[i].resize(px);
-      pack(depth+(size_t)i*px,px,hiP[i].data(),loP[i].data()); hp[i]=hiP[i].data(); lp[i]=loP[i].data(); }
-    if(!encodePlaneSeq(hp,W,H,fps,hiF,hiK)) return 3;
-    if(!encodePlaneSeq(lp,W,H,fps,loF,loK)) return 4;
-    if((int)hiF.size()!=N || (int)loF.size()!=N) return 7;
-    tracks.push_back({2,"V_VP9","depth-hi",W,H}); tracks.push_back({3,"V_VP9","depth-lo",W,H});
+  int px=W*H;
+  struct SigEnc { std::vector<Bytes> hiF, loF, hiP, loP; std::vector<bool> hiK, loK; };
+  std::vector<SigEnc> enc(specs.size());
+  for(size_t si=0; si<specs.size(); si++){
+    auto& sp=specs[si]; auto& se=enc[si]; auto& sm=sigMeta[si];
+    if(!sp.data) return 1;
+    se.hiP.resize(N); se.loP.resize(N);
+    std::vector<const uint8_t*> hp(N), lp(N);
+    for(int i=0;i<N;i++){
+      se.hiP[i].resize(px); se.loP[i].resize(px);
+      pack(sp.data+(size_t)i*px, px, se.hiP[i].data(), se.loP[i].data());
+      hp[i]=se.hiP[i].data(); lp[i]=se.loP[i].data();
+    }
+    if(!encodePlaneSeq(hp,W,H,fps,se.hiF,se.hiK)) return 3;
+    if(!encodePlaneSeq(lp,W,H,fps,se.loF,se.loK)) return 4;
+    if((int)se.hiF.size()!=N || (int)se.loF.size()!=N) return 7;
+    char hiName[128], loName[128];
+    snprintf(hiName,sizeof hiName,"signal-%s-hi", sm.id.c_str());
+    snprintf(loName,sizeof loName,"signal-%s-lo", sm.id.c_str());
+    tracks.push_back({sm.track_hi,"V_VP9",hiName,W,H});
+    tracks.push_back({sm.track_lo,"V_VP9",loName,W,H});
   }
   for(int i=0;i<N;i++){ int t=(int)(1000.0*i/fps);
     if(rgba) frames.push_back({1,(bool)rgbK[i],t,rgbF[i].data(),rgbF[i].size()});
-    if(depth){ frames.push_back({2,(bool)hiK[i],t,hiF[i].data(),hiF[i].size()});
-               frames.push_back({3,(bool)loK[i],t,loF[i].data(),loF[i].size()}); } }
+    for(size_t si=0; si<specs.size(); si++){
+      auto& se=enc[si]; auto& sm=sigMeta[si];
+      frames.push_back({sm.track_hi,(bool)se.hiK[i],t,se.hiF[i].data(),se.hiF[i].size()});
+      frames.push_back({sm.track_lo,(bool)se.loK[i],t,se.loF[i].data(),se.loF[i].size()});
+    }
+  }
   int durationMs = (int)llround(N * 1000.0 / (fps>0?fps:30));
-  file = mux(tracks, frames, makeMeta(W,H,N,fps,near_,far_,levels, rgba!=nullptr, depth!=nullptr), durationMs);
+  file = mux(tracks, frames, buildMetadataJson(W,H,N,fps,hasRgb,sigMeta), durationMs);
   return 0;
+}
+
+int buildFile(const uint8_t* rgba, const uint16_t* depth, int W, int H, int N, int fps,
+              int kbps, double near_, double far_, int levels, Bytes& file){
+  std::vector<SignalEncodeSpec> specs;
+  if(depth){
+    SignalEncodeSpec s; s.id="depth"; s.data=depth;
+    s.quant.inverse_depth=true; s.quant.near_=near_; s.quant.far_=far_; s.quant.levels=levels;
+    specs.push_back(s);
+  }
+  return buildFileMulti(rgba, kbps, specs, W, H, N, fps, file);
 }
 } // namespace
 
@@ -384,33 +537,80 @@ int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out){
 int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
              double* near_, double* far_, int* levels, int* has_rgb){
   Demuxed d = demux(webm,len); if(d.metadata.empty()) return 1;
-  double v;
-  if(W && jnum(d.metadata,"width",v)) *W=(int)v;
-  if(H && jnum(d.metadata,"height",v)) *H=(int)v;
-  if(N && jnum(d.metadata,"frames",v)) *N=(int)v;
-  if(fps && jnum(d.metadata,"fps",v)) *fps=(int)v;
-  if(near_ && jnum(d.metadata,"near",v)) *near_=v;
-  if(far_ && jnum(d.metadata,"far",v)) *far_=v;
-  if(levels) *levels = jnum(d.metadata,"levels",v) ? (int)v : 65536;   // default = full 16-bit
-  if(has_rgb) *has_rgb = d.metadata.find("\"rgb\":null")==std::string::npos ? 1 : 0;
+  FileMeta meta = parseMetadata(d.metadata);
+  if(W) *W=meta.width;
+  if(H) *H=meta.height;
+  if(N) *N=meta.frames;
+  if(fps) *fps=meta.fps;
+  if(has_rgb) *has_rgb = meta.has_rgb ? 1 : 0;
+  const SignalMeta* depth = findSignal(meta, "depth");
+  if(depth && depth->quant.inverse_depth){
+    if(near_) *near_=depth->quant.near_;
+    if(far_) *far_=depth->quant.far_;
+    if(levels) *levels=depth->quant.levels;
+  }else{
+    if(levels) *levels=65536;
+  }
+  return 0;
+}
+
+int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id, uint16_t* out){
+  if(!webm || !signal_id || !out) return 1;
+  Demuxed d = demux(webm,len); if(d.metadata.empty()) return 1;
+  FileMeta meta = parseMetadata(d.metadata);
+  const SignalMeta* sig = findSignal(meta, signal_id);
+  if(!sig) return 8;
+  if(meta.width<=0 || meta.height<=0) return 2;
+  std::vector<Frame> hi, lo;
+  for(auto& f : d.frames){
+    if(f.track==sig->track_hi) hi.push_back(f);
+    else if(f.track==sig->track_lo) lo.push_back(f);
+  }
+  std::vector<Bytes> hiP, loP;
+  if(!decodePlaneTrack(hi,meta.width,meta.height,hiP)) return 3;
+  if(!decodePlaneTrack(lo,meta.width,meta.height,loP)) return 4;
+  if(hiP.size()!=loP.size()) return 5;
+  int px=meta.width*meta.height;
+  for(size_t i=0;i<hiP.size();i++) unpack(hiP[i].data(), loP[i].data(), px, out+i*px);
   return 0;
 }
 
 int dc_decode_depth(const uint8_t* webm, size_t len, uint16_t* depth_out){
+  return dc_decode_signal(webm, len, "depth", depth_out);
+}
+
+int dc_get_metadata(const uint8_t* webm, size_t len, char** json_out, size_t* json_len){
+  if(!webm || !json_out || !json_len) return 1;
   Demuxed d = demux(webm,len); if(d.metadata.empty()) return 1;
-  double v; int W=0,H=0,thi=2,tlo=3;
-  jnum(d.metadata,"width",v); W=(int)v; jnum(d.metadata,"height",v); H=(int)v;
-  if(jnum(d.metadata,"trackHi",v)) thi=(int)v; if(jnum(d.metadata,"trackLo",v)) tlo=(int)v;
-  if(W<=0||H<=0) return 2;
-  std::vector<Frame> hi, lo;
-  for(auto& f : d.frames){ if(f.track==thi) hi.push_back(f); else if(f.track==tlo) lo.push_back(f); }
-  std::vector<Bytes> hiP, loP;
-  if(!decodePlaneTrack(hi,W,H,hiP)) return 3;
-  if(!decodePlaneTrack(lo,W,H,loP)) return 4;
-  if(hiP.size()!=loP.size()) return 5;
-  int px=W*H;
-  for(size_t i=0;i<hiP.size();i++) unpack(hiP[i].data(), loP[i].data(), px, depth_out+i*px);
+  *json_len = d.metadata.size();
+  *json_out = (char*)malloc(*json_len + 1);
+  if(!*json_out) return 5;
+  memcpy(*json_out, d.metadata.c_str(), *json_len);
+  (*json_out)[*json_len] = '\0';
   return 0;
+}
+
+int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
+                    const dc_signal_spec_t* signals, int num_signals,
+                    int W, int H, int N, int fps,
+                    uint8_t** out, size_t* out_len){
+  if(!out || !out_len || W<=0 || H<=0 || N<=0) return 1;
+  if(num_signals<=0 && !rgba) return 1;
+  std::vector<SignalEncodeSpec> specs;
+  for(int i=0;i<num_signals;i++){
+    const dc_signal_spec_t& in=signals[i];
+    if(!in.id || !in.data) return 1;
+    SignalEncodeSpec s; s.id=in.id; s.data=in.data;
+    if(in.inverse_depth){
+      s.quant.inverse_depth=true;
+      s.quant.near_=in.near_; s.quant.far_=in.far_;
+      s.quant.levels = in.levels<=0 ? 65536 : in.levels;
+    }
+    specs.push_back(s);
+  }
+  Bytes file; int rc=buildFileMulti(rgba, rgb_kbps, specs, W, H, N, fps, file);
+  if(rc) return rc;
+  return finish(file, out, out_len);
 }
 
 void dc_quantize_inverse(const float* z, int n, double near_, double far_, int levels, uint16_t* out){
