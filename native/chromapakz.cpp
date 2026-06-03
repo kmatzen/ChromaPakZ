@@ -174,7 +174,12 @@ bool encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int
   vpx_codec_ctx_t c{}; if(vpx_codec_enc_init(&c,iface,&cfg,0)) return false;
   vpx_codec_control(&c, VP9E_SET_LOSSLESS, 1);
   vpx_codec_control(&c, VP8E_SET_CPUUSED, 1);
+  vpx_codec_control(&c, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);   // signal full-range in the bitstream
   vpx_image_t img; vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1);
+  // Signal FULL range: depth is packed full-range 0..255 in luma. Without this the stream
+  // defaults to limited ("tv") range and any decoder that honours it (e.g. ffmpeg) rescales/
+  // clips the luma, corrupting depth. Full-range makes every conformant decoder reproduce Y exactly.
+  img.cs = VPX_CS_BT_709; img.range = VPX_CR_FULL_RANGE;
   bool ok=true;
   for(size_t i=0;i<=planes.size() && ok;i++){
     vpx_image_t* in=nullptr;
@@ -245,6 +250,8 @@ bool encodeRGBSeq(const std::vector<const uint8_t*>& rgba, int W, int H, int fps
   cfg.g_lag_in_frames=0; cfg.rc_end_usage=VPX_VBR; cfg.rc_target_bitrate=kbps; cfg.kf_mode=VPX_KF_DISABLED;
   vpx_codec_ctx_t c{}; if(vpx_codec_enc_init(&c,iface,&cfg,0)) return false;
   vpx_codec_control(&c, VP8E_SET_CPUUSED, 2);
+  vpx_codec_control(&c, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
+  vpx_codec_control(&c, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
   vpx_image_t img; vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1);
   img.cs=VPX_CS_BT_709; img.range=VPX_CR_FULL_RANGE;
   bool ok=true;
