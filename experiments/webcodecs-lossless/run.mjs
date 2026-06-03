@@ -46,6 +46,46 @@ if (MODE === 'caps') {
   console.log(`  VideoEncoder=${c.hasEncoder}  VideoDecoder=${c.hasDecoder}  secureContext=${c.secure}`);
   console.log('  config support (encode):');
   for (const [k, v] of Object.entries(c.codecs || {})) console.log(`    ${k.padEnd(18)} ${v}`);
+} else if (MODE === 'rd') {
+  const rows = await page.evaluate(([w,h]) => window.__rdSweep(w,h), [SIZE, SIZE]).catch(e => ({ error: String(e) }));
+  if (rows.error) { await browser.close(); server.close(); console.error('FATAL:', rows.error); process.exit(1); }
+  console.log('\ncodec encode/decode path on quantized depth (peak=65535):');
+  console.log('  QP   bpp      PSNR(dB)   note');
+  for (const r of rows)
+    console.log(`  ${String(r.qp).padStart(2)}   ${r.bpp.toFixed(3).padStart(7)}   ${r.exact ? '   ∞   ' : r.psnr.toFixed(1).padStart(6)}   ${r.exact ? 'lossless (bit-exact)' : ''}`);
+  // write the SVG (lossy QP curve + the lossless QP0 point at the top)
+  const lossy = rows.filter(r => !r.exact), exact = rows.find(r => r.exact);
+  const W=760,H=470,ML=72,MR=24,MT=52,MB=62, x0=ML,y0=MT,x1=W-MR,y1=H-MB;
+  const xs=rows.map(r=>r.bpp), ps=lossy.map(r=>r.psnr);
+  const xmin=Math.floor(Math.min(...xs)-0.3), xmax=Math.ceil(Math.max(...xs)+0.3);
+  const ymin=Math.floor(Math.min(...ps)-2), ymax=Math.ceil(Math.max(...ps)+4);
+  const mx=x=>x0+(x-xmin)/(xmax-xmin)*(x1-x0), my=y=>y1-(y-ymin)/(ymax-ymin)*(y1-y0);
+  const s=[`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" font-family="ui-monospace,Menlo,monospace" font-size="12">`];
+  s.push(`<rect width="${W}" height="${H}" fill="#fff"/>`);
+  s.push(`<text x="${W/2}" y="26" text-anchor="middle" font-size="15" font-weight="700">ChromaPakZ codec rate–distortion (256×256 depth, peak 65535)</text>`);
+  for(let i=0;i<=5;i++){ const xv=xmin+(xmax-xmin)*i/5, X=mx(xv);
+    s.push(`<line x1="${X.toFixed(1)}" y1="${y0}" x2="${X.toFixed(1)}" y2="${y1}" stroke="#eee"/>`);
+    s.push(`<text x="${X.toFixed(1)}" y="${y1+18}" text-anchor="middle" fill="#555">${xv.toFixed(1)}</text>`);
+    const yv=ymin+(ymax-ymin)*i/5, Y=my(yv);
+    s.push(`<line x1="${x0}" y1="${Y.toFixed(1)}" x2="${x1}" y2="${Y.toFixed(1)}" stroke="#eee"/>`);
+    s.push(`<text x="${x0-8}" y="${(Y+4).toFixed(1)}" text-anchor="end" fill="#555">${yv.toFixed(0)}</text>`); }
+  s.push(`<rect x="${x0}" y="${y0}" width="${x1-x0}" height="${y1-y0}" fill="none" stroke="#ccc"/>`);
+  s.push(`<text x="${(x0+x1)/2}" y="${H-20}" text-anchor="middle" fill="#222">file size (bits / pixel)</text>`);
+  s.push(`<text x="18" y="${(y0+y1)/2}" text-anchor="middle" fill="#222" transform="rotate(-90 18 ${(y0+y1)/2})">PSNR of decoded vs source codes (dB)</text>`);
+  const poly=lossy.map(r=>`${mx(r.bpp).toFixed(1)},${my(r.psnr).toFixed(1)}`).join(' ');
+  s.push(`<polyline points="${poly}" fill="none" stroke="#2563eb" stroke-width="2"/>`);
+  for(const r of lossy){ s.push(`<circle cx="${mx(r.bpp).toFixed(1)}" cy="${my(r.psnr).toFixed(1)}" r="3.4" fill="#2563eb"/>`);
+    s.push(`<text x="${mx(r.bpp).toFixed(1)}" y="${(my(r.psnr)-8).toFixed(1)}" text-anchor="middle" fill="#2563eb" font-size="10">QP${r.qp}</text>`); }
+  // lossless point at the top edge
+  const lx=mx(exact.bpp);
+  s.push(`<line x1="${lx.toFixed(1)}" y1="${y0}" x2="${lx.toFixed(1)}" y2="${y1}" stroke="#16a34a" stroke-dasharray="4 3"/>`);
+  s.push(`<polygon points="${lx.toFixed(1)},${y0+4} ${(lx-6).toFixed(1)},${y0+15} ${(lx+6).toFixed(1)},${y0+15}" fill="#16a34a"/>`);
+  const lLeft = lx > (x0+x1)/2;
+  s.push(`<text x="${(lLeft?lx-9:lx+9).toFixed(1)}" y="${y0+15}" text-anchor="${lLeft?'end':'start'}" fill="#16a34a" font-weight="700">QP 0 — lossless (∞ dB), ${exact.bpp.toFixed(2)} bpp</text>`);
+  s.push(`<text x="${x1-6}" y="${y1-10}" text-anchor="end" fill="#777" font-size="10">VP9 quantizer sweep on the same quantized depth; QP0 = bit-exact</text>`);
+  s.push('</svg>');
+  fs.writeFileSync(path.join(root,'docs/rate-distortion.svg'), s.join('\n'));
+  console.log('\n  wrote docs/rate-distortion.svg');
 } else if (MODE === 'decfmt') {
   const webmB64 = fs.readFileSync(process.argv[3]).toString('base64');
   const info = await page.evaluate(b => window.__decodeFormatProbe(b), webmB64).catch(e => ({ error: String(e) }));
