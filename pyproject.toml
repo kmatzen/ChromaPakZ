@@ -1,0 +1,37 @@
+[build-system]
+requires = ["scikit-build-core>=0.8"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "chromapakz"
+version = "0.1.0"
+description = "Lossless RGBD video encoder — RGB + bit-exact 16-bit depth in one WebM (VP9, royalty-free)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "kmatzen" }]
+dependencies = ["numpy>=1.20"]
+keywords = ["depth", "rgbd", "video", "codec", "vp9", "lossless", "webm", "realsense", "kinect"]
+
+[project.urls]
+Homepage = "https://github.com/kmatzen/ChromaPakZ"
+
+[tool.scikit-build]
+minimum-version = "0.8"
+cmake.build-type = "Release"
+wheel.packages = ["python/chromapakz"]
+
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux* pp*"
+build-frontend = "build"
+test-requires = "numpy"
+test-command = "python {project}/tests/roundtrip.py"
+
+[tool.cibuildwheel.linux]
+before-all = "bash {project}/scripts/install-libvpx.sh"
+environment = { PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig" }
+
+[tool.cibuildwheel.macos]
+before-all = "brew install libvpx pkg-config ninja"
+# delocate (run automatically by cibuildwheel) bundles libvpx into the wheel.

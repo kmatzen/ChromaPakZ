@@ -1,4 +1,4 @@
-# depthcodec — design evaluation & due diligence
+# ChromaPakZ — design evaluation & due diligence
 
 This document defends the design against the question *"did you actually consider the alternatives, or
 just pick the convenient one?"* It enumerates the full option space on every axis, states the constraint
@@ -119,9 +119,9 @@ Same uint16 depth, every credible lossless codec, bits/pixel (`python/benchmark_
 
 **Full 16-bit (realistic noisy depth):**
 
-| codec | bpp | vs depthcodec | royalty-free | 16-bit native | browser enc+dec, no WASM | seekable video |
+| codec | bpp | vs ChromaPakZ | royalty-free | 16-bit native | browser enc+dec, no WASM | seekable video |
 |---|---|---|---|---|---|---|
-| **depthcodec (VP9 lossless, tri-fold 8+8, inter)** | **13.20** | — | ✅ | (8+8) | ✅ | ✅ |
+| **ChromaPakZ (VP9 lossless, tri-fold 8+8, inter)** | **13.20** | — | ✅ | (8+8) | ✅ | ✅ |
 | raw uint16 + LZMA-9e | 13.08 | −1% | ✅ | ✅ | ❌ | ❌ |
 | FFV1 (16-bit, intra) | 13.83 | +5% | ✅ | ✅ | ❌ | ❌ |
 | PNG-16 per frame (intra) | 13.84 | +5% | ✅ | ✅ | ❌ (8-bit canvas) | ❌ |
@@ -131,18 +131,18 @@ Same uint16 depth, every credible lossless codec, bits/pixel (`python/benchmark_
 
 **Matched 11-bit precision (noise-floor-matched):**
 
-| codec | bpp | vs depthcodec |
+| codec | bpp | vs ChromaPakZ |
 |---|---|---|
-| **depthcodec** | **8.09** | — |
+| **ChromaPakZ** | **8.09** | — |
 | raw uint16 + LZMA-9e | 7.93 | −2% |
 | FFV1 | 8.34 | +3% |
 | x265/HEVC lossless 12-bit (patent pool) | 8.58 | +6% |
 | PNG-16 | 9.95 | +23% |
 | x264 8+8 (GPL) | 11.93 | +47% |
 
-**Reading:** depthcodec **beats FFV1, PNG, HEVC and x264**, and is within **1–2%** of LZMA-9-extreme — a
+**Reading:** ChromaPakZ **beats FFV1, PNG, HEVC and x264**, and is within **1–2%** of LZMA-9-extreme — a
 non-realtime, non-seekable, non-browser archival compressor that satisfies *none* of R1∧R3∧R4∧R5. Under
-heavy noise all lossless codecs converge near the entropy floor (the noise *is* the cost), so depthcodec's
+heavy noise all lossless codecs converge near the entropy floor (the noise *is* the cost), so ChromaPakZ's
 real win is meeting every constraint at **no ratio penalty**. (libaom-AV1 and libjxl weren't in this ffmpeg
 build; AV1 is ruled out by §3, and JPEG-XL — likely the ratio leader — is ruled out by R3, §3/§9.)
 
@@ -168,7 +168,7 @@ scope of the recommendation is clear:
 | R3 encode-only (decode-in-browser still needed) | offline FFV1/JXL + a WASM decoder, or AV1 high-bit | removes the hardest half of R3 |
 | R2 (lossless) | **Pece-2011 / RealSense hue** colorization, or high-quality lossy VP9/AV1 | near-lossless packs 16-bit into 8-bit channels at a fraction of the size |
 | R1 (royalty-free) | **HEVC Main 4:4:4 16 Intra** | only mainstream codec with *native* 16-bit lossless mono — but still no browser encode |
-| nothing | **depthcodec as specified** | the only point satisfying all of R1–R5 |
+| nothing | **ChromaPakZ as specified** | the only point satisfying all of R1–R5 |
 
 ## 10. Prior art surveyed
 
@@ -176,7 +176,12 @@ scope of the recommendation is clear:
   periodic/triangle-wave packing of 16-bit depth into 8-bit channels to survive *lossy* codecs.
   Near-lossless; ours adapts the triangle idea but stays **bit-exact** via a lossless codec.
 - **Intel RealSense "colorized depth"** — Hue encoding (~10.5 effective bits), lossy, ~80× with commodity
-  codecs. Caps precision; not lossless.
+  codecs. Caps precision; not lossless. (https://dev.intelrealsense.com/docs/depth-image-compression-by-colorization-for-intel-realsense-depth-cameras)
+- **Azure Kinect / RGBD datasets** — Azure Kinect records to **Matroska (.mkv)**, multi-track, with a
+  16-bit-grayscale depth track; the lossless route is 16-bit **PNG (MPNG)** per frame inside the MKV.
+  TUM RGB-D / NYU / ScanNet store depth as 16-bit PNG sequences — bit-exact but intra-only. This both
+  **validates the container choice** (Matroska = WebM's basis) and marks the gap ChromaPakZ fills:
+  lossless *inter-frame* compression + a browser path. (https://learn.microsoft.com/en-us/azure/kinect-dk/record-file-format)
 - **MPEG Immersive Video (MIV) / 3D-HEVC / MV-HEVC** — standardized multi-view-video-plus-depth for
   volumetric/6-DoF. Heavyweight, HEVC-based (patent pool), not browser-native; overkill for one RGBD stream.
 - **Google Draco** — mesh/point-cloud geometry compression, *not* depth-video. Out of scope.
@@ -186,16 +191,42 @@ scope of the recommendation is clear:
   edge+diffusion) — beat generic image codecs by exploiting piecewise-smooth depth, but are custom and would
   need WASM (conflicts with R3).
 
-## 11. Residual risks / not-yet-verified
+## 11. Browser compatibility (measured across engines)
 
-- **VP9 lossless confirmed on Chromium only.** Firefox 130+ and Safari 26+ ship `VideoEncoder`, but
-  bit-exact VP9-QP0 on those engines is unverified. Firefox WebCodecs is **desktop-only** (no Android);
-  Safari < 26 is partial. Mobile coverage is materially worse than "Chrome full." *(cited)*
+Tested with Playwright on **Chromium 148, Firefox 150, WebKit 26.4** (`run.mjs caps|single|jsdecode|decfmt`,
+`BROWSER=…`). Caveat: Playwright's Firefox/WebKit are close to but not byte-identical with shipping
+Firefox/Safari; treat as strong indicators.
+
+| Engine | `VideoEncoder` | quantizer mode | **lossless ENCODE (VP9 QP0)** | decoder output fmt | **lossless DECODE** |
+|---|---|---|---|---|---|
+| Chromium 148 | ✓ | ✓ | **bit-exact ✓** | I420 | **bit-exact ✓** |
+| WebKit 26.4 (≈Safari 26) | ✓ | **unsupported** (throws) | ✗ — no QP0 path | NV12 | **bit-exact ✓** |
+| Firefox 150 | ✓ | reports ✓ | ✗ — QP0 not lossless (Δ≈56k) | **BGRX** | ✗ — see below |
+
+Findings:
+- **Encode (lossless) is Chromium-only today.** WebKit rejects `bitrateMode:"quantizer"` for every codec
+  (only plain VBR VP9 is offered) so QP0 is unreachable; Firefox accepts quantizer mode but its VP9
+  encoder at QP0 is **not** bit-exact.
+- **Decode (lossless) works on Chromium and WebKit/Safari** — both expose luma as plane 0 (I420 / NV12),
+  verified bit-exact on a Python-encoded file. **Firefox decodes VP9 to colour-converted, studio-range
+  `BGRX`**, where the luma we packed is range-scaled and clamped (not bit-exact recoverable), and its
+  `copyTo` cannot convert pixel formats — so **Firefox decode is unsupported** by this design.
+- Practical coverage: **encode** = Chromium-family browsers; **decode/playback** = Chromium + Safari 26+.
+  That still covers the dominant capture (Chrome) and viewing (Chrome+Safari, incl. iOS) paths, but the
+  earlier "encode *and* decode, any browser" framing of R3 is **Chromium-only for encode** and
+  **Chromium+WebKit for decode**. Firefox needs a fallback (offline/native encode; a WASM or WebGL
+  luma-readback decode path) — logged as future work.
+- Firefox WebCodecs is also **desktop-only** (no Android); Safari < 26 is partial. *(cited)*
+
+## 12. Residual risks / not-yet-verified
+
+- These are Playwright engine builds, not the exact shipping browsers; re-confirm on real Chrome stable,
+  Safari 26 on a Mac/iPhone, and Firefox release before publishing hard support claims.
 - **"Royalty-free" for VP9/AV1 is the AOMedia/Google position; Sisvel operates pools disputing it.** *(cited)*
 - Synthetic data only so far — real-sensor bitrate will differ (noise-dominated; §7 shows the trend).
 - No Cues/Duration yet (seekable `<video>` playback); native RGB GOP mirrors the browser (one keyframe).
 
-## 12. Sources
+## 13. Sources
 
 VP9 https://en.wikipedia.org/wiki/VP9 · AV1 https://en.wikipedia.org/wiki/AV1 ·
 VP8 https://en.wikipedia.org/wiki/VP8 · AVC pool https://www.via-la.com/licensing-2/avc-h-264/ ·

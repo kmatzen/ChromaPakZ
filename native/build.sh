@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Build the depthcodec shared library (for Python ctypes) and the CLI. Requires libvpx (pkg-config vpx).
+# Canonical native build via CMake. Produces build/_core.{so,dylib} and build/dccli,
+# and copies them into native/ for the dev ctypes loader + CLI convenience.
+# Requires CMake + libvpx (pkg-config vpx). For the Python package use `pip install .` instead.
 set -euo pipefail
-cd "$(dirname "$0")"
-CXX=${CXX:-clang++}
-FLAGS="-std=c++17 -O2 -Wall $(pkg-config --cflags vpx)"
-LIBS="$(pkg-config --libs vpx)"
-EXT=$([[ "$(uname)" == "Darwin" ]] && echo dylib || echo so)
-
-echo "building libdepthcodec.$EXT …"
-$CXX $FLAGS -fPIC -shared depthcodec.cpp $LIBS -o "libdepthcodec.$EXT"
-echo "building dccli …"
-$CXX $FLAGS dccli.cpp depthcodec.cpp $LIBS -o dccli
-echo "done: native/libdepthcodec.$EXT, native/dccli"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cmake -S "$root" -B "$root/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "$root/build" -j
+cp "$root"/build/_core.* "$root/native/" 2>/dev/null || true
+cp "$root"/build/dccli "$root/native/" 2>/dev/null || true
+echo "built: build/_core.* + build/dccli  (copied into native/ for dev use)"
