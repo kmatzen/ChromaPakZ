@@ -97,9 +97,17 @@ Matching the code step to the noise collapses the cost:
 
 ![ChromaPakZ rate-distortion](docs/rate-distortion.svg)
 
-The rate-distortion curve makes it visual: **depth PSNR saturates by ~11 bits**, after which precision
-buys nothing but bigger files (you're losslessly archiving sensor noise). ChromaPakZ tracks or beats FFV1
-and beats PNG-16 at every operating point. Regenerate with `python python/plot_rd.py`.
+The y-axis is PSNR of the reconstructed depth **vs the original float** — i.e. the float→uint16
+*quantization* distortion, **not** codec loss. The codec is lossless: all three encoders reconstruct the
+**identical** uint16 codes, so at each bit depth they land at the **same PSNR** and differ only
+horizontally (file size) — which is exactly why they share one plateau. It's finite and flat past ~11 bits
+because **(1)** auto `near/far` use the 1st/99th percentiles, so ~2% of pixels (the near/far tails) are
+**clamped** to the end codes — a bit-independent error that caps PSNR ~41 dB (with `near/far` = true
+min/max, PSNR climbs the textbook ~6 dB/bit to ~94 dB at 16-bit); and **(2)** mapping continuous float onto
+any finite grid is itself quantization. **File size**, by contrast, keeps growing with bits — lossless
+coding faithfully stores more sensor *noise*. So past ~11 bits you pay bits for neither fidelity
+(clamp-capped) nor signal (noise): the knee. ChromaPakZ tracks/beats FFV1 and beats PNG-16 at every point.
+Regenerate with `python python/plot_rd.py`.
 
 This is *not* lossy depth — it's choosing a uint16 grid matched to real precision, then carrying it
 bit-exact. **`levels` is a first-class, metadata-stored quantization parameter** (default 65536 =
