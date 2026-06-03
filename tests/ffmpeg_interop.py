@@ -11,7 +11,7 @@ import chromapakz as cz
 
 rng = np.random.default_rng(1)
 N, H, W = 6, 48, 64
-depth = rng.integers(5000, 45000, size=(N, H, W)).astype(np.uint16)  # depth-only -> tracks 2,3
+depth = rng.integers(5000, 45000, size=(N, H, W)).astype(np.uint16)  # depth signal → tracks 2,3 (no RGB)
 data = cz.encode_depth(depth)
 
 

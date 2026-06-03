@@ -3,12 +3,10 @@
 ## Continuous integration (`.github/workflows/ci.yml`)
 
 Runs on every push to `main` and every PR:
-- **build + test** on Linux and macOS — installs libvpx + ffmpeg, builds the native lib with CMake, runs
-  the C++ `dccli selftest` (bit-exact), then `pip install .` (compiles via CMake/scikit-build-core),
-  `tests/roundtrip.py`, and `tests/ffmpeg_interop.py` (guards the full-color-range / bit-exact contract
-  against an external decoder).
-- **browser** — installs Playwright Chromium and runs the headless WebCodecs probe, asserting VP9 lossless
-  encode→decode is bit-exact in a real browser.
+- **build + test** on Linux and macOS — CMake + `dccli selftest`, `pip install .`,
+  `tests/roundtrip.py`, `tests/cross_interop.py`, and `tests/ffmpeg_interop.py`.
+- **browser** — `tests/js_quant.mjs`, `tests/js_signals.mjs`, `tests/webm_stream.mjs`, Playwright
+  probes (`single`, `streaming`, `network`, `multisignal`), and `smoke-demo.mjs`.
 
 Suggested branch flow: protect `main`, do work on feature branches, open PRs, require the `ci` checks to
 pass before merge (Settings → Branches → branch protection → require status checks).

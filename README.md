@@ -3,12 +3,14 @@
 <p align="center"><img src="docs/logo.png" alt="ChromaPakZ — lossless RGBD video encoder" width="680"></p>
 
 **A lossless RGBD video codec** (クロマパックZ): one ordinary `.webm` that carries an 8-bit **RGB** track
-alongside **bit-exact 16-bit depth**, in sync. It is built so that
+alongside **bit-exact 16-bit auxiliary signals** — depth, object IDs, packed normals, or any other `W×H`
+`uint16` plane — in sync. It is built so that
 
 - a **legacy player shows plain RGB** — the depth rides in extra tracks a normal player ignores;
 - it uses only **royalty-free** codecs (VP9 / libvpx, BSD) — no GPL encoder, no patent pool;
 - it **encodes and decodes in the browser with no WASM**, via WebCodecs; and
-- depth is packed with one **reversible map**, not the range-slice bookkeeping of older schemes.
+- depth is packed with one **reversible map**, not the range-slice bookkeeping of older schemes;
+- **multiple lossless uint16 signals** (depth, object IDs, …) share one container in sync.
 
 It's a clean-room redo of an older MP4/x264 approach (RGB as YUV, plus 16-bit depth sliced into several
 lossless-10-bit ranges). That design worked but had three thorns: x264 is GPL, the range-slicing was
@@ -25,13 +27,19 @@ python3 -m http.server 8000      # from the repo root, then open http://localhos
 
 # Python — pip compiles the native libvpx core via CMake and bundles it
 pip install .
-python -c "import chromapakz as cz; cz.decode_depth(open('clip.webm','rb').read())"
-#   cz.encode_rgbd(rgb_NHWc4_uint8, depth_NHW_uint16, near=.., far=..) -> webm bytes
+python -c "import chromapakz as cz; cz.decode(data)['signals']['depth']"
+#   cz.encode({'depth': u16, 'objectId': u16}, specs={...}, rgb=rgba) -> webm bytes
+#   cz.encode_rgbd(rgb, depth, near=.., far=..)  # depth-only sugar
+
+# Browser JS API — streaming encode/decode (see docs/API.md)
+#   createEncoder({ signals: [{ id:'depth', near, far }, { id:'objectId' }] })
+#   createDecoder(bytes).readFrame() -> { rgb, signals: { depth: { u16 }, objectId: { u16 } } }
 
 # C++ / CLI
 cmake -S . -B build && cmake --build build -j     # or: native/build.sh
-native/dccli selftest
-native/dccli decode clip.webm depth.u16           # depth track of any ChromaPakZ file
+./build/dccli selftest
+./build/dccli decode clip.webm depth.u16           # depth signal
+./build/dccli decodesignal clip.webm objectId ids.u16
 ```
 
 ## How it works
@@ -40,8 +48,8 @@ native/dccli decode clip.webm depth.u16           # depth track of any ChromaPak
 |---|---|
 | **Container** | WebM / Matroska, multi-track. RGB is track 1, so any player shows it; depth tracks are ignored by players that don't know them. A Duration, a Cues index, and ~1 s RGB keyframes make it **seekable** in `<video>` (depth stays single-keyframe — it isn't what `<video>` plays). |
 | **RGB track** | 8-bit VP9, YUV 4:2:0, BT.709 full-range — a normal, viewable video stream. |
-| **Depth** | float depth → **inverse-depth uint16** → **triangle-fold into two 8-bit planes** → two **VP9 lossless** tracks, inter-coded. |
-| **Metadata** | A WebM tag carries the quantization contract (`near`/`far`/`levels`, scheme, units) so any decoder can reconstruct float depth. |
+| **Lossless signals** | Each signal: optional quant (e.g. inverse-depth for float depth) → **uint16** → **triangle-fold 8+8** → two **VP9 lossless** tracks. Add object IDs, labels, etc. as additional signal pairs. |
+| **Metadata** | v2 `signals[]` describes each signal (`id`, tracks, scheme, quant). Legacy `depth` field remains for older tools. |
 
 **Inverse-depth quantization** spends precision where it matters (near surfaces), matching how stereo/ToF
 sensors behave. Float can't be stored losslessly in 16 bits, so this quantization *is* the format's defined
@@ -124,18 +132,21 @@ point is **QP 0, bit-exact**. Regenerate with `python python/plot_rd.py`.
 ## Cross-language implementations
 
 All three read and write the identical `.webm`, verified bit-exact in every direction (browser ⇄ C++ ⇄
-Python), and produce standard files — `ffprobe` reports `matroska,webm` with three VP9 streams, and ffmpeg
-decodes track 0 as plain RGB.
+Python), and produce standard files — `ffprobe` reports `matroska,webm` with one RGB stream plus two VP9
+streams per lossless signal, and ffmpeg decodes track 0 as plain RGB when present.
+
+Format schema: [`docs/FORMAT.md`](docs/FORMAT.md). API: [`docs/API.md`](docs/API.md).
 
 | Surface | Codec | Build |
 |---|---|---|
-| **Browser** | WebCodecs VP9 | none — `src/chromapakz.js`, `src/webm.js` (pure JS) |
-| **C++** | libvpx VP9 | CMake → `build/_core` + `dccli` |
-| **Python** | binds the C++ core via ctypes | `pip install .` (scikit-build-core compiles & bundles the lib) |
+| **Browser** | WebCodecs VP9 | none — `src/chromapakz.js`, `src/signals.js`, `src/webm.js`. Multi-signal streaming API. |
+| **C++** | libvpx VP9 | CMake → `build/_core` + `dccli` (`dc_encode_multi`, `dc_decode_signal`) |
+| **Python** | ctypes → C++ | `pip install .` — `encode()`, `decode()`, `parse_metadata()` |
 
 ```sh
-native/dccli encodergbd rgb.rgba depth.u16 W H N fps near far kbps out.webm   # full RGBD
-native/dccli decodergb  clip.webm rgb.rgba                                    # RGB track → raw RGBA
+./build/dccli encodergbd rgb.rgba depth.u16 W H N fps near far kbps out.webm
+./build/dccli decodesignal clip.webm objectId ids.u16
+./build/dccli decodergb  clip.webm rgb.rgba
 ```
 
 ## Real-data ingestion (`python/`)
@@ -175,14 +186,14 @@ the browser. Sources:
 ## Repository layout
 
 ```
-src/          chromapakz.js, webm.js        browser implementation (WebCodecs, no deps)
-native/       chromapakz.{h,cpp}, dccli.cpp  C++ core (libvpx) + CLI; CMakeLists.txt at root
-python/       chromapakz/ (pip package), ingest.py, make_synthetic_rgbd.py, plot_rd.py
-demo/         index.html                     in-browser encode→decode→view demo
-examples/     tum_fr1desk.py                 real Kinect data (TUM RGB-D) example
-experiments/  webcodecs-lossless/            measurement harness (run.mjs) + headless tests
-docs/         EVALUATION.md, RELEASING.md, rate-distortion.svg
-tests/        roundtrip.py, ffmpeg_interop.py
+src/          chromapakz.js, signals.js, webm.js, chromapakz-core.js
+native/       chromapakz.{h,cpp}, dccli.cpp
+python/       chromapakz/ (pip package), ingest.py, make_synthetic_rgbd.py
+demo/         index.html                     in-browser encode→decode→view
+examples/     tum_fr1desk.py
+experiments/  webcodecs-lossless/            run.mjs, smoke-demo.mjs, headless tests
+docs/         FORMAT.md, API.md, EVALUATION.md, RELEASING.md
+tests/        roundtrip.py, cross_interop.py, ffmpeg_interop.py, js_*.mjs
 ```
 
 CI builds and tests on Linux + macOS and runs the in-browser VP9-lossless probe in headless Chromium;
@@ -200,3 +211,4 @@ Working end-to-end and verified across all three implementations. Honest caveats
   claims.
 - **"Royalty-free"** reflects the AOMedia/Google position on VP9; Sisvel operates pools that dispute it.
 - An **auto precision picker** (estimate the sensor noise floor to choose `--depth-bits`) is future work.
+- **Network byte streaming** is supported via `onChunk` on encode and `createDecoder()` + `push()`/`finish()` on decode. See [`docs/API.md`](docs/API.md).
