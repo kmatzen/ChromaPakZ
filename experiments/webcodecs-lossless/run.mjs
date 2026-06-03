@@ -3,7 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+import { chromium, firefox, webkit } from 'playwright';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(dir, '../..');             // repo root, so ../../src/ resolves
@@ -23,11 +23,12 @@ const server = http.createServer((req, res) => {
 }).listen(0);
 const port = server.address().port;
 
-// Flags: ensure software VP9/AV1 encoders are available even without a GPU.
-const browser = await chromium.launch({
-  args: ['--enable-features=PlatformEncryptedDolbyVision',
-         '--disable-gpu', '--use-gl=disabled'],
-});
+// Engine selection: BROWSER=chromium|firefox|webkit (default chromium).
+const ENGINES = { chromium, firefox, webkit };
+const ENGINE = process.env.BROWSER || 'chromium';
+const launcher = ENGINES[ENGINE] || chromium;
+const browser = await launcher.launch(
+  ENGINE === 'chromium' ? { args: ['--disable-gpu', '--use-gl=disabled'] } : {});
 const page = await browser.newPage();
 page.on('console', m => { if (m.type() === 'error') console.error('  [page error]', m.text()); });
 page.on('pageerror', e => console.error('  [pageerror]', e.message));
@@ -37,8 +38,19 @@ await page.waitForFunction('window.__ready === true', { timeout: 10000 });
 
 const bpp = (b, px) => (b * 8 / px).toFixed(3);
 const verdict = r => r.lossless ? 'EXACT ✓' : `LOSSY ✗ (max Δ=${r.dMax})`;
+console.log(`\nengine: ${ENGINE} ${browser.version()}`);
 
-if (MODE === 'single') {
+if (MODE === 'caps') {
+  const c = await page.evaluate(() => window.__caps()).catch(e => ({ error: String(e) }));
+  if (c.error) { await browser.close(); server.close(); console.error('FATAL:', c.error); process.exit(1); }
+  console.log(`  VideoEncoder=${c.hasEncoder}  VideoDecoder=${c.hasDecoder}  secureContext=${c.secure}`);
+  console.log('  config support (encode):');
+  for (const [k, v] of Object.entries(c.codecs || {})) console.log(`    ${k.padEnd(18)} ${v}`);
+} else if (MODE === 'decfmt') {
+  const webmB64 = fs.readFileSync(process.argv[3]).toString('base64');
+  const info = await page.evaluate(b => window.__decodeFormatProbe(b), webmB64).catch(e => ({ error: String(e) }));
+  console.log('  decoded-frame format:', JSON.stringify(info));
+} else if (MODE === 'single') {
   const out = await page.evaluate(([w, h]) => window.__runProbe(w, h), [SIZE, SIZE]).catch(e => ({ error: String(e) }));
   if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
   console.log(`\nUA: ${out.ua}\nsecureContext: ${out.secure}   size: ${out.width}×${out.height}\n`);
