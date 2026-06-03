@@ -1,9 +1,17 @@
 # build artifacts
 node_modules/
 __pycache__/
+build/
+dist/
+wheelhouse/
+*.egg-info/
 native/libdepthcodec.*
+native/_core.*
 native/dccli
 native/*.o
+python/chromapakz/_core.*
+python/chromapakz/*.dylib
+python/chromapakz/*.so
 
 # test / sample data
 *.webm

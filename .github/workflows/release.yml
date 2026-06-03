@@ -1,0 +1,52 @@
+name: release
+
+# Cut a GitHub Release (tag like v0.1.0) to build wheels + sdist and publish to PyPI
+# via Trusted Publishing (OIDC — no API token stored). See docs/RELEASING.md for one-time setup.
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}        # manual runs build artifacts without publishing
+
+jobs:
+  wheels:
+    name: wheels (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        # libvpx provisioning + test command come from [tool.cibuildwheel] in pyproject.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: publish to PyPI
+    needs: [wheels, sdist]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: pypi                 # configure a GitHub Environment named "pypi"
+    permissions:
+      id-token: write                 # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        # No password/token: PyPI Trusted Publishing authenticates via the OIDC token above.

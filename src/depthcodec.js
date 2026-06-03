@@ -46,6 +46,9 @@ function rgbaFrame(rgba, W, H, tsUs){
   return new VideoFrame(rgba,{ format:'RGBA', codedWidth:W, codedHeight:H, timestamp:tsUs });
 }
 async function readLuma(frame, W, H){
+  // Read luma = plane 0, which holds Y for I420 (Chromium) and NV12 (WebKit/Safari) alike.
+  // Firefox decodes VP9 to colour-converted BGRX (studio-range) — luma is not bit-exact
+  // recoverable there, and its copyTo cannot convert formats; Firefox decode is unsupported.
   const dst=new Uint8Array(frame.allocationSize()); const lay=await frame.copyTo(dst); const y=lay[0];
   const out=new Uint8Array(W*H);
   for(let r=0;r<H;r++) out.set(dst.subarray(y.offset+r*y.stride, y.offset+r*y.stride+W), r*W);

@@ -1,6 +1,9 @@
-# depthcodec
+# ChromaPakZ
 
-A single container holding **RGB + bit-exact 16-bit depth**, synchronized, that:
+<p align="center"><img src="docs/logo.png" alt="ChromaPakZ — lossless RGBD video encoder" width="680"></p>
+
+**Lossless RGBD video encoder** (クロマパックZ) — a single container holding **RGB + bit-exact 16-bit
+depth**, synchronized, that:
 
 - a **legacy player shows as plain RGB** (depth lives in extra tracks it ignores),
 - uses only **royalty-free** codecs (no GPL encoder, no patent pool),
@@ -42,24 +45,24 @@ All three implementations read/write the **same** `.webm` — verified bit-exact
 | Surface | Codec | Container | Build |
 |---|---|---|---|
 | **Browser** | WebCodecs VP9 | `src/webm.js` (pure JS) | none — `src/depthcodec.js` |
-| **C++** | libvpx VP9 (`pkg-config vpx`) | `native/depthcodec.cpp` EBML (port of `webm.js`) | `native/build.sh` → `libdepthcodec.{dylib,so}` + `dccli` |
-| **Python** | (binds the C++ core via ctypes) | — | `python/depthcodec.py`, needs the built lib + numpy |
+| **C++** | libvpx VP9 (`pkg-config vpx`) | `native/depthcodec.cpp` EBML (port of `webm.js`) | **CMake** → `build/_core` + `dccli` |
+| **Python** | `chromapakz` (binds the C++ core via ctypes) | — | **`pip install .`** (CMake/scikit-build-core compiles & bundles the lib) |
 
 No GPL and no patent pool anywhere: VP9 + libvpx (BSD) on native, WebCodecs VP9 in-browser.
 
 ```sh
-# native
-native/build.sh && native/dccli selftest
-native/dccli decode    clip.webm depth.u16            # depth track of any depthcodec file
+# native (CMake; or run native/build.sh which wraps it)
+cmake -S . -B build && cmake --build build -j
+native/dccli selftest
+native/dccli decode    clip.webm depth.u16            # depth track of any ChromaPakZ file
 native/dccli decodergb clip.webm rgb.rgba             # RGB track → raw RGBA
 native/dccli encode     depth.u16 W H N fps near far out.webm                 # depth-only
 native/dccli encodergbd rgb.rgba depth.u16 W H N fps near far kbps out.webm   # full RGBD
 
-# python
-python3 -c "import sys; sys.path.insert(0,'python'); import depthcodec as dc; \
-            data=open('clip.webm','rb').read(); \
-            print(dc.decode_depth(data).shape, dc.decode_rgb(data).shape)"
-# dc.encode_rgbd(rgb_NHWc4_uint8, depth_NHW_uint16, near=.., far=..) -> webm bytes
+# python — a proper package; pip compiles the native lib via CMake at install time
+pip install .
+python -c "import chromapakz as cz; d=open('clip.webm','rb').read(); print(cz.decode_depth(d).shape)"
+# cz.encode_rgbd(rgb_NHWc4_uint8, depth_NHW_uint16, near=.., far=..) -> webm bytes
 ```
 
 **Full RGBD, all verified bit-exact:** browser- and native-encoded RGBD files interchange in every
@@ -92,6 +95,12 @@ Matching the code step to the noise collapses the cost:
 | 11 | ~56 mm | 8.1 |
 | 10 | ~112 mm | 6.9 |
 
+![ChromaPakZ rate-distortion](docs/rate-distortion.svg)
+
+The rate-distortion curve makes it visual: **depth PSNR saturates by ~11 bits**, after which precision
+buys nothing but bigger files (you're losslessly archiving sensor noise). ChromaPakZ tracks or beats FFV1
+and beats PNG-16 at every operating point. Regenerate with `python python/plot_rd.py`.
+
 This is *not* lossy depth — it's choosing a uint16 grid matched to real precision, then carrying it
 bit-exact. **`levels` is a first-class, metadata-stored quantization parameter** (default 65536 =
 full 16-bit) threaded through all three impls: `M = levels-2; code = round((1/z−1/far)/(1/near−1/far)·M)+1`.
@@ -107,8 +116,39 @@ full-16-bit default.
 - Native could add a CMake target / pip-installable wheel; today it builds via `native/build.sh`.
 - An auto noise estimator so `--depth-bits` picks itself (temporal stddev on static pixels).
 
+## How it relates to RealSense / Kinect (robotics RGBD)
+
+Depth-camera ecosystems already had to solve "store/stream RGB + 16-bit depth," and they split into two
+camps. ChromaPakZ deliberately takes the best of both:
+
+- **Intel RealSense — colorize, then use a normal video codec.** librealsense recommends converting
+  16-bit depth into an RGB image (Hue colorization, ~10.5 effective bits; uniform or inverse) and encoding
+  that with stock H.264/H.265 to reuse hardware codecs and cut bandwidth. Excellent for streaming and
+  perception — but **lossy/near-lossless**: the Hue map caps precision and the codec adds error, so it's
+  unsuitable for ground-truth or archival depth.
+- **Kinect / RGBD datasets — store it raw or as PNG.** Azure Kinect records to **Matroska (.mkv),
+  multi-track, with a 16-bit-grayscale depth track**; the lossless route there is wrapping each depth frame
+  as a **16-bit PNG (MPNG)** inside the MKV. The wider RGBD-dataset community (TUM RGB-D, NYU, ScanNet, …)
+  likewise stores depth as **16-bit PNG sequences** — bit-exact, but **intra-only and large** (no temporal
+  compression).
+
+ChromaPakZ sits exactly in the gap between them:
+
+| | RealSense colorize | Kinect/PNG | **ChromaPakZ** |
+|---|---|---|---|
+| bit-exact 16-bit depth | ✗ (≈10.5 bits, lossy) | ✓ | **✓** |
+| RGB plays in any legacy player | ✓ | — | **✓** |
+| inter-frame (temporal) compression | ✓ (but lossy) | ✗ (intra PNG) | **✓ (lossless)** |
+| royalty-free + browser-native, no WASM | — | — | **✓** |
+
+Container kinship is telling: **Azure Kinect already chose Matroska — exactly WebM's basis.** ChromaPakZ
+differs by *compressing* depth losslessly (VP9 + triangle-fold, inter-coded — it beats the PNG-16 baseline,
+see the benchmark) instead of storing raw 16-bit or intra PNG, and by running encode/decode in the browser.
+Sources: [RealSense colorized depth](https://dev.intelrealsense.com/docs/depth-image-compression-by-colorization-for-intel-realsense-depth-cameras),
+[Azure Kinect .mkv record format](https://learn.microsoft.com/en-us/azure/kinect-dk/record-file-format).
+
 > **Due diligence:** [`docs/EVALUATION.md`](docs/EVALUATION.md) defends every design choice against the
-> full alternative space — codec/container/packing/bit-depth — with reproducible benchmarks (depthcodec
+> full alternative space — codec/container/packing/bit-depth — with reproducible benchmarks (ChromaPakZ
 > beats FFV1, PNG-16, HEVC and x264 on the same depth, and is within 1–2% of LZMA) and cited
 > licensing/browser-support facts. Includes a sensitivity analysis of when a different choice would win.
 
@@ -164,8 +204,9 @@ inter-coded (1 keyframe + P-frames)`. ~4.5 bpp on ±3-noise synthetic data; real
 ### Still open
 - **Real-data validation** — drop actual depth frames through the harness; the lo-plane cost is
   noise-dominated and will differ from synthetic.
-- **Browser encode breadth** — `VideoEncoder` is in Chrome, Firefox 130+, Safari 26+ (desktop).
-  VP9 lossless confirmed on Chromium; Firefox/Safari unverified.
+- **Browser support is engine-specific** (measured, [`docs/EVALUATION.md` §11](docs/EVALUATION.md)):
+  lossless **encode** is Chromium-only (WebKit lacks quantizer mode; Firefox QP0 isn't lossless);
+  lossless **decode** works on Chromium + WebKit/Safari (Firefox decodes to colour-converted BGRX).
 - **Build**: real encoder/decoder (triangle-fold + VP9 lossless GOP) + MP4/WebM muxing with a
   standard RGB track first (legacy fallback) + metadata box for the inverse-depth contract.
 
