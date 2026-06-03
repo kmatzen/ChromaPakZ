@@ -68,7 +68,15 @@ python -c "import chromapakz as cz; d=open('clip.webm','rb').read(); print(cz.de
 **Full RGBD, all verified bit-exact:** browser- and native-encoded RGBD files interchange in every
 direction (browser ⇄ C++ ⇄ Python), depth always bit-exact; `ffprobe` reads them as standard
 `matroska,webm` with 3 VP9 streams; and `ffmpeg` decodes track 0 as plain RGB (legacy fallback).
-RGB uses lossy VP9 with BT.709 full-range, signaled in the bitstream so players colour it correctly.
+Both RGB and depth signal **full color range** in the bitstream (`VP9E_SET_COLOR_RANGE`), so a
+range-honouring decoder reproduces the depth luma exactly rather than rescaling/clipping it.
+
+### A note on ffmpeg (encode vs decode)
+- **Decoding** ChromaPakZ files with ffmpeg/dav1d/any conformant VP9 decoder is **fine and bit-exact** —
+  the depth is plain VP9, and full-range signaling means the luma comes back unscaled.
+- **Encoding**, prefer the ChromaPakZ encoder (direct libvpx natively, WebCodecs in-browser), **not** the
+  ffmpeg CLI: `ffmpeg -c:v libvpx-vp9 -lossless 1` is bit-exact but **~3× larger** (≈39 vs ≈13 bpp on the
+  same depth) because its wrapper makes poor lossless coding decisions. Same library, very different result.
 
 ## Real-data ingestion (`python/`)
 
@@ -101,12 +109,13 @@ path on already-quantized depth**, PSNR of decoded-vs-source codes as the VP9 qu
 
 ![ChromaPakZ codec rate-distortion](docs/rate-distortion.svg)
 
-ChromaPakZ's operating point is **QP 0 — bit-exact (∞ dB)**, the green marker at the top: the codec adds
-*zero* distortion to the quantized depth. The blue curve shows what allowing loss would buy (QP 4 → ~68 dB
-at 7.2 bpp, down to QP 63 → ~51 dB at 3.9 bpp) — i.e. near-lossless depth is available from the same
-pipeline if a use-case wants it, but the default is exact. (Other lossless codecs — FFV1, PNG-16 — also sit
-at ∞ dB; they differ only in file size, which is the §7 benchmark.) Regenerate with
-`node experiments/webcodecs-lossless/run.mjs rd`.
+The **lossless codecs all sit on the ∞-dB band** (top): they reproduce the depth exactly, so they differ
+only in file size — and ChromaPakZ (VP9) is smallest, just under FFV1, with PNG-16 well behind. That is the
+real comparison among "the methods you'd otherwise use." The blue curve is ChromaPakZ's *own* near-lossless
+option: sweeping the VP9 quantizer trades fidelity for size (down to ~1 bpp at ~51 dB) if a use-case wants
+it — but the default operating point is **QP 0, bit-exact**. Regenerate with `python python/plot_rd.py`
+(it runs the WebCodecs sweep — the real codec — and scores FFV1/PNG on the identical codes; ffmpeg's
+`libvpx-vp9` lossless is ~3× bloated and is *not* used to represent ChromaPakZ — see the ffmpeg note above).
 
 This is *not* lossy depth — it's choosing a uint16 grid matched to real precision, then carrying it
 bit-exact. **`levels` is a first-class, metadata-stored quantization parameter** (default 65536 =

@@ -22,11 +22,11 @@ jobs:
 
       - name: Install libvpx + tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config cmake ninja-build
+        run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config cmake ninja-build ffmpeg
 
       - name: Install libvpx + tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install libvpx pkg-config cmake ninja
+        run: brew install libvpx pkg-config cmake ninja ffmpeg
 
       - uses: actions/setup-python@v5
         with:
@@ -44,6 +44,9 @@ jobs:
           python -m pip install numpy
           python -m pip install . --no-build-isolation || python -m pip install .
           python tests/roundtrip.py
+
+      - name: ffmpeg decode-interop (full-range / bit-exact regression guard)
+        run: python tests/ffmpeg_interop.py
 
   browser:
     name: in-browser VP9 lossless (Chromium)
