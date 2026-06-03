@@ -1,0 +1,15 @@
+# build artifacts
+node_modules/
+__pycache__/
+native/libdepthcodec.*
+native/dccli
+native/*.o
+
+# test / sample data
+*.webm
+*.u16
+*.npz
+*.rgba
+_png16.png
+demo/preview.png
+experiments/**/package*.json
