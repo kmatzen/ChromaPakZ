@@ -175,7 +175,7 @@ Demuxed demux(const uint8_t* b, size_t len){
   return d;
 }
 
-// ── metadata (v2 signals + v1 depth legacy) ──
+// ── metadata (v2 signals) ──
 bool jnum(const std::string& j, const char* key, double& out){
   std::string k = std::string("\"")+key+"\":"; auto p=j.find(k); if(p==std::string::npos) return false;
   p+=k.size(); while(p<j.size() && (j[p]==' '||j[p]=='\t')) p++;
@@ -230,18 +230,6 @@ void parseSignalsV2(const std::string& j, FileMeta& m){
   }
 }
 
-void parseLegacyDepth(const std::string& j, FileMeta& m){
-  if(j.find("\"depth\":null")!=std::string::npos) return;
-  if(j.find("\"depth\":") == std::string::npos) return;
-  SignalMeta s; s.id="depth"; s.quant.inverse_depth=true;
-  double hi=2, lo=3, lv=65536;
-  jnum(j,"trackHi",hi); jnum(j,"trackLo",lo);
-  s.track_hi=(int)hi; s.track_lo=(int)lo;
-  jnum(j,"near",s.quant.near_); jnum(j,"far",s.quant.far_);
-  if(jnum(j,"levels",lv)) s.quant.levels=(int)lv;
-  m.signals.push_back(s);
-}
-
 FileMeta parseMetadata(const std::string& j){
   FileMeta m; m.has_rgb = j.find("\"rgb\":null")==std::string::npos && j.find("\"rgb\":")!=std::string::npos;
   double v;
@@ -251,7 +239,7 @@ FileMeta parseMetadata(const std::string& j){
   jnum(j,"frames",v); m.frames=(int)v;
   jnum(j,"version",v); m.version = v>0 ? (int)v : 1;
   if(m.version>=2) parseSignalsV2(j,m);
-  if(m.signals.empty()) parseLegacyDepth(j,m);
+  if(m.signals.empty()) return m; // caller checks
   return m;
 }
 
@@ -281,22 +269,11 @@ std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::v
     sigs+=buf;
   }
   sigs+="]";
-  const SignalMeta* depthSig=nullptr;
-  for(auto& s : signals) if(s.id=="depth" && s.quant.inverse_depth){ depthSig=&s; break; }
-  std::string legacy="null";
-  if(depthSig){
-    char dep[460];
-    snprintf(dep,sizeof dep,
-      "{\"trackHi\":%d,\"trackLo\":%d,\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
-      "\"quant\":\"inverse-depth\",\"near\":%g,\"far\":%g,\"levels\":%d,\"invalidCode\":0,\"dtype\":\"uint16\"}",
-      depthSig->track_hi, depthSig->track_lo, depthSig->quant.near_, depthSig->quant.far_, depthSig->quant.levels);
-    legacy=dep;
-  }
   std::string rgb = hasRgb ? "{\"track\":1,\"codec\":\"vp09.00.10.08\"}" : "null";
   char out[4096];
   snprintf(out,sizeof out,
-    "{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":%s,\"signals\":%s,\"depth\":%s}",
-    W,H,fps,N,rgb.c_str(),sigs.c_str(),legacy.c_str());
+    "{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":%s,\"signals\":%s}",
+    W,H,fps,N,rgb.c_str(),sigs.c_str());
   return out;
 }
 
@@ -485,17 +462,6 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
   file = mux(tracks, frames, buildMetadataJson(W,H,N,fps,hasRgb,sigMeta), durationMs);
   return 0;
 }
-
-int buildFile(const uint8_t* rgba, const uint16_t* depth, int W, int H, int N, int fps,
-              int kbps, double near_, double far_, int levels, Bytes& file){
-  std::vector<SignalEncodeSpec> specs;
-  if(depth){
-    SignalEncodeSpec s; s.id="depth"; s.data=depth;
-    s.quant.inverse_depth=true; s.quant.near_=near_; s.quant.far_=far_; s.quant.levels=levels;
-    specs.push_back(s);
-  }
-  return buildFileMulti(rgba, kbps, specs, W, H, N, fps, file);
-}
 } // namespace
 
 // ── C ABI ──
@@ -504,22 +470,6 @@ extern "C" {
 static int finish(Bytes& file, uint8_t** out, size_t* out_len){
   *out=(uint8_t*)malloc(file.size()); if(!*out) return 5;
   memcpy(*out, file.data(), file.size()); *out_len=file.size(); return 0;
-}
-
-int dc_encode_depth(const uint16_t* depth, int W, int H, int N, int fps,
-                    double near_, double far_, int levels, uint8_t** out, size_t* out_len){
-  if(!depth||!out||!out_len||W<=0||H<=0||N<=0) return 1;
-  if(levels<=0) levels=65536;
-  Bytes file; int rc=buildFile(nullptr,depth,W,H,N,fps,0,near_,far_,levels,file); if(rc) return rc;
-  return finish(file,out,out_len);
-}
-
-int dc_encode_rgbd(const uint8_t* rgba, const uint16_t* depth, int W, int H, int N, int fps,
-                   int rgb_kbps, double near_, double far_, int levels, uint8_t** out, size_t* out_len){
-  if((!rgba&&!depth)||!out||!out_len||W<=0||H<=0||N<=0) return 1;
-  if(levels<=0) levels=65536;
-  Bytes file; int rc=buildFile(rgba,depth,W,H,N,fps,rgb_kbps,near_,far_,levels,file); if(rc) return rc;
-  return finish(file,out,out_len);
 }
 
 int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out){
@@ -573,10 +523,6 @@ int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id, uin
   int px=meta.width*meta.height;
   for(size_t i=0;i<hiP.size();i++) unpack(hiP[i].data(), loP[i].data(), px, out+i*px);
   return 0;
-}
-
-int dc_decode_depth(const uint8_t* webm, size_t len, uint16_t* depth_out){
-  return dc_decode_signal(webm, len, "depth", depth_out);
 }
 
 int dc_get_metadata(const uint8_t* webm, size_t len, char** json_out, size_t* json_len){

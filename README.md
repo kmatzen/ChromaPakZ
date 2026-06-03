@@ -27,9 +27,8 @@ python3 -m http.server 8000      # from the repo root, then open http://localhos
 
 # Python — pip compiles the native libvpx core via CMake and bundles it
 pip install .
-python -c "import chromapakz as cz; cz.decode(data)['signals']['depth']"
-#   cz.encode({'depth': u16, 'objectId': u16}, specs={...}, rgb=rgba) -> webm bytes
-#   cz.encode_rgbd(rgb, depth, near=.., far=..)  # depth-only sugar
+python -c "import chromapakz as cz; print(cz.inverse_depth_spec(0.3, 9.0))"
+#   cz.encode({"depth": u16}, specs={"depth": cz.inverse_depth_spec(near, far)}, rgb=rgba)
 
 # Browser JS API — streaming encode/decode (see docs/API.md)
 #   createEncoder({ signals: [{ id:'depth', near, far }, { id:'objectId' }] })
@@ -38,8 +37,7 @@ python -c "import chromapakz as cz; cz.decode(data)['signals']['depth']"
 # C++ / CLI
 cmake -S . -B build && cmake --build build -j     # or: native/build.sh
 ./build/dccli selftest
-./build/dccli decode clip.webm depth.u16           # depth signal
-./build/dccli decodesignal clip.webm objectId ids.u16
+./build/dccli decodesignal clip.webm depth depth.u16
 ```
 
 ## How it works
@@ -49,7 +47,7 @@ cmake -S . -B build && cmake --build build -j     # or: native/build.sh
 | **Container** | WebM / Matroska, multi-track. RGB is track 1, so any player shows it; depth tracks are ignored by players that don't know them. A Duration, a Cues index, and ~1 s RGB keyframes make it **seekable** in `<video>` (depth stays single-keyframe — it isn't what `<video>` plays). |
 | **RGB track** | 8-bit VP9, YUV 4:2:0, BT.709 full-range — a normal, viewable video stream. |
 | **Lossless signals** | Each signal: optional quant (e.g. inverse-depth for float depth) → **uint16** → **triangle-fold 8+8** → two **VP9 lossless** tracks. Add object IDs, labels, etc. as additional signal pairs. |
-| **Metadata** | v2 `signals[]` describes each signal (`id`, tracks, scheme, quant). Legacy `depth` field remains for older tools. |
+| **Metadata** | v2 `signals[]` only — each signal (`id`, tracks, scheme, quant). |
 
 **Inverse-depth quantization** spends precision where it matters (near surfaces), matching how stereo/ToF
 sensors behave. Float can't be stored losslessly in 16 bits, so this quantization *is* the format's defined

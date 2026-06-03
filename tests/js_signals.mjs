@@ -29,7 +29,6 @@ const meta=normalizeMetadata(d.metadata);
 ok(meta.version===2, 'version 2');
 ok(meta.signals.length===2, 'two signals');
 ok(meta.signals[0].id==='depth' && meta.signals[1].id==='objectId', 'signal ids');
-ok(meta.depth?.near===0.3, 'legacy depth mirror');
 ok(d.frames.length===N*4, `frame packets ${d.frames.length}`);
 
 console.log(failed ? `\n${failed} failed` : '\nall passed');

@@ -3,6 +3,7 @@
 import { makeDepth, makeDepthSeq, runProbe, runProbeGOP, runProbe10GOP, probeHighDepth } from './probe.js';
 import * as DC from '../../src/chromapakz.js';
 import { demux } from '../../src/webm.js';
+import { normalizeMetadata } from '../../src/signals.js';
 import { SCHEMES } from './probe.js';
 
 // True codec rate-distortion: feed ALREADY-QUANTIZED uint16 depth (a multi-frame clip) through the
@@ -46,16 +47,17 @@ window.__rdSweep = async (W=256, H=256, N=12) => {
 window.__decodeWebMCompare = async (webmB64, refB64) => {
   const webm = Uint8Array.from(atob(webmB64), c=>c.charCodeAt(0));
   const dec = await DC.decode(webm);
-  const N = dec.depthU16.length, px = dec.width*dec.height;
+  const depthSeries = dec.signalSeries?.depth ?? [];
+  const N = depthSeries.length, px = dec.width*dec.height;
   let exact=true, dMax=0;
   if(refB64){ const ref=new Uint16Array(Uint8Array.from(atob(refB64), c=>c.charCodeAt(0)).buffer);
-    for(let i=0;i<N;i++){ const B=dec.depthU16[i];
+    for(let i=0;i<N;i++){ const B=depthSeries[i].u16;
       for(let j=0;j<px;j++){ const d=Math.abs(ref[i*px+j]-B[j]); if(d>dMax)dMax=d; if(d)exact=false; } } }
-  // sample reconstructed float depth at fixed indices (frame 0) for a cross-impl float check
   const idx=[0, (px/4)|0, (px/2)|0, (3*px/4)|0, px-1];
-  const sampleFloats = dec.depthFloat ? idx.map(i=>dec.depthFloat[0][i]) : null;
+  const sampleFloats = depthSeries[0]?.float ? idx.map(i=>depthSeries[0].float[i]) : null;
+  const depthSig = dec.signals?.find(s=>s.id==='depth');
   return { N, width:dec.width, height:dec.height, rgbFrames: dec.rgb?dec.rgb.length:0,
-           exact, dMax, levels: dec.metadata.depth?.levels ?? null, sampleFloats, idx, metadata:dec.metadata };
+           exact, dMax, levels: depthSig?.quant?.levels ?? null, sampleFloats, idx, metadata:dec.metadata };
 };
 
 // Streaming createEncoder/createDecoder + autoNearFar; must match batch encode/decode bit-exact.
@@ -73,8 +75,8 @@ window.__runStreamingWebM = async (W=256, H=256, N=12) => {
   const { near, far }=DC.autoNearFar(depthFloat);
   const refCodes=depthFloat.map(z=>DC.quantizeInverseDepth(z,near,far));
 
-  const enc=DC.createEncoder({ W,H,fps:30,near,far });
-  for(let i=0;i<N;i++) await enc.addFrame({ rgb:rgb[i], depthFloat:depthFloat[i] });
+  const enc=DC.createEncoder({ W,H,fps:30, signals:[{ id:'depth', near, far }] });
+  for(let i=0;i<N;i++) await enc.addFrame({ rgb:rgb[i], signals:{ depth:{ float:depthFloat[i] } } });
   const bytes=await enc.finish();
 
   const dec=DC.createDecoder(bytes);
@@ -82,20 +84,21 @@ window.__runStreamingWebM = async (W=256, H=256, N=12) => {
   if(dec.frameCount!==N && dec.metadata.frames!=null) throw new Error('decoder frameCount mismatch');
   let i=0, exact=true, dMax=0;
   for await (const frame of dec){
-    const A=refCodes[i], B=frame.depthU16;
+    const A=refCodes[i], B=frame.signals.depth.u16;
     for(let j=0;j<A.length;j++){ const d=Math.abs(A[j]-B[j]); if(d>dMax)dMax=d; if(d)exact=false; }
     i++;
   }
   await dec.close();
 
-  const batch=await DC.encode({ W,H,fps:30,rgbFrames:rgb,depthFloat });
+  const frames=depthFloat.map((z,fi)=>({ rgb:rgb[fi], signals:{ depth:{ float:z } } }));
+  const batch=await DC.encode({ W,H,fps:30, signals:[{ id:'depth', near, far }], frames });
   const batchDec=await DC.decode(batch);
   let batchExact=true;
-  for(let k=0;k<N;k++){ const A=refCodes[k], B=batchDec.depthU16[k];
+  for(let k=0;k<N;k++){ const A=refCodes[k], B=batchDec.signalSeries.depth[k].u16;
     for(let j=0;j<A.length;j++) if(A[j]!==B[j]) batchExact=false; }
 
   let throwsMissing=false;
-  try{ await DC.encode({ W,H,depthU16:refCodes }); }catch{ throwsMissing=true; }
+  try{ DC.createEncoder({ W,H }); }catch{ throwsMissing=true; }
 
   return { exact, dMax, N:i, batchExact, throwsMissing,
     signalCount: dec.signals?.length ?? 0,
@@ -145,7 +148,9 @@ window.__runNetworkWebM = async (W=256, H=256, N=8) => {
   }
   const { near, far }=DC.autoNearFar(depthFloat);
   const refCodes=depthFloat.map(z=>DC.quantizeInverseDepth(z,near,far));
-  const bytes=await DC.encode({ W,H,fps:30,near,far,rgbFrames:rgb,depthFloat });
+  const sig=[{ id:'depth', near, far }];
+  const frames=depthFloat.map((z,i)=>({ rgb:rgb[i], signals:{ depth:{ float:z } } }));
+  const bytes=await DC.encode({ W,H,fps:30, signals:sig, frames });
 
   const dec=DC.createDecoder();
   const chunkSize=512;
@@ -156,20 +161,19 @@ window.__runNetworkWebM = async (W=256, H=256, N=8) => {
   for(;;){
     const frame=await dec.readFrame();
     if(!frame) break;
-    const A=refCodes[i], B=frame.depthU16;
+    const A=refCodes[i], B=frame.signals.depth.u16;
     for(let j=0;j<A.length;j++){ const d=Math.abs(A[j]-B[j]); if(d>dMax)dMax=d; if(d)exact=false; }
     i++;
   }
   await dec.close();
 
-  // onChunk encode path
   const chunks=[];
-  const enc=DC.createEncoder({ W,H,fps:30,near,far, onChunk:c=>chunks.push(c) });
-  for(let f=0;f<N;f++) await enc.addFrame({ rgb:rgb[f], depthFloat:depthFloat[f] });
+  const enc=DC.createEncoder({ W,H,fps:30, signals:sig, onChunk:c=>chunks.push(c) });
+  for(let f=0;f<N;f++) await enc.addFrame(frames[f]);
   const streamBytes=await enc.finish();
   const batchDec=await DC.decode(streamBytes);
   let streamExact=true;
-  for(let k=0;k<N;k++){ const A=refCodes[k], B=batchDec.depthU16[k];
+  for(let k=0;k<N;k++){ const A=refCodes[k], B=batchDec.signalSeries.depth[k].u16;
     for(let j=0;j<A.length;j++) if(A[j]!==B[j]) streamExact=false; }
 
   return { exact, dMax, N:i, chunks:chunks.length, bytes:bytes.length, streamExact,
@@ -182,10 +186,10 @@ window.__runWebM = async (W=256, H=256, N=30) => {
   for (let f=0; f<N; f++){ const a=new Uint8Array(W*H*4);
     for (let r=0;r<H;r++) for (let c=0;c<W;c++){ const o=(r*W+c)*4;
       a[o]=(c+f*4)&255; a[o+1]=r&255; a[o+2]=128; a[o+3]=255; } rgb.push(a); }
-  const bytes = await DC.encode({ W, H, fps:30, rgbFrames:rgb, depthU16:depth, near:0.2, far:10 });
+  const bytes = await DC.encode({ W, H, fps:30, signals:[{ id:'depth', near:0.2, far:10 }], frames: depth.map((d,i)=>({ rgb:rgb[i], signals:{ depth:{ u16:d } } })) });
   const dec = await DC.decode(bytes);
   let dMax=0, exact=true;
-  for (let i=0;i<N;i++){ const A=depth[i], B=dec.depthU16[i];
+  for (let i=0;i<N;i++){ const A=depth[i], B=dec.signalSeries.depth[i].u16;
     for (let j=0;j<A.length;j++){ const d=Math.abs(A[j]-B[j]); if(d>dMax)dMax=d; if(d)exact=false; } }
   // float round-trip error (quantization boundary, expected nonzero)
   const zf = DC.dequantizeInverseDepth(depth[0], 0.2, 10);
@@ -207,7 +211,8 @@ window.__runWebM = async (W=256, H=256, N=30) => {
 // What pixel format does this engine's VP9 decoder actually hand back? (explains readback bugs)
 window.__decodeFormatProbe = async (webmB64) => {
   const webm = Uint8Array.from(atob(webmB64), c=>c.charCodeAt(0));
-  const dm = demux(webm); const thi = dm.metadata.depth.trackHi;
+  const dm = demux(webm); const meta = normalizeMetadata(dm.metadata);
+  const thi = meta.signals.find(s=>s.id==='depth').tracks.hi;
   const frames = dm.frames.filter(f=>f.track===thi).sort((a,b)=>a.timeMs-b.timeMs);
   return await new Promise((res,rej)=>{
     let info=null;

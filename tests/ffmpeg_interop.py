@@ -12,7 +12,7 @@ import chromapakz as cz
 rng = np.random.default_rng(1)
 N, H, W = 6, 48, 64
 depth = rng.integers(5000, 45000, size=(N, H, W)).astype(np.uint16)  # depth signal → tracks 2,3 (no RGB)
-data = cz.encode_depth(depth)
+data = cz.encode({"depth": depth}, specs={"depth": cz.inverse_depth_spec(0.2, 10.0)})
 
 
 def gray(path, stream):
@@ -34,5 +34,6 @@ with tempfile.TemporaryDirectory() as t:
     l = np.where(hi & 1, 255 - lo, lo).astype(np.uint16)  # invert the triangle-fold
     recovered = (hi.astype(np.uint16) << 8) | l
     assert np.array_equal(recovered, depth), "ffmpeg-decoded depth is not bit-exact"
+    assert np.array_equal(cz.decode_signal(data, "depth"), depth), "native decode bit-exact"
 
 print("ffmpeg decode interop OK — full range signaled, depth bit-exact")
