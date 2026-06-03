@@ -226,7 +226,8 @@ Findings:
 - The §7 benchmark uses a synthetic clip; real-sensor depth is validated separately on TUM RGB-D
   `fr1/desk` (≈5 bpp lossless RGBD, bit-exact — `examples/tum_fr1desk.py`). Bitrate is noise-dominated, so
   it varies by sensor; §7 shows the trend.
-- No Cues/Duration yet (seekable `<video>` playback); native RGB GOP mirrors the browser (one keyframe).
+- Seekable playback is supported (Duration + Cues + ~1 s RGB keyframes); depth stays single-keyframe
+  (lossless inter), which is correct since `<video>` plays/seeks only the RGB track.
 
 ### Tooling caveats (found while validating)
 - **Full color range must be signaled.** Depth luma is packed full-range 0–255; the streams now emit

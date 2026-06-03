@@ -24,7 +24,9 @@ enum : uint32_t {
   ID_Tracks=0x1654AE6B, ID_TrackEntry=0xAE, ID_TrackNumber=0xD7, ID_TrackUID=0x73C5, ID_TrackType=0x83,
   ID_FlagLacing=0x9C, ID_CodecID=0x86, ID_Name=0x536E, ID_Video=0xE0, ID_PixelWidth=0xB0, ID_PixelHeight=0xBA,
   ID_Tags=0x1254C367, ID_Tag=0x7373, ID_Targets=0x63C0, ID_SimpleTag=0x67C8, ID_TagName=0x45A3, ID_TagString=0x4487,
-  ID_Cluster=0x1F43B675, ID_Timestamp=0xE7, ID_SimpleBlock=0xA3,
+  ID_Cluster=0x1F43B675, ID_Timestamp=0xE7, ID_SimpleBlock=0xA3, ID_Duration=0x4489,
+  ID_Cues=0x1C53BB6B, ID_CuePoint=0xBB, ID_CueTime=0xB3, ID_CueTrackPositions=0xB7,
+  ID_CueTrack=0xF7, ID_CueClusterPosition=0xF1,
 };
 
 void append(Bytes& a, const Bytes& b){ a.insert(a.end(), b.begin(), b.end()); }
@@ -37,6 +39,7 @@ Bytes vint(uint64_t n){
 Bytes idBytes(uint32_t id){ Bytes b; while(id){ b.insert(b.begin(), id&0xff); id>>=8; } return b; }
 Bytes uintBytes(uint64_t n){ if(n==0) return Bytes{0}; Bytes b; while(n){ b.insert(b.begin(), n&0xff); n>>=8; } return b; }
 Bytes strBytes(const std::string& s){ return Bytes(s.begin(), s.end()); }
+Bytes f8(double v){ uint64_t u; std::memcpy(&u,&v,8); Bytes b(8); for(int i=7;i>=0;i--){ b[i]=u&0xff; u>>=8; } return b; } // EBML float (big-endian)
 
 Bytes el(uint32_t id, const Bytes& payload){
   Bytes out = idBytes(id); Bytes sz = vint(payload.size());
@@ -67,7 +70,7 @@ Bytes simpleBlock(int track, int relTime, bool key, const uint8_t* data, size_t 
 }
 
 Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
-          const std::string& metadata, int clusterSpanMs=30000){
+          const std::string& metadata, int durationMs, int clusterSpanMs=30000){
   Bytes hdr;
   append(hdr, elU(ID_EBMLVersion,1)); append(hdr, elU(ID_EBMLReadVersion,1));
   append(hdr, elU(ID_EBMLMaxIDLength,4)); append(hdr, elU(ID_EBMLMaxSizeLength,8));
@@ -75,6 +78,7 @@ Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
   Bytes header = el(ID_EBML, hdr);
 
   Bytes info; append(info, elU(ID_TimestampScale,1000000));
+  if(durationMs>0) append(info, el(ID_Duration, f8((double)durationMs)));
   append(info, elS(ID_MuxingApp,"chromapakz")); append(info, elS(ID_WritingApp,"chromapakz"));
   Bytes seg; append(seg, el(ID_Info, info));
 
@@ -86,14 +90,36 @@ Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
     append(seg, el(ID_Tags, el(ID_Tag, tag)));
   }
 
+  // Cue track = the RGB track if present, else the first track. Clusters start on its keyframes.
+  int cueTrack = tracks.empty()?1:tracks[0].number;
+  for(auto& t : tracks) if(t.name=="rgb") cueTrack=t.number;
+
   std::stable_sort(frames.begin(), frames.end(), [](const Frame&a, const Frame&b){ return a.timeMs<b.timeMs; });
-  size_t i=0;
-  while(i<frames.size()){
-    int base = frames[i].timeMs; Bytes cl; append(cl, elU(ID_Timestamp, base));
-    while(i<frames.size() && frames[i].timeMs-base < clusterSpanMs){
-      auto& f=frames[i++]; append(cl, simpleBlock(f.track, f.timeMs-base, f.key, f.data, f.len));
-    }
+  std::vector<std::pair<int,size_t>> cues;   // (cue time ms, Segment-relative byte offset of cluster)
+  Bytes blocks; int base=0; bool open=false, hasCue=false;
+  auto flush=[&](){ if(!open) return;
+    size_t pos=seg.size();                   // offset of this Cluster from start of Segment data
+    Bytes cl; append(cl, elU(ID_Timestamp, base)); append(cl, blocks);
     append(seg, el(ID_Cluster, cl));
+    if(hasCue) cues.push_back({base, pos});
+    blocks.clear(); open=false; hasCue=false; };
+  for(auto& f : frames){
+    bool cueKey = f.track==cueTrack && f.key;
+    if(open && (cueKey || f.timeMs-base>=clusterSpanMs)) flush();
+    if(!open){ base=f.timeMs; open=true; hasCue=false; }
+    if(cueKey) hasCue=true;
+    append(blocks, simpleBlock(f.track, f.timeMs-base, f.key, f.data, f.len));
+  }
+  flush();
+
+  if(!cues.empty()){
+    Bytes cb;
+    for(auto& c : cues){
+      Bytes tp; append(tp, elU(ID_CueTrack, cueTrack)); append(tp, elU(ID_CueClusterPosition, c.second));
+      Bytes pt; append(pt, elU(ID_CueTime, c.first)); append(pt, el(ID_CueTrackPositions, tp));
+      append(cb, el(ID_CuePoint, pt));
+    }
+    append(seg, el(ID_Cues, cb));
   }
   Bytes out = header; append(out, el(ID_Segment, seg));
   return out;
@@ -254,10 +280,10 @@ bool encodeRGBSeq(const std::vector<const uint8_t*>& rgba, int W, int H, int fps
   vpx_codec_control(&c, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
   vpx_image_t img; vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1);
   img.cs=VPX_CS_BT_709; img.range=VPX_CR_FULL_RANGE;
-  bool ok=true;
+  bool ok=true; int keyEvery = fps>0?fps:30;          // ~1s keyframe interval → seekable RGB (Cues)
   for(size_t i=0;i<=rgba.size() && ok;i++){ vpx_image_t* in=nullptr;
     if(i<rgba.size()){ rgbaToI420(rgba[i],W,H,&img); in=&img; }
-    vpx_enc_frame_flags_t fl=(i==0)?VPX_EFLAG_FORCE_KF:0;
+    vpx_enc_frame_flags_t fl=(i%keyEvery==0)?VPX_EFLAG_FORCE_KF:0;
     if(vpx_codec_encode(&c,in,(vpx_codec_pts_t)i,1,fl,VPX_DL_GOOD_QUALITY)){ ok=false; break; }
     const vpx_codec_cx_pkt_t* pkt; vpx_codec_iter_t it=nullptr;
     while((pkt=vpx_codec_get_cx_data(&c,&it))) if(pkt->kind==VPX_CODEC_CX_FRAME_PKT){
@@ -313,7 +339,8 @@ int buildFile(const uint8_t* rgba, const uint16_t* depth, int W, int H, int N, i
     if(rgba) frames.push_back({1,(bool)rgbK[i],t,rgbF[i].data(),rgbF[i].size()});
     if(depth){ frames.push_back({2,(bool)hiK[i],t,hiF[i].data(),hiF[i].size()});
                frames.push_back({3,(bool)loK[i],t,loF[i].data(),loF[i].size()}); } }
-  file = mux(tracks, frames, makeMeta(W,H,N,fps,near_,far_,levels, rgba!=nullptr, depth!=nullptr));
+  int durationMs = (int)llround(N * 1000.0 / (fps>0?fps:30));
+  file = mux(tracks, frames, makeMeta(W,H,N,fps,near_,far_,levels, rgba!=nullptr, depth!=nullptr), durationMs);
   return 0;
 }
 } // namespace
