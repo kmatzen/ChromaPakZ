@@ -1,4 +1,4 @@
-// Minimal pure-JS Matroska/WebM muxer + demuxer for the subset depthcodec needs:
+// Minimal pure-JS Matroska/WebM muxer + demuxer for the subset chromapakz needs:
 // multiple VP9 video tracks, one cluster-split timeline, and a metadata tag.
 // No dependencies, no WASM. Sizes are computed bottom-up (whole file buffered in memory).
 
@@ -55,12 +55,12 @@ export function mux({ tracks, frames, metadata, timestampScaleNs=1_000_000, clus
     elU(ID.EBMLVersion,1), elU(ID.EBMLReadVersion,1), elU(ID.EBMLMaxIDLength,4), elU(ID.EBMLMaxSizeLength,8),
     elS(ID.DocType,'webm'), elU(ID.DocTypeVersion,2), elU(ID.DocTypeReadVersion,2) ]));
   const info = el(ID.Info, cat([ elU(ID.TimestampScale,timestampScaleNs),
-    elS(ID.MuxingApp,'depthcodec'), elS(ID.WritingApp,'depthcodec') ]));
+    elS(ID.MuxingApp,'chromapakz'), elS(ID.WritingApp,'chromapakz') ]));
   const tracksEl = el(ID.Tracks, cat(tracks.map(trackEntry)));
   const segChildren=[info, tracksEl];
   if(metadata!=null){
     const tag = el(ID.Tag, cat([ el(ID.Targets, new Uint8Array(0)),
-      el(ID.SimpleTag, cat([ elS(ID.TagName,'DEPTHCODEC'), elS(ID.TagString, JSON.stringify(metadata)) ])) ]));
+      el(ID.SimpleTag, cat([ elS(ID.TagName,'CHROMAPAKZ'), elS(ID.TagString, JSON.stringify(metadata)) ])) ]));
     segChildren.push(el(ID.Tags, tag));
   }
   // Cluster splitting so SimpleBlock relative timecodes stay within int16.
@@ -106,7 +106,7 @@ export function demux(buf){
       let name=null,val=null; for(const f of children(buf,st.dStart,st.dEnd)){
         if(f.id===ID.TagName) name=new TextDecoder().decode(buf.subarray(f.dStart,f.dEnd));
         if(f.id===ID.TagString) val=new TextDecoder().decode(buf.subarray(f.dStart,f.dEnd)); }
-      if(name==='DEPTHCODEC') out.metadata=JSON.parse(val); } }
+      if(name==='CHROMAPAKZ') out.metadata=JSON.parse(val); } }
   function walkCluster(s,e){ let base=0;
     for(const c of children(buf,s,e)){
       if(c.id===ID.Timestamp) base=readUint(buf,c.dStart,c.dEnd);

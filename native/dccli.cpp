@@ -1,9 +1,9 @@
-// depthcodec CLI / test driver. Commands:
+// chromapakz CLI / test driver. Commands:
 //   selftest                                  encode→decode synthetic depth, assert bit-exact
 //   decode  <in.webm> <out.u16>               decode depth track to raw uint16-LE
 //   encode  <in.u16> W H N fps near far <out.webm>
 //   info    <in.webm>                         print header
-#include "depthcodec.h"
+#include "chromapakz.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,7 +46,7 @@ int main(int argc, char** argv){
   if(cmd=="decode"){
     if(argc<4){ fprintf(stderr,"decode <in.webm> <out.u16>\n"); return 2; }
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
-    if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a depthcodec file\n"); return 1; }
+    if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
     std::vector<uint16_t> depth((size_t)W*H*N);
     if(dc_decode_depth(webm.data(),webm.size(),depth.data())){ fprintf(stderr,"decode failed\n"); return 1; }
     writeFile(argv[3],(uint8_t*)depth.data(),depth.size()*2);
@@ -78,7 +78,7 @@ int main(int argc, char** argv){
   if(cmd=="decodergb"){
     if(argc<4){ fprintf(stderr,"decodergb <in.webm> <out.rgba>\n"); return 2; }
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
-    if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a depthcodec file\n"); return 1; }
+    if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
     if(!rgb){ fprintf(stderr,"file has no RGB track\n"); return 1; }
     std::vector<uint8_t> out((size_t)W*H*N*4);
     if(dc_decode_rgb(webm.data(),webm.size(),out.data())){ fprintf(stderr,"rgb decode failed\n"); return 1; }
@@ -88,8 +88,8 @@ int main(int argc, char** argv){
   if(cmd=="info"){
     if(argc<3){ fprintf(stderr,"info <in.webm>\n"); return 2; }
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
-    if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a depthcodec file\n"); return 1; }
-    printf("depthcodec: %dx%d, %d frames @ %dfps, near=%g far=%g, levels=%d, rgb=%s\n",W,H,N,fps,near_,far_,levels,rgb?"yes":"no");
+    if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
+    printf("chromapakz: %dx%d, %d frames @ %dfps, near=%g far=%g, levels=%d, rgb=%s\n",W,H,N,fps,near_,far_,levels,rgb?"yes":"no");
     return 0;
   }
   fprintf(stderr,"unknown command: %s\n",cmd.c_str()); return 2;

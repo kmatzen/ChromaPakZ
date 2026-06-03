@@ -7,7 +7,7 @@ Overlays competing lossless codecs at equal distortion. Writes docs/rate-distort
 import os, subprocess, tempfile, sys, math
 import numpy as np
 sys.path.insert(0, ".")
-import depthcodec as dc, webm_inspect
+import chromapakz as dc, webm_inspect
 
 z = np.load("sample_rgbd.npz"); depth = z["depth"].astype(np.float32)
 N, H, W = depth.shape; PX = N * W * H
@@ -24,7 +24,7 @@ def psnr(levels):
     return c, (20 * math.log10(PEAK / math.sqrt(mse)) if mse > 0 else float("inf"))
 
 
-def depthcodec_bpp(c, levels):
+def chromapakz_bpp(c, levels):
     data = dc.encode_depth(c, fps=30, near=near, far=far, levels=levels)
     b = sum(t["bytes"] for t in webm_inspect.track_sizes(data).values() if t["name"].startswith("depth"))
     return b * 8 / PX
@@ -55,7 +55,7 @@ print(f"{'bits':>5} {'PSNR dB':>9} {'ChromaPakZ bpp':>15} {'FFV1 bpp':>10} {'PNG
 for bits in BITS:
     L = 1 << bits
     c, p = psnr(L)
-    cz = depthcodec_bpp(c, L)
+    cz = chromapakz_bpp(c, L)
     fv = ffmpeg_bpp(c, ["-c:v", "ffv1", "-level", "3", "-g", "1"])
     pn = png_bpp(c)
     series["ChromaPakZ (VP9 lossless)"].append((cz, p, bits))

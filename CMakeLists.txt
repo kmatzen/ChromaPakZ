@@ -13,13 +13,13 @@ pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
 
 # Native core shared library. Output named "_core" (no lib prefix) so the Python
 # package's ctypes loader finds chromapakz/_core.{so,dylib}.
-add_library(_core SHARED native/depthcodec.cpp)
+add_library(_core SHARED native/chromapakz.cpp)
 set_target_properties(_core PROPERTIES PREFIX "" OUTPUT_NAME "_core")
 target_include_directories(_core PRIVATE native)
 target_link_libraries(_core PRIVATE PkgConfig::VPX)
 
 # Command-line tool (dev/testing; not shipped in the Python wheel).
-add_executable(dccli native/dccli.cpp native/depthcodec.cpp)
+add_executable(dccli native/dccli.cpp native/chromapakz.cpp)
 target_include_directories(dccli PRIVATE native)
 target_link_libraries(dccli PRIVATE PkgConfig::VPX)
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>depthcodec · RGBD-in-WebM demo</title>
+<title>chromapakz · RGBD-in-WebM demo</title>
 <style>
   :root{
     --bg:#0b0e14; --panel:#121722; --panel2:#0e131c; --line:#1e2633; --ink:#d6deeb;
@@ -58,7 +58,7 @@
 <body>
 <div class="wrap">
 <header>
-  <h1><b>depthcodec</b> — RGB + bit-exact 16-bit depth, one WebM, no WASM</h1>
+  <h1><b>chromapakz</b> — RGB + bit-exact 16-bit depth, one WebM, no WASM</h1>
   <p>Generate (or load) an RGBD clip, encode it in-browser via WebCodecs VP9, then decode and view it back.
      The RGB pane is exactly what a legacy player shows; depth rides along, bit-exact.</p>
 </header>
@@ -125,7 +125,7 @@
 </div>
 
 <script type="module">
-import * as DC from '../src/depthcodec.js';
+import * as DC from '../src/chromapakz.js';
 import { demux } from '../src/webm.js';
 
 const $=s=>document.querySelector(s);
@@ -274,7 +274,7 @@ function reportEncode(encMs){
     tr.innerHTML=`<td>${t.name||t.number}</td><td>${t.codecID}</td><td>${t.frames.length}</td>`+
       `<td>${b.toLocaleString()}</td><td>${(b*8/px).toFixed(3)}</td>`; tb.appendChild(tr); }
   const url=URL.createObjectURL(new Blob([S.bytes],{type:'video/webm'}));
-  $('#dlLine').innerHTML=`<a class="dl" href="${url}" download="depthcodec-clip.webm">⬇ download clip.webm</a>`+
+  $('#dlLine').innerHTML=`<a class="dl" href="${url}" download="chromapakz-clip.webm">⬇ download clip.webm</a>`+
     ` — opens in VLC / Chrome / any player as plain RGB.`;
 }
 

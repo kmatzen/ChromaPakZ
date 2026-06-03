@@ -1,6 +1,6 @@
-// depthcodec native core: triangle-fold packing + libvpx VP9 lossless + a minimal
+// chromapakz native core: triangle-fold packing + libvpx VP9 lossless + a minimal
 // Matroska/WebM mux/demux that is byte-compatible with src/webm.js.
-#include "depthcodec.h"
+#include "chromapakz.h"
 #include <vector>
 #include <string>
 #include <cstring>
@@ -75,13 +75,13 @@ Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
   Bytes header = el(ID_EBML, hdr);
 
   Bytes info; append(info, elU(ID_TimestampScale,1000000));
-  append(info, elS(ID_MuxingApp,"depthcodec")); append(info, elS(ID_WritingApp,"depthcodec"));
+  append(info, elS(ID_MuxingApp,"chromapakz")); append(info, elS(ID_WritingApp,"chromapakz"));
   Bytes seg; append(seg, el(ID_Info, info));
 
   Bytes te; for(auto& t : tracks) append(te, trackEntry(t)); append(seg, el(ID_Tracks, te));
 
   if(!metadata.empty()){
-    Bytes st; append(st, elS(ID_TagName,"DEPTHCODEC")); append(st, elS(ID_TagString, metadata));
+    Bytes st; append(st, elS(ID_TagName,"CHROMAPAKZ")); append(st, elS(ID_TagString, metadata));
     Bytes tag; append(tag, el(ID_Targets, Bytes{})); append(tag, el(ID_SimpleTag, st));
     append(seg, el(ID_Tags, el(ID_Tag, tag)));
   }
@@ -134,7 +134,7 @@ Demuxed demux(const uint8_t* b, size_t len){
       std::string name, val; for(auto& f : kids(b,st.dStart,st.dEnd)){
         if(f.id==ID_TagName) name.assign((const char*)b+f.dStart, f.dEnd-f.dStart);
         if(f.id==ID_TagString) val.assign((const char*)b+f.dStart, f.dEnd-f.dStart); }
-      if(name=="DEPTHCODEC") d.metadata=val; } };
+      if(name=="CHROMAPAKZ") d.metadata=val; } };
   auto walkCluster=[&](size_t s, size_t e){ uint64_t base=0;
     for(auto& c : kids(b,s,e)){
       if(c.id==ID_Timestamp) base=readUint(b,c.dStart,c.dEnd);

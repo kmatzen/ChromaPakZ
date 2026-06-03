@@ -17,7 +17,7 @@ range-slicing was fiddly, and the browser needed a WASM codec.
 ## Status: working prototype (verified end-to-end)
 
 `src/` is a runnable, dependency-free implementation:
-- **`src/depthcodec.js`** — `encode()`/`decode()`: inverse-depth quantization + triangle-fold 8+8 +
+- **`src/chromapakz.js`** — `encode()`/`decode()`: inverse-depth quantization + triangle-fold 8+8 +
   VP9 lossless inter-coded depth tracks + a normal VP9 RGB track, via WebCodecs.
 - **`src/webm.js`** — a minimal pure-JS Matroska/WebM muxer + demuxer (multi VP9 track + metadata tag).
 
@@ -44,8 +44,8 @@ All three implementations read/write the **same** `.webm` — verified bit-exact
 
 | Surface | Codec | Container | Build |
 |---|---|---|---|
-| **Browser** | WebCodecs VP9 | `src/webm.js` (pure JS) | none — `src/depthcodec.js` |
-| **C++** | libvpx VP9 (`pkg-config vpx`) | `native/depthcodec.cpp` EBML (port of `webm.js`) | **CMake** → `build/_core` + `dccli` |
+| **Browser** | WebCodecs VP9 | `src/webm.js` (pure JS) | none — `src/chromapakz.js` |
+| **C++** | libvpx VP9 (`pkg-config vpx`) | `native/chromapakz.cpp` EBML (port of `webm.js`) | **CMake** → `build/_core` + `dccli` |
 | **Python** | `chromapakz` (binds the C++ core via ctypes) | — | **`pip install .`** (CMake/scikit-build-core compiles & bundles the lib) |
 
 No GPL and no patent pool anywhere: VP9 + libvpx (BSD) on native, WebCodecs VP9 in-browser.
