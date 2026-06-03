@@ -1,0 +1,57 @@
+<!doctype html><meta charset="utf-8"><title>headless probe</title>
+<script type="module">
+import { makeDepth, makeDepthSeq, runProbe, runProbeGOP, runProbe10GOP, probeHighDepth } from './probe.js';
+import * as DC from '../../src/depthcodec.js';
+import { demux } from '../../src/webm.js';
+
+// Decode an externally-supplied .webm (e.g. made by the C++/Python impl) and, if a raw
+// uint16-LE reference is given, verify depth is bit-exact. Proves native→browser interop.
+window.__decodeWebMCompare = async (webmB64, refB64) => {
+  const webm = Uint8Array.from(atob(webmB64), c=>c.charCodeAt(0));
+  const dec = await DC.decode(webm);
+  const N = dec.depthU16.length, px = dec.width*dec.height;
+  let exact=true, dMax=0;
+  if(refB64){ const ref=new Uint16Array(Uint8Array.from(atob(refB64), c=>c.charCodeAt(0)).buffer);
+    for(let i=0;i<N;i++){ const B=dec.depthU16[i];
+      for(let j=0;j<px;j++){ const d=Math.abs(ref[i*px+j]-B[j]); if(d>dMax)dMax=d; if(d)exact=false; } } }
+  // sample reconstructed float depth at fixed indices (frame 0) for a cross-impl float check
+  const idx=[0, (px/4)|0, (px/2)|0, (3*px/4)|0, px-1];
+  const sampleFloats = dec.depthFloat ? idx.map(i=>dec.depthFloat[0][i]) : null;
+  return { N, width:dec.width, height:dec.height, rgbFrames: dec.rgb?dec.rgb.length:0,
+           exact, dMax, levels: dec.metadata.depth?.levels ?? null, sampleFloats, idx, metadata:dec.metadata };
+};
+
+window.__runWebM = async (W=256, H=256, N=30) => {
+  const depth = makeDepthSeq(W, H, N);
+  const rgb = [];
+  for (let f=0; f<N; f++){ const a=new Uint8Array(W*H*4);
+    for (let r=0;r<H;r++) for (let c=0;c<W;c++){ const o=(r*W+c)*4;
+      a[o]=(c+f*4)&255; a[o+1]=r&255; a[o+2]=128; a[o+3]=255; } rgb.push(a); }
+  const bytes = await DC.encode({ W, H, fps:30, rgbFrames:rgb, depthU16:depth, near:0.2, far:10 });
+  const dec = await DC.decode(bytes);
+  let dMax=0, exact=true;
+  for (let i=0;i<N;i++){ const A=depth[i], B=dec.depthU16[i];
+    for (let j=0;j<A.length;j++){ const d=Math.abs(A[j]-B[j]); if(d>dMax)dMax=d; if(d)exact=false; } }
+  // float round-trip error (quantization boundary, expected nonzero)
+  const zf = DC.dequantizeInverseDepth(depth[0], 0.2, 10);
+  const zq = DC.quantizeInverseDepth(zf, 0.2, 10);
+  let qExact=true; for(let j=0;j<zq.length;j++){ if(zq[j]!==depth[0][j]){ qExact=false; break; } }
+  const b64 = u8 => { let s=''; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); };
+  window.__lastWebM = b64(bytes);
+  const raw = new Uint8Array(N*W*H*2); const dv=new DataView(raw.buffer);
+  for(let i=0;i<N;i++) for(let j=0;j<W*H;j++) dv.setUint16((i*W*H+j)*2, depth[i][j], true);
+  window.__lastDepth = b64(raw);
+  const d2 = demux(bytes); const per={};
+  for (const f of d2.frames) per[f.track]=(per[f.track]||0)+f.data.length;
+  const trackInfo = Object.values(d2.tracks).map(t=>({ n:t.number, name:t.name, codec:t.codecID,
+    w:t.width, h:t.height, frames:t.frames.length, bytes:per[t.number]||0 }));
+  return { totalBytes:bytes.length, exact, dMax, qStableQuantize:qExact, N, W, H,
+    rgbDecoded: dec.rgb?dec.rgb.length:0, trackInfo, metadata:dec.metadata };
+};
+
+window.__runProbe = async (W=256, H=256) => runProbe(makeDepth(W,H), W, H);
+window.__runProbeGOP = async (W=256, H=256, N=30) => runProbeGOP(W,H,N);
+window.__runProbe10GOP = async (W=256, H=256, N=30) => runProbe10GOP(W,H,N);
+window.__probeHighDepth = async (W=256, H=256) => probeHighDepth(W,H);
+window.__ready = true;
+</script>

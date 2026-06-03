@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>depthcodec · WebCodecs lossless packing probe</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 24px;
+         background:#0e1116; color:#d6deeb; max-width: 1040px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color:#7e8aa0; margin: 0 0 18px; }
+  button, label.file { font: inherit; padding: 8px 16px; background:#2b6cb0; color:#fff; border:0;
+           border-radius:6px; cursor:pointer; display:inline-block; }
+  button:disabled { opacity:.5; cursor:default; }
+  label.file { background:#2d3748; }
+  input[type=file] { display:none; }
+  table { border-collapse: collapse; margin-top: 18px; width:100%; }
+  th, td { text-align:right; padding:6px 10px; border-bottom:1px solid #222a35; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align:left; }
+  th { color:#7e8aa0; font-weight:600; }
+  .ok { color:#48bb78; font-weight:700; } .bad { color:#f56565; font-weight:700; }
+  .warn { color:#ecc94b; } .muted { color:#7e8aa0; } .win { color:#63b3ed; font-weight:700; }
+  #env { margin-top: 22px; white-space: pre-wrap; color:#7e8aa0; font-size:12px; }
+  code { background:#1a212c; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<h1>WebCodecs lossless depth-packing probe</h1>
+<p class="sub">Measures, on <em>this</em> browser: (1) is QP=0 VP9/AV1 truly bit-exact? and
+(2) does the triangle-fold packing beat naive byte-split on compressed size? Lower bits/pixel = better.</p>
+
+<button id="run">Run on synthetic depth</button>
+<label class="file">Load raw uint16-LE depth…<input id="file" type="file" /></label>
+<span id="status" class="muted" style="margin-left:12px"></span>
+
+<table id="results" hidden>
+  <thead><tr>
+    <th>codec</th><th>scheme</th><th>lossless?</th><th>hi bpp</th><th>lo bpp</th><th>total bpp</th><th>vs byte-split</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<div id="env"></div>
+
+<script type="module">
+let W = 256, H = 256;
+const $ = s => document.querySelector(s);
+const tbody = $('#results tbody');
+
+// ── Synthetic depth: slanted plane + a raised disc + far background + sensor noise ──
+// Wide value span so the low byte crosses many segment boundaries (the sawtooth-cliff stressor).
+function makeDepth() {
+  const d = new Uint16Array(W * H);
+  let s = 0x9e3779b9 >>> 0;
+  const noise = () => { s ^= s<<13; s^=s>>>17; s^=s<<5; s>>>=0; return ((s & 7) - 3); }; // ±3 LSB
+  const cx = W*0.55, cy = H*0.45, R = Math.min(W,H)*0.28;
+  for (let r=0;r<H;r++) for (let c=0;c<W;c++){
+    let z = 9000 + (c*70) + (r*45);                 // slanted plane, spans ~9k..45k
+    if ((c-cx)**2 + (r-cy)**2 < R*R) z -= 6000;      // a closer object (depth edge)
+    if (r > H*0.85) z = 60000;                       // far background band
+    z += noise();
+    d[r*W+c] = Math.max(0, Math.min(65535, z));
+  }
+  return d;
+}
+
+// ── Packing schemes: uint16 depth → two 8-bit planes (hi, lo), reversibly ──
+const SCHEMES = {
+  'byte-split': {
+    pack(d){ const hi=new Uint8Array(d.length), lo=new Uint8Array(d.length);
+      for(let i=0;i<d.length;i++){ hi[i]=d[i]>>8; lo[i]=d[i]&0xff; } return {hi,lo}; },
+    unpack(hi,lo){ const d=new Uint16Array(hi.length);
+      for(let i=0;i<d.length;i++) d[i]=(hi[i]<<8)|lo[i]; return d; },
+  },
+  'triangle-fold': {
+    pack(d){ const hi=new Uint8Array(d.length), lo=new Uint8Array(d.length);
+      for(let i=0;i<d.length;i++){ const h=d[i]>>8, l=d[i]&0xff; hi[i]=h; lo[i]=(h&1)?(255-l):l; }
+      return {hi,lo}; },
+    unpack(hi,lo){ const d=new Uint16Array(hi.length);
+      for(let i=0;i<d.length;i++){ const h=hi[i], l=(h&1)?(255-lo[i]):lo[i]; d[i]=(h<<8)|l; }
+      return d; },
+  },
+};
+
+function makeFrame(yPlane){
+  const cW=W>>1, cH=H>>1, buf=new Uint8Array(W*H+2*cW*cH);
+  buf.set(yPlane,0); buf.fill(128, W*H);
+  return new VideoFrame(buf,{ format:'I420', codedWidth:W, codedHeight:H, timestamp:0,
+    colorSpace:{ primaries:'bt709', transfer:'iec61966-2-1', matrix:'bt709', fullRange:true }});
+}
+async function readY(frame){
+  const dst=new Uint8Array(frame.allocationSize()); const lay=await frame.copyTo(dst); const y=lay[0];
+  const out=new Uint8Array(W*H);
+  for(let r=0;r<H;r++) out.set(dst.subarray(y.offset+r*y.stride, y.offset+r*y.stride+W), r*W);
+  return out;
+}
+// Encode one 8-bit plane losslessly, decode it back. Returns {bytes, plane}.
+function roundTrip(codec, plane){
+  return new Promise((resolve,reject)=>{
+    let bytes=0, recovered=null;
+    const dec=new VideoDecoder({ output:async f=>{ try{recovered=await readY(f);}finally{f.close();} }, error:reject });
+    const qpKey = codec.startsWith('vp09') ? 'vp9' : 'av1';
+    const enc=new VideoEncoder({ output:(chunk,meta)=>{ if(meta?.decoderConfig) dec.configure(meta.decoderConfig);
+      bytes+=chunk.byteLength; dec.decode(chunk); }, error:reject });
+    enc.configure({ codec, width:W, height:H, bitrateMode:'quantizer', latencyMode:'quality' });
+    const fr=makeFrame(plane); enc.encode(fr,{ keyFrame:true, [qpKey]:{ quantizer:0 } }); fr.close();
+    enc.flush().then(()=>dec.flush()).then(()=>{ enc.close(); dec.close(); resolve({bytes,recovered}); }).catch(reject);
+  });
+}
+async function supported(codec){
+  try{ return (await VideoEncoder.isConfigSupported({codec,width:W,height:H,bitrateMode:'quantizer'})).supported; }
+  catch{ return false; }
+}
+const eq=(a,b)=>{ if(a.length!==b.length) return false; for(let i=0;i<a.length;i++) if(a[i]!==b[i]) return false; return true; };
+const bpp=b=> (b*8/(W*H)).toFixed(3);
+
+async function run(depth){
+  $('#run').disabled=true; $('#results').hidden=false; tbody.innerHTML='';
+  const codecs=['vp09.00.10.08','av01.0.04M.08'];
+  for(const codec of codecs){
+    if(!(await supported(codec))){ const tr=tbody.insertRow();
+      tr.innerHTML=`<td>${codec}</td><td colspan=6 class="warn">unsupported (quantizer mode)</td>`; continue; }
+    let baseline=null;
+    for(const [name,sch] of Object.entries(SCHEMES)){
+      $('#status').textContent=`${codec} · ${name}…`;
+      try{
+        const {hi,lo}=sch.pack(depth);
+        const rhi=await roundTrip(codec,hi), rlo=await roundTrip(codec,lo);
+        const d2=sch.unpack(rhi.recovered, rlo.recovered);
+        const lossless = eq(hi,rhi.recovered)&&eq(lo,rlo.recovered)&&eq(depth,d2);
+        const total=rhi.bytes+rlo.bytes; if(name==='byte-split') baseline=total;
+        const rel = baseline ? ((total/baseline-1)*100) : 0;
+        const tr=tbody.insertRow();
+        tr.innerHTML=`<td>${codec}</td><td>${name}</td>
+          <td class="${lossless?'ok':'bad'}">${lossless?'EXACT ✓':'LOSSY ✗'}</td>
+          <td>${bpp(rhi.bytes)}</td><td>${bpp(rlo.bytes)}</td><td><b>${bpp(total)}</b></td>
+          <td class="${rel<0?'win':'muted'}">${name==='byte-split'?'—':(rel>0?'+':'')+rel.toFixed(1)+'%'}</td>`;
+      }catch(e){ const tr=tbody.insertRow(); tr.innerHTML=`<td>${codec}</td><td>${name}</td>
+        <td colspan=5 class="bad">error: ${e.message||e}</td>`; }
+    }
+  }
+  $('#status').textContent='done'; $('#run').disabled=false;
+}
+
+$('#run').addEventListener('click', ()=>run(makeDepth()));
+$('#file').addEventListener('change', async e=>{
+  const f=e.target.files[0]; if(!f) return;
+  const buf=new Uint16Array(await f.arrayBuffer());
+  const side=Math.round(Math.sqrt(buf.length));
+  if(side*side!==buf.length || side%2){ $('#status').textContent=`need a square, even-sided uint16 plane; got ${buf.length} samples`; return; }
+  W=H=side; $('#status').textContent=`loaded ${side}×${side} depth`; run(buf);
+});
+$('#env').textContent =
+  `userAgent: ${navigator.userAgent}\n`+
+  `VideoEncoder:${'VideoEncoder'in window}  VideoDecoder:${'VideoDecoder'in window}\n`+
+  `Synthetic: slanted plane + closer disc + far band + ±3-LSB noise, value span ~9k..60k.`;
+</script>
+</body>
+</html>
