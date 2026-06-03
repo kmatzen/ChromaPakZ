@@ -58,9 +58,9 @@
 <body>
 <div class="wrap">
 <header>
-  <h1><b>chromapakz</b> — RGB + bit-exact 16-bit depth, one WebM, no WASM</h1>
+  <h1><b>chromapakz</b> — RGB + lossless signals, one WebM, no WASM</h1>
   <p>Generate (or load) an RGBD clip, encode it in-browser via WebCodecs VP9, then decode and view it back.
-     The RGB pane is exactly what a legacy player shows; depth rides along, bit-exact.</p>
+     The RGB pane is what a legacy player shows; depth (and other uint16 signals) ride along, bit-exact.</p>
 </header>
 
 <div id="unsupported">This browser doesn't expose <code>VideoEncoder</code> (WebCodecs). Try Chrome,
@@ -184,10 +184,7 @@ function genScene(){
     depth.push(Z); rgb.push(col);
   }
   S.depthFloat=depth; S.rgb=rgb;
-  // auto near/far from valid percentiles
-  const vals=[]; for(const Z of depth) for(const z of Z) if(Number.isFinite(z)&&z>0) vals.push(z);
-  vals.sort((a,b)=>a-b);
-  S.near=vals[Math.floor(vals.length*0.01)]; S.far=vals[Math.floor(vals.length*0.99)];
+  ({ near:S.near, far:S.far }=DC.autoNearFar(depth));
 }
 
 // ── depth colormap: near→hot, far→cool; invalid→dark ──
@@ -199,6 +196,13 @@ function depthColor(z,near,far,out,o){
   let r,g,b; if(hp<1)[r,g,b]=[c,xx,0];else if(hp<2)[r,g,b]=[xx,c,0];else if(hp<3)[r,g,b]=[0,c,xx];
   else if(hp<4)[r,g,b]=[0,xx,c];else if(hp<5)[r,g,b]=[xx,0,c];else[r,g,b]=[c,0,xx];
   out[o]=(r+m)*255;out[o+1]=(g+m)*255;out[o+2]=(b+m)*255;out[o+3]=255;
+}
+
+function depthQuant(meta){
+  const s=meta.signals?.find(x=>x.id==='depth');
+  if(s?.quant?.type==='inverse-depth') return { near:s.quant.near, far:s.quant.far };
+  if(meta.depth?.near!=null) return { near:meta.depth.near, far:meta.depth.far };
+  return null;
 }
 
 // ── rendering ──
@@ -214,7 +218,8 @@ function render(){
   // Depth (prefer decoded float; fall back to source)
   const Zf=S.dec&&S.dec.depthFloat?S.dec.depthFloat[f]:(S.depthFloat?S.depthFloat[f]:null);
   if(Zf){ const buf=new Uint8ClampedArray(W*H*4);
-    const near=S.dec?S.dec.metadata.depth.near:S.near, far=S.dec?S.dec.metadata.depth.far:S.far;
+    const q=S.dec?depthQuant(S.dec.metadata):null;
+    const near=q?q.near:S.near, far=q?q.far:S.far;
     for(let i=0;i<W*H;i++) depthColor(Zf[i],near,far,buf,i*4);
     depthCanvas.getContext('2d').putImageData(new ImageData(buf,W,H),0,0);
     $('#depthRange').textContent=`${near.toFixed(2)}–${far.toFixed(2)} m`; }
@@ -242,15 +247,25 @@ $('#encode').onclick=async()=>{ $('#encode').disabled=true; $('#hint').textConte
   const levels=1<<S.bits;
   S.refCodes=S.depthFloat.map(z=>DC.quantizeInverseDepth(z,S.near,S.far,levels));
   const t0=performance.now();
-  S.bytes=await DC.encode({W:S.W,H:S.H,fps:S.fps,rgbFrames:S.rgb,depthFloat:S.depthFloat,
-    near:S.near,far:S.far,levels,rgbKbps:S.kbps});
-  const enc=performance.now()-t0;
-  reportEncode(enc); $('#decode').disabled=false; $('#encode').disabled=false;
+  const enc=DC.createEncoder({W:S.W,H:S.H,fps:S.fps,near:S.near,far:S.far,levels,rgbKbps:S.kbps*1000});
+  for(let i=0;i<S.N;i++) await enc.addFrame({rgb:S.rgb[i],depthFloat:S.depthFloat[i]});
+  S.bytes=await enc.finish();
+  const encMs=performance.now()-t0;
+  reportEncode(encMs); $('#decode').disabled=false; $('#encode').disabled=false;
   $('#hint').innerHTML='Encoded. Now <b>Decode &amp; view</b> to reconstruct from the file.'; };
 
 $('#decode').onclick=async()=>{ $('#decode').disabled=true; $('#hint').textContent='decoding…';
-  const t0=performance.now(); S.dec=await DC.decode(S.bytes); const dec=performance.now()-t0;
-  $('#sDec').textContent=dec.toFixed(0)+' ms';
+  const t0=performance.now();
+  const dec=DC.createDecoder(S.bytes);
+  const out={metadata:dec.metadata,width:dec.width,height:dec.height,rgb:[],depthU16:[],depthFloat:[]};
+  for await (const frame of dec){
+    if(frame.rgb) out.rgb.push(frame.rgb);
+    if(frame.depthU16) out.depthU16.push(frame.depthU16);
+    if(frame.depthFloat) out.depthFloat.push(frame.depthFloat);
+  }
+  await dec.close();
+  S.dec=out; const decMs=performance.now()-t0;
+  $('#sDec').textContent=decMs.toFixed(0)+' ms';
   // bit-exact check vs source codes (only when we generated the source)
   let exact=null,dMax=0;
   if(S.refCodes){ exact=true; for(let i=0;i<S.refCodes.length;i++){const A=S.refCodes[i],B=S.dec.depthU16[i];
@@ -266,7 +281,8 @@ function reportEncode(encMs){
   $('#statsCard').style.display=''; $('#sEnc').textContent=encMs.toFixed(0)+' ms';
   $('#sSize').textContent=(S.bytes.length/1024).toFixed(0)+' KiB';
   const px=S.W*S.H*S.N; $('#sBpp').textContent=(S.bytes.length*8/px).toFixed(2)+' bpp';
-  $('#sQuant').innerHTML=`${S.bits}-bit · ${S.near.toFixed(2)}–${S.far.toFixed(2)} m`;
+  $('#sQuant').innerHTML=`${S.bits}-bit · ${S.near.toFixed(2)}–${S.far.toFixed(2)} m`+
+    (S.dec?.metadata?.signals?` · ${S.dec.metadata.signals.length} signal(s)`:'');
   // per-track breakdown via the JS demuxer
   const d=demux(S.bytes); const per={}; for(const fr of d.frames) per[fr.track]=(per[fr.track]||0)+fr.data.length;
   const tb=$('#trackTable tbody'); tb.innerHTML=''; $('#trackTable').hidden=false;

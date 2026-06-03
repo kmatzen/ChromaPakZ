@@ -38,6 +38,28 @@ int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out);
 void dc_quantize_inverse(const float* z, int n, double near_, double far_, int levels, uint16_t* out);
 void dc_dequantize_inverse(const uint16_t* d, int n, double near_, double far_, int levels, float* out);
 
+// One lossless uint16 plane per frame (row-major W*H, N frames). inverse_depth=1 stores
+// inverse-depth quant in metadata (near/far/levels); 0 = raw pass-through uint16.
+typedef struct {
+  const char* id;
+  const uint16_t* data;
+  int inverse_depth;
+  double near_, far_;
+  int levels;
+} dc_signal_spec_t;
+
+// Encode RGB (optional) + any number of lossless signals. rgba may be null (no RGB track).
+int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
+                    const dc_signal_spec_t* signals, int num_signals,
+                    int W, int H, int N, int fps,
+                    uint8_t** out, size_t* out_len);
+
+// Return the CHROMAPAKZ metadata JSON (malloc'd; free with dc_free).
+int dc_get_metadata(const uint8_t* webm, size_t len, char** json_out, size_t* json_len);
+
+// Decode one signal by id (e.g. "depth", "objectId") into caller buffer W*H*N uint16.
+int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id, uint16_t* out);
+
 void dc_free(uint8_t* p);
 
 #ifdef __cplusplus

@@ -8,7 +8,7 @@ import { chromium, firefox, webkit } from 'playwright';
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(dir, '../..');             // repo root, so ../../src/ resolves
 const pagePath = '/experiments/webcodecs-lossless/headless.html';
-const MODE = process.argv[2] || 'single';            // single | gop | split | highdepth | webm
+const MODE = process.argv[2] || 'single';            // single | streaming | network | multisignal | …
 const SIZE = Number(process.argv[3] || 256);
 const N = Number(process.argv[4] || 30);
 const TYPES = { '.html':'text/html', '.js':'text/javascript' };
@@ -104,6 +104,34 @@ if (MODE === 'caps') {
       `${bpp(r.hiBytes, r.px).padStart(6)}   ${bpp(r.loBytes, r.px).padStart(6)}   ` +
       `${bpp(r.totalBytes, r.px).padStart(9)}   ${relStr}`);
   }
+} else if (MODE === 'streaming') {
+  const out = await page.evaluate(([w, h, n]) => window.__runStreamingWebM(w, h, n), [SIZE, SIZE, N])
+    .catch(e => ({ error: String(e) }));
+  if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
+  console.log(`\nStreaming API round-trip · ${SIZE}×${SIZE} × ${N} frames\n`);
+  console.log(`  createEncoder→createDecoder depth bit-exact: ${out.exact ? 'YES ✓' : 'NO ✗ (max Δ=' + out.dMax + ')'}`);
+  console.log(`  batch encode(depthFloat, auto near/far) bit-exact: ${out.batchExact ? 'YES ✓' : 'NO ✗'}`);
+  console.log(`  encode(depthU16) without near/far throws: ${out.throwsMissing ? 'YES ✓' : 'NO ✗'}`);
+  console.log(`  metadata signals: ${out.signalCount}`);
+  console.log(`  near/far metadata: ${out.near.toFixed(3)}–${out.far.toFixed(3)}`);
+  if (!out.exact || !out.batchExact || !out.throwsMissing) process.exitCode = 1;
+} else if (MODE === 'multisignal') {
+  const out = await page.evaluate(([w, h, n]) => window.__runMultiSignalWebM(w, h, n), [SIZE, SIZE, N])
+    .catch(e => ({ error: String(e) }));
+  if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
+  console.log(`\nMulti-signal WebM · ${SIZE}×${SIZE} × ${N}\n`);
+  console.log(`  depth bit-exact: ${out.exactDepth ? 'YES ✓' : 'NO ✗'}`);
+  console.log(`  objectId bit-exact: ${out.exactOid ? 'YES ✓' : 'NO ✗'}`);
+  if (!out.exactDepth || !out.exactOid) process.exitCode = 1;
+} else if (MODE === 'network') {
+  const out = await page.evaluate(([w, h, n]) => window.__runNetworkWebM(w, h, n), [SIZE, SIZE, N])
+    .catch(e => ({ error: String(e) }));
+  if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
+  console.log(`\nNetwork byte streaming · ${SIZE}×${SIZE} × ${N} frames\n`);
+  console.log(`  onChunk segments: ${out.chunks}`);
+  console.log(`  chunked push decode (batch file) bit-exact: ${out.exact ? 'YES ✓' : 'NO ✗ (max Δ=' + out.dMax + ')'}`);
+  console.log(`  onChunk encode bit-exact: ${out.streamExact ? 'YES ✓' : 'NO ✗'}`);
+  if (!out.exact || !out.streamExact) process.exitCode = 1;
 } else if (MODE === 'webm') {
   const out = await page.evaluate(([w, h, n]) => window.__runWebM(w, h, n), [SIZE, SIZE, N]).catch(e => ({ error: String(e) }));
   if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
@@ -117,7 +145,7 @@ if (MODE === 'caps') {
     console.log(`  ${String(t.n).padEnd(6)} ${(t.name||'').padEnd(11)} ${t.codec.padEnd(7)} ` +
       `${(t.w+'×'+t.h).padEnd(11)} ${String(t.frames).padStart(4)}   ${String(t.bytes).padStart(8)}   ` +
       `${(t.bytes*8/(out.W*out.H*out.N)).toFixed(3)}`);
-  console.log(`\n  metadata: ${JSON.stringify(out.metadata.depth)}`);
+  console.log(`\n  metadata signals: ${JSON.stringify(out.metadata.signals?.map(s=>s.id) ?? out.metadata.depth)}`);
   const [b64, depthB64] = await page.evaluate(() => [window.__lastWebM, window.__lastDepth]);
   fs.writeFileSync(path.join(dir, 'sample.webm'), Buffer.from(b64, 'base64'));
   fs.writeFileSync(path.join(dir, 'sample.u16'), Buffer.from(depthB64, 'base64'));
