@@ -202,11 +202,14 @@ CI builds and tests on Linux + macOS and runs the in-browser VP9-lossless probe 
 
 Working end-to-end and verified across all three implementations. Honest caveats:
 
-- **Browser support is engine-specific** (measured, [`EVALUATION.md` §11](docs/EVALUATION.md)): lossless
-  *encode* is Chromium-only today (WebKit lacks WebCodecs' quantizer mode; Firefox's QP 0 isn't lossless);
-  lossless *decode* works on Chromium and WebKit/Safari. Firefox decodes VP9 to color-converted BGRX, so
-  it needs a fallback. These are Playwright engine builds — reconfirm on shipping browsers before hard
-  claims.
+- **Browser support is engine-specific** (measured, [`EVALUATION.md` §11](docs/EVALUATION.md)): native
+  WebCodecs lossless *encode* is Chromium-only today (WebKit lacks WebCodecs' quantizer mode; Firefox's
+  QP 0 isn't lossless); native lossless *decode* works on Chromium and WebKit/Safari, while Firefox
+  decodes VP9 to color-converted BGRX. Where native can't be trusted, the library transparently falls
+  back to a bundled **libvpx-WASM** codec, chosen *per operation* by a cached runtime probe — so a
+  decode-only browser (e.g. Safari) downloads only `vp9-decode.wasm` and never the larger encoder, and
+  vice-versa. Force it with `backend: 'webcodecs' | 'wasm'` (default `'auto'`); see [`docs/API.md`](docs/API.md).
+  These are Playwright engine builds — reconfirm on shipping browsers before hard claims.
 - **"Royalty-free"** reflects the AOMedia/Google position on VP9; Sisvel operates pools that dispute it.
 - An **auto precision picker** (estimate the sensor noise floor to choose `--depth-bits`) is future work.
 - **Network byte streaming** is supported via `onChunk` on encode and `createDecoder()` + `push()`/`finish()` on decode. See [`docs/API.md`](docs/API.md).

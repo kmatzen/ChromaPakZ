@@ -23,6 +23,7 @@ import {
   SIGNAL_DEPTH,
   SIGNAL_RAW_U16,
 } from './signals.js';
+import { pickEncoderBackend, pickDecoderBackend } from './backend/select.js';
 
 export {
   LEVELS_FULL,
@@ -35,84 +36,17 @@ export {
   SIGNAL_RAW_U16,
 };
 
-// ── WebCodecs helpers ──
-function lumaFrame(plane, W, H, tsUs){
-  const cW=W>>1, cH=H>>1, buf=new Uint8Array(W*H+2*cW*cH);
-  buf.set(plane,0); buf.fill(128, W*H);
-  return new VideoFrame(buf,{ format:'I420', codedWidth:W, codedHeight:H, timestamp:tsUs,
-    colorSpace:{ primaries:'bt709', transfer:'iec61966-2-1', matrix:'bt709', fullRange:true }});
-}
-function rgbaFrame(rgba, W, H, tsUs){
-  return new VideoFrame(rgba,{ format:'RGBA', codedWidth:W, codedHeight:H, timestamp:tsUs });
-}
-async function readLuma(frame, W, H){
-  const dst=new Uint8Array(frame.allocationSize()); const lay=await frame.copyTo(dst); const y=lay[0];
-  const out=new Uint8Array(W*H);
-  for(let r=0;r<H;r++) out.set(dst.subarray(y.offset+r*y.stride, y.offset+r*y.stride+W), r*W);
-  return out;
-}
-async function readRGBA(frame, W, H){
-  const opts={format:'RGBA'}; const buf=new Uint8Array(frame.allocationSize(opts)); await frame.copyTo(buf,opts);
-  return buf;
-}
-
-function createTrackEncoder({ makeFrame, lossless, W, H, fps, bitrate, keyEvery=Infinity }){
-  let i=0; const usPerFrame=1e6/fps; const outQ=[]; let waitOut=null;
-  const enc=new VideoEncoder({ output:(c)=>{ const data=new Uint8Array(c.byteLength); c.copyTo(data);
-    const chunk={ key:c.type==='key', timeMs:Math.round(c.timestamp/1000), data };
-    if(waitOut){ const w=waitOut; waitOut=null; w(chunk); } else outQ.push(chunk);
-  }, error:e=>{ throw e; } });
-  const cfg={ codec:'vp09.00.10.08', width:W, height:H, framerate:fps };
-  if(lossless) cfg.bitrateMode='quantizer'; else cfg.bitrate=bitrate||2_000_000;
-  enc.configure(cfg);
-  return {
-    async push(src){
-      const f=makeFrame(src, i*usPerFrame); const isKey=i===0 || i%keyEvery===0;
-      enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); i++;
-      if(outQ.length) return outQ.shift();
-      return new Promise(res=>{ waitOut=res; });
-    },
-    async close(){
-      await enc.flush(); enc.close();
-      const rest=outQ.splice(0);
-      if(waitOut){ const w=waitOut; waitOut=null; if(rest.length) w(rest.shift()); else w(null); }
-      return rest;
-    },
-  };
-}
-
-function createTrackDecoder(W, H, readFn){
-  const queue=[]; let wait=null, err=null, closed=false;
-  const dec=new VideoDecoder({ output:async f=>{ try{
-    queue.push(await readFn(f,W,H));
-    if(wait){ const w=wait; wait=null; w(); }
-  } finally{ f.close(); } }, error:e=>{ err=e; if(wait){ const w=wait; wait=null; w(); } } });
-  dec.configure({ codec:'vp09.00.10.08', codedWidth:W, codedHeight:H });
-  return {
-    push(fr){
-      if(err) throw err;
-      if(closed) throw new Error('track decoder closed');
-      dec.decode(new EncodedVideoChunk({ type:fr.key?'key':'delta', timestamp:fr.timeMs*1000, data:fr.data }));
-    },
-    async next(){
-      if(err) throw err;
-      if(queue.length) return queue.shift();
-      if(closed) return null;
-      await new Promise(res=>{ wait=res; });
-      if(err) throw err;
-      return queue.length ? queue.shift() : null;
-    },
-    async close(){ await dec.flush(); dec.close(); closed=true;
-      if(wait){ wait(); wait=null; } },
-  };
-}
+// ── codec backends ──
+// All VP9 frame encode/decode goes through a pluggable backend (native WebCodecs or a WASM
+// libvpx fallback), selected per operation by src/backend/select.js. Tracks are described by
+// `kind`: 'luma' (8-bit Y plane, lossless for signals) or 'rgba' (lossy preview RGB).
 
 function resolveSignalSpecs(signals){
   if(!signals?.length) throw new Error('createEncoder: signals[] required');
   return signals;
 }
 
-function makeFrameReader({ meta, W, H, blocks }){
+function makeFrameReader({ meta, W, H, blocks, getBackend }){
   let i=0, shut=false;
   const rgbDec={};
   const sigDec={}; // id → { hi, lo }
@@ -127,9 +61,10 @@ function makeFrameReader({ meta, W, H, blocks }){
       if(i>=blocks.length) return null;
       const slot=blocks[i++];
       const out={ rgb: null, signals: {} };
+      const be=await getBackend();
 
       if(slot.rgb){
-        if(!rgbDec.dec) rgbDec.dec=createTrackDecoder(W,H,readRGBA);
+        if(!rgbDec.dec) rgbDec.dec=be.createTrackDecoder({ kind:'rgba', W, H });
         rgbDec.dec.push(slot.rgb);
         out.rgb=await rgbDec.dec.next();
       }
@@ -137,7 +72,7 @@ function makeFrameReader({ meta, W, H, blocks }){
       for(const s of signals){
         const hiKey=`${s.id}:hi`, loKey=`${s.id}:lo`;
         if(!slot[hiKey]) continue;
-        if(!sigDec[s.id]) sigDec[s.id]={ hi: createTrackDecoder(W,H,readLuma), lo: createTrackDecoder(W,H,readLuma) };
+        if(!sigDec[s.id]) sigDec[s.id]={ hi: be.createTrackDecoder({ kind:'luma', W, H }), lo: be.createTrackDecoder({ kind:'luma', W, H }) };
         sigDec[s.id].hi.push(slot[hiKey]);
         sigDec[s.id].lo.push(slot[loKey]);
         const hi=await sigDec[s.id].hi.next();
@@ -171,7 +106,7 @@ function makeFrameReader({ meta, W, H, blocks }){
 /**
  * @param signals — e.g. [{ id:'depth', near, far }, { id:'objectId' }]
  */
-export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null }){
+export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto' }){
   const specList=resolveSignalSpecs(signals);
   let n=0, hasRgb=false;
   let signalPlan=null;
@@ -180,6 +115,12 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   let streamMux=null, byteParts=null;
   const muxFrames=[];
   const rgbKeyEvery=Math.max(1, Math.round(fps));
+
+  // Backends are picked once per encoder, lazily, on first frame. Lossless (signals) and
+  // lossy (rgb) probe independently — a browser may have native lossy but need WASM lossless.
+  let losslessBackendP=null, lossyBackendP=null;
+  const losslessBackend=()=> losslessBackendP ??= pickEncoderBackend({ lossless:true, force:backend });
+  const lossyBackend=()=> lossyBackendP ??= pickEncoderBackend({ lossless:false, force:backend });
 
   function ensurePlan(){
     if(signalPlan) return;
@@ -196,11 +137,12 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     if(onChunk) onChunk(streamMux.header);
   }
 
-  function getSigEnc(id){
+  async function getSigEnc(id){
     if(!sigEnc[id]){
+      const be=await losslessBackend();
       sigEnc[id]={
-        hi: createTrackEncoder({ makeFrame:(s,ts)=>lumaFrame(s,W,H,ts), lossless:true, W,H,fps }),
-        lo: createTrackEncoder({ makeFrame:(s,ts)=>lumaFrame(s,W,H,ts), lossless:true, W,H,fps }),
+        hi: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps }),
+        lo: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps }),
       };
     }
     return sigEnc[id];
@@ -235,8 +177,8 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     async addFrame(frame){
       const writes=[];
       if(frame.rgb){
-        if(!rgbEnc) rgbEnc=createTrackEncoder({ makeFrame:(s,ts)=>rgbaFrame(s,W,H,ts), lossless:false,
-          W,H,fps, bitrate:rgbKbps, keyEvery:rgbKeyEvery });
+        if(!rgbEnc){ const be=await lossyBackend();
+          rgbEnc=be.createTrackEncoder({ kind:'rgba', lossless:false, W, H, fps, bitrate:rgbKbps, keyEvery:rgbKeyEvery }); }
         hasRgb=true;
       }
       ensurePlan();
@@ -246,7 +188,7 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
         const u16=u16FromFramePayload(inputs[s.id], s);
         if(!u16) continue;
         anySignal=true;
-        const enc=getSigEnc(s.id);
+        const enc=await getSigEnc(s.id);
         const { hi, lo }=triFoldPack(u16);
         const chi=await enc.hi.push(hi), clo=await enc.lo.push(lo);
         writes.push({ track:s.tracks.hi, ...chi }, { track:s.tracks.lo, ...clo });
@@ -298,17 +240,23 @@ export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000,
 }
 
 // ── streaming decode ──
-export function createDecoder(bytes){
-  if(bytes!==undefined) return createDecoderFromBytes(bytes);
-  return createNetworkDecoder();
+export function createDecoder(bytes, opts={}){
+  if(bytes!==undefined) return createDecoderFromBytes(bytes, opts);
+  return createNetworkDecoder(opts);
 }
 
-function createDecoderFromBytes(bytes){
+// Memoized decoder backend, shared across all tracks of one decoder (probes at most once).
+function decoderBackendGetter(force){
+  let p=null;
+  return ()=> p ??= pickDecoderBackend({ force });
+}
+
+function createDecoderFromBytes(bytes, { backend='auto' }={}){
   const { tracks, metadata:raw }=demux(bytes);
   const meta=normalizeMetadata(raw);
   const W=meta.width, H=meta.height;
   const blocks=blocksByTime(tracks, meta);
-  const core=makeFrameReader({ meta, W, H, blocks });
+  const core=makeFrameReader({ meta, W, H, blocks, getBackend: decoderBackendGetter(backend) });
   const depth=meta.signals.find(s=>s.id==='depth');
   return {
     get metadata(){ return meta; },
@@ -327,8 +275,9 @@ function createDecoderFromBytes(bytes){
   };
 }
 
-function createNetworkDecoder(){
+function createNetworkDecoder({ backend='auto' }={}){
   const sdm=createStreamDemux();
+  const getBackend=decoderBackendGetter(backend);
   let meta=null, W=0, H=0, keys=null;
   const slotPending=new Map();
   const blockQueue=[];
@@ -393,7 +342,7 @@ function createNetworkDecoder(){
         if(streamDone) return null;
         await new Promise(res=>{ waitBlock=res; });
       }
-      if(!core && blockQueue.length) core=makeFrameReader({ meta, W, H, blocks:blockQueue });
+      if(!core && blockQueue.length) core=makeFrameReader({ meta, W, H, blocks:blockQueue, getBackend });
       if(!core) return null;
       return core.readFrame();
     },
@@ -414,8 +363,8 @@ function createNetworkDecoder(){
   };
 }
 
-export async function decode(bytes){
-  const dec=createDecoder(bytes);
+export async function decode(bytes, opts={}){
+  const dec=createDecoder(bytes, opts);
   const rgb=[], signalSeries={};
   for await (const frame of dec){
     if(frame.rgb) rgb.push(frame.rgb);

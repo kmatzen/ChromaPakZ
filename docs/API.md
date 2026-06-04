@@ -39,6 +39,24 @@ Network: `onChunk` on encode; `createDecoder()` + `push()` + `finish()` on decod
 
 Quant helpers: `quantizeInverseDepth`, `dequantizeInverseDepth`, `autoNearFar`, `triFoldPack`, `triFoldUnpack`.
 
+### Codec backend & WASM fallback
+
+VP9 frame encode/decode runs on native **WebCodecs** where it's trustworthy, and falls back to a
+bundled **libvpx-WASM** codec where it isn't — decided *per operation* by a one-time, cached
+runtime probe (a bit-exact round-trip; we probe rather than sniff the UA because some engines
+report VP9 support but aren't lossless/bit-exact). The fallback is granular: a browser that only
+decodes pulls `vp9-decode.wasm` (~236 KB) and never the larger `vp9-encode.wasm` (~858 KB), and
+vice-versa — the two are separate dynamic-import chunks, so your bundler ships only what runs.
+
+```javascript
+createEncoder({ W, H, signals, backend: 'auto' });   // 'auto' (default) | 'webcodecs' | 'wasm'
+createDecoder(bytes, { backend: 'auto' });            // same option; also on decode(bytes, opts)
+```
+
+`'auto'` probes and chooses; `'webcodecs'` / `'wasm'` force a backend (useful for tests/SSR).
+With no WebCodecs at all (e.g. Node), `'auto'` resolves to WASM. Rebuild the WASM artifacts with
+`npm run build:wasm` (needs an activated Emscripten SDK).
+
 ---
 
 ## Python (`python/chromapakz`)

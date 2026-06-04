@@ -1,0 +1,49 @@
+{
+  "name": "chromapakz",
+  "version": "0.1.0",
+  "description": "Lossless RGB + bit-exact auxiliary signals (depth, object IDs, …) in one WebM (VP9). WebCodecs in the browser, with a per-operation WASM (libvpx) fallback.",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./src/chromapakz.js",
+  "module": "./src/chromapakz.js",
+  "exports": {
+    ".": "./src/chromapakz.js",
+    "./webm": "./src/webm.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "native/wasm/dc_vp9.cpp",
+    "native/wasm/dc_vp9.h",
+    "native/wasm/build-wasm.sh",
+    "native/wasm/gen-decode-ref.mjs",
+    "docs/API.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:wasm": "bash native/wasm/build-wasm.sh",
+    "build": "vite build",
+    "test": "node tests/js_quant.mjs && node tests/js_signals.mjs && node tests/js_metadata_v2.mjs && node tests/webm_stream.mjs && node tests/js_wasm_roundtrip.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0",
+    "vite": "^6.3.0"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/kmatzen/ChromaPakZ",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kmatzen/ChromaPakZ.git"
+  },
+  "keywords": [
+    "webm",
+    "vp9",
+    "depth",
+    "lossless",
+    "webcodecs",
+    "wasm",
+    "libvpx",
+    "video"
+  ]
+}
