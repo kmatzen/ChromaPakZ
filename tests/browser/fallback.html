@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>chromapakz WASM-fallback test</title>
+<!-- Loaded by tests/browser/run.mjs under Playwright (chromium/firefox/webkit). Imports the
+     BUILT bundle (dist/) — the browser-facing artifact where the bundler has resolved the
+     Emscripten glue's Node-only imports. Run `npm run build` first. -->
+<script type="module">
+import * as DC from '/dist/chromapakz.js';
+
+const W = 48, H = 32, N = 4;
+function makeSeq(){
+  const seq = [];
+  for (let f = 0; f < N; f++){
+    const u16 = new Uint16Array(W*H);
+    for (let i = 0; i < u16.length; i++) u16[i] = ((i*131 + f*777) % 60000) + 1;
+    seq.push(u16);
+  }
+  return seq;
+}
+const eq = (a,b) => { if (a.length !== b.length) return false; for (let i=0;i<a.length;i++) if (a[i]!==b[i]) return false; return true; };
+
+// Round-trip a synthetic uint16 signal and report bit-exactness. `backend` is forwarded to
+// both encoder and decoder ('auto' | 'webcodecs' | 'wasm').
+window.runRoundTrip = async ({ backend = 'auto' } = {}) => {
+  const seq = makeSeq();
+  const enc = DC.createEncoder({ W, H, fps: 30, signals: [{ id: 'raw' }], backend });
+  for (const u16 of seq) await enc.addFrame({ signals: { raw: { u16 } } });
+  const bytes = await enc.finish();
+
+  const dec = DC.createDecoder(bytes, { backend });
+  const out = [];
+  for await (const frame of dec) out.push(frame.signals.raw.u16);
+  await dec.close();
+
+  let ok = out.length === N;
+  for (let i = 0; i < N && ok; i++) ok = eq(seq[i], out[i]);
+  return { ok, frames: out.length, bytes: bytes.length };
+};
+
+window.__ready = true;
+</script>
