@@ -17,7 +17,7 @@ import os
 
 import numpy as np
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 LEVELS_FULL = 65536
 
 
@@ -77,8 +77,17 @@ def _buf(data):
     return (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
 
 
+def _check_inverse_depth(near, far, levels):
+    """Validate an inverse-depth range (matches the JS planSignals guard) — fail loud, not NaN."""
+    if not (near > 0 and far > near):
+        raise ValueError(f"inverse-depth needs 0 < near < far (got near={near}, far={far})")
+    if levels < 3:
+        raise ValueError(f"inverse-depth needs levels >= 3 (got {levels})")
+
+
 def inverse_depth_spec(near, far, levels=LEVELS_FULL):
     """Spec dict for a depth signal with inverse-depth quant."""
+    _check_inverse_depth(near, far, levels)
     return {"inverse_depth": True, "near": near, "far": far, "levels": levels}
 
 
@@ -124,6 +133,8 @@ def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
         inv = bool(sp.get("inverse_depth", False))
         if inv and ("near" not in sp or "far" not in sp):
             raise ValueError(f"signal {sid!r}: inverse_depth requires near and far in specs")
+        if inv:
+            _check_inverse_depth(sp["near"], sp["far"], sp.get("levels", LEVELS_FULL))
         c_specs[i].id = sid.encode("utf-8")
         c_specs[i].data = arrays[i].ctypes.data_as(u16p)
         c_specs[i].inverse_depth = 1 if inv else 0
@@ -209,6 +220,7 @@ def decode(data, signal_ids=None):
 
 def quantize_inverse(z, near=0.2, far=10.0, levels=LEVELS_FULL):
     """Float depth/disparity -> uint16 inverse-depth codes (code 0 == invalid)."""
+    _check_inverse_depth(near, far, levels)
     z = np.ascontiguousarray(z, dtype=np.float32)
     out = np.empty(z.shape, dtype=np.uint16)
     _lib.dc_quantize_inverse(z.ctypes.data_as(f32p), z.size, near, far, levels, out.ctypes.data_as(u16p))
@@ -217,6 +229,7 @@ def quantize_inverse(z, near=0.2, far=10.0, levels=LEVELS_FULL):
 
 def dequantize_inverse(d, near=0.2, far=10.0, levels=LEVELS_FULL):
     """uint16 inverse-depth codes -> float32 metric depth (invalid -> NaN)."""
+    _check_inverse_depth(near, far, levels)
     d = np.ascontiguousarray(d, dtype=np.uint16)
     out = np.empty(d.shape, dtype=np.float32)
     _lib.dc_dequantize_inverse(d.ctypes.data_as(u16p), d.size, near, far, levels, out.ctypes.data_as(f32p))

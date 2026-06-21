@@ -8,13 +8,15 @@ alongside **bit-exact 16-bit auxiliary signals** — depth, object IDs, packed n
 
 - a **legacy player shows plain RGB** — the depth rides in extra tracks a normal player ignores;
 - it uses only **royalty-free** codecs (VP9 / libvpx, BSD) — no GPL encoder, no patent pool;
-- it **encodes and decodes in the browser with no WASM**, via WebCodecs; and
+- it runs **in the browser via WebCodecs** — **no WASM on Chromium**, with a small libvpx-WASM fallback for engines whose native path isn't bit-exact; and
 - depth is packed with one **reversible map**, not the range-slice bookkeeping of older schemes;
 - **multiple lossless uint16 signals** (depth, object IDs, …) share one container in sync.
 
 It's a clean-room redo of an older MP4/x264 approach (RGB as YUV, plus 16-bit depth sliced into several
 lossless-10-bit ranges). That design worked but had three thorns: x264 is GPL, the range-slicing was
-fiddly, and the browser needed a WASM codec. ChromaPakZ removes all three.
+fiddly, and the browser always needed a WASM codec. ChromaPakZ removes the first two outright; for the
+third, Chromium runs end-to-end on WebCodecs with **no WASM**, and a small libvpx-WASM build is kept only
+as a per-operation fallback for engines whose native path isn't bit-exact (Firefox, Safari).
 
 The same format is implemented three times — **browser (WebCodecs)**, **C++ (libvpx)**, and **Python** —
 and a file written by any one decodes bit-exactly in the others.
@@ -22,11 +24,14 @@ and a file written by any one decodes bit-exactly in the others.
 ## Quickstart
 
 ```sh
-# Browser demo — encode→file→decode→view, entirely in-page, no WASM
+# Browser demo — encode→file→decode→view, entirely in-page (no WASM on Chromium)
 python3 -m http.server 8000      # from the repo root, then open http://localhost:8000/demo/
 
-# Python — pip compiles the native libvpx core via CMake and bundles it
-pip install .
+# Python / C++ — the native libvpx core is compiled from source, so install the build
+# prerequisites first: libvpx (dev headers), pkg-config, CMake, and a C++17 compiler.
+#   macOS:   brew install libvpx pkg-config cmake ninja
+#   Debian:  sudo apt-get install libvpx-dev pkg-config cmake ninja-build g++
+pip install .                    # pip compiles the native core via CMake and bundles it
 python -c "import chromapakz as cz; print(cz.inverse_depth_spec(0.3, 9.0))"
 #   cz.encode({"depth": u16}, specs={"depth": cz.inverse_depth_spec(near, far)}, rgb=rgba)
 
@@ -77,7 +82,8 @@ WebCodecs has no "lossless" switch, so every claim here is a measurement from
 
 [`docs/EVALUATION.md`](docs/EVALUATION.md) is the full due-diligence record: every codec/container/packing
 alternative considered, the constraint that eliminates each, a head-to-head benchmark (ChromaPakZ beats
-FFV1, PNG-16, HEVC and x264 on the same depth, and lands within 1–2% of LZMA), cited licensing/browser
+FFV1, PNG-16 and x264 on the same 16-bit depth, beats x265/HEVC at matched 11-bit precision, and lands
+within 1–2% of LZMA), cited licensing/browser
 facts, and a sensitivity analysis of when a different choice would win.
 
 ## What it costs
@@ -97,18 +103,21 @@ one-line dataset fetch).
 
 The one knob that moves this is the **quantization precision** vs the sensor's noise floor. Spreading depth
 over all 65,535 codes makes one step far finer than the noise, so the codec faithfully archives randomness.
-Coarsening the grid to match the noise collapses the cost — without losing real signal:
+Coarsening the grid to match the noise collapses the cost — without losing real signal. The sweep below is
+measured on the synthetic benchmark clip (`make_synthetic_rgbd.py`, range ≈0.9–7.8 m) — a separate clip from
+the TUM numbers above:
 
 | effective bits | depth precision at 7.8 m | depth bpp |
 |---|---|---|
-| 16 (default) | 1.7 mm per step | 13.2 |
-| 12 | 28 mm per step | 9.7 |
-| 11 | 56 mm per step | 8.1 |
-| 10 | 112 mm per step | 6.9 |
+| 16 (default) | 0.9 mm per step | 13.2 |
+| 12 | 14 mm per step | 9.7 |
+| 11 | 28 mm per step | 8.1 |
+| 10 | 56 mm per step | 6.9 |
 
-`levels` is a first-class, metadata-stored parameter (default 65536 = full 16-bit) shared by all three
-implementations, so reduced-precision files reconstruct identically everywhere. Set it with
-`ingest.py --depth-bits N` or the `levels=` argument.
+(Reproduce the bpp column with `python python/benchmark_codecs.py`.) `levels` is a first-class,
+metadata-stored parameter (default 65536 = full 16-bit) shared by all three implementations, so
+reduced-precision files reconstruct identically everywhere. Set it with `ingest.py --depth-bits N` or the
+`levels=` argument.
 
 ### Codec rate-distortion
 
@@ -173,7 +182,7 @@ Depth-camera ecosystems already split into two camps; ChromaPakZ takes the best 
 | bit-exact 16-bit depth | ✗ (lossy) | ✓ | **✓** |
 | RGB plays in any legacy player | ✓ | — | **✓** |
 | inter-frame (temporal) compression | ✓ (lossy) | ✗ | **✓ (lossless)** |
-| royalty-free, browser-native, no WASM | — | — | **✓** |
+| royalty-free, browser-native (no WASM on Chromium) | — | — | **✓** |
 
 That Azure Kinect already chose Matroska — WebM's basis — is telling. ChromaPakZ differs by *compressing*
 depth losslessly (VP9 + triangle-fold, inter-coded) rather than storing raw or intra PNG, and by running in
@@ -191,7 +200,7 @@ demo/         index.html                     in-browser encode→decode→view
 examples/     tum_fr1desk.py
 experiments/  webcodecs-lossless/            run.mjs, smoke-demo.mjs, headless tests
 docs/         FORMAT.md, API.md, EVALUATION.md, RELEASING.md
-tests/        roundtrip.py, cross_interop.py, ffmpeg_interop.py, js_*.mjs
+tests/        roundtrip.py, cross_interop.py, stream_interop.py, ffmpeg_interop.py, js_*.mjs
 ```
 
 CI builds and tests on Linux + macOS and runs the in-browser VP9-lossless probe in headless Chromium;
