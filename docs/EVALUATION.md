@@ -140,7 +140,9 @@ Same uint16 depth, every credible lossless codec, bits/pixel (`python/benchmark_
 | PNG-16 | 9.95 | +23% |
 | x264 8+8 (GPL) | 11.93 | +47% |
 
-**Reading:** ChromaPakZ **beats FFV1, PNG, HEVC and x264**, and is within **1–2%** of LZMA-9-extreme — a
+**Reading:** ChromaPakZ **beats FFV1, PNG and x264 at full 16-bit, and beats x265/HEVC at matched 11-bit**
+(x265 caps at 12-bit input here, so it isn't in the 16-bit table; HEVC's native 16-bit lossless mode wasn't
+reachable in this ffmpeg build), and is within **1–2%** of LZMA-9-extreme — a
 non-realtime, non-seekable, non-browser archival compressor that satisfies *none* of R1∧R3∧R4∧R5. Under
 heavy noise all lossless codecs converge near the entropy floor (the noise *is* the cost), so ChromaPakZ's
 real win is meeting every constraint at **no ratio penalty**. (libaom-AV1 and libjxl weren't in this ffmpeg

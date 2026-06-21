@@ -56,7 +56,7 @@ def png16_size(codes16):
 def chromapakz_size(c16, levels):
     data = dc.encode({"depth": c16}, specs={"depth": dc.inverse_depth_spec(near, far, levels)}, fps=30)
     ts = webm_inspect.track_sizes(data)
-    return sum(t["bytes"] for t in ts.values() if t["name"].startswith("depth"))
+    return sum(t["bytes"] for t in ts.values() if t["name"].startswith("signal-depth"))
 
 
 def bench(levels, label):
@@ -97,4 +97,6 @@ def bench(levels, label):
 
 
 bench(65536, "Full 16-bit (realistic noisy depth)")
+bench(4096, "Matched 12-bit precision")
 bench(2048, "Matched 11-bit precision (noise-floor-matched)")
+bench(1024, "Matched 10-bit precision")

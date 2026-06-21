@@ -131,15 +131,23 @@ int readId(const uint8_t* b, size_t p, uint32_t& id){
   uint8_t first=b[p]; int L=1, m=0x80; while(L<=4 && !(first&m)){ m>>=1; L++; }
   id=0; for(int k=0;k<L;k++) id=(id<<8)|b[p+k]; return L;
 }
-int readSize(const uint8_t* b, size_t p, uint64_t& size){
+int readSize(const uint8_t* b, size_t p, uint64_t& size, bool* unknown=nullptr){
   uint8_t first=b[p]; int L=1, m=0x80; while(L<=8 && !(first&m)){ m>>=1; L++; }
-  size = first & (m-1); for(int k=1;k<L;k++) size=(size<<8)|b[p+k]; return L;
+  size = first & (m-1); for(int k=1;k<L;k++) size=(size<<8)|b[p+k];
+  // An all-ones value (the reserved vint pattern) marks an unknown-size element —
+  // the JS streaming muxer emits these for the Segment. Mirror src/webm.js readSize().
+  if(unknown){ uint64_t allOnes=((uint64_t)1<<(7*L))-1; *unknown=(size==allOnes); }
+  return L;
 }
 uint64_t readUint(const uint8_t* b, size_t s, size_t e){ uint64_t v=0; for(size_t k=s;k<e;k++) v=(v<<8)|b[k]; return v; }
 std::vector<Child> kids(const uint8_t* b, size_t start, size_t end){
   std::vector<Child> r; size_t p=start;
-  while(p<end){ uint32_t id; size_t la=readId(b,p,id); uint64_t sz; size_t lb=readSize(b,p+la,sz);
-    size_t ds=p+la+lb; r.push_back({id, ds, ds+sz}); p=ds+sz; }
+  while(p<end){ uint32_t id; size_t la=readId(b,p,id); bool unk=false; uint64_t sz; size_t lb=readSize(b,p+la,sz,&unk);
+    size_t ds=p+la+lb; size_t de = unk ? end : ds+sz;
+    if(de>end) de=end;                       // unknown-size, or a truncated/oversized element: clamp to parent
+    r.push_back({id, ds, de});
+    if(unk) break;                           // unknown size runs to the parent's end (matches the JS demuxer)
+    p=de; }
   return r;
 }
 
@@ -257,23 +265,23 @@ std::string quantJson(const SignalQuantMeta& q){
 }
 
 std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::vector<SignalMeta>& signals){
+  // Built with std::string throughout — the document grows with signal count and id length,
+  // so a fixed stack buffer would silently truncate (and emit invalid JSON) past some size.
   std::string sigs="[";
   for(size_t i=0;i<signals.size();i++){
     if(i) sigs+=",";
     const auto& s=signals[i];
-    char buf[512];
-    snprintf(buf,sizeof buf,
-      "{\"id\":\"%s\",\"tracks\":{\"hi\":%d,\"lo\":%d},\"codec\":\"vp09.00.10.08\","
-      "\"lossless\":true,\"scheme\":\"tri-fold-8+8\",\"dtype\":\"uint16\",\"invalidCode\":0,\"quant\":%s}",
-      s.id.c_str(), s.track_hi, s.track_lo, quantJson(s.quant).c_str());
-    sigs+=buf;
+    char nums[64]; snprintf(nums,sizeof nums,"\"hi\":%d,\"lo\":%d", s.track_hi, s.track_lo);
+    sigs += "{\"id\":\""; sigs += s.id; sigs += "\",\"tracks\":{"; sigs += nums;
+    sigs += "},\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
+            "\"dtype\":\"uint16\",\"invalidCode\":0,\"quant\":";
+    sigs += quantJson(s.quant); sigs += "}";
   }
   sigs+="]";
   std::string rgb = hasRgb ? "{\"track\":1,\"codec\":\"vp09.00.10.08\"}" : "null";
-  char out[4096];
-  snprintf(out,sizeof out,
-    "{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":%s,\"signals\":%s}",
-    W,H,fps,N,rgb.c_str(),sigs.c_str());
+  char head[160];
+  snprintf(head,sizeof head,"{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":",W,H,fps,N);
+  std::string out=head; out+=rgb; out+=",\"signals\":"; out+=sigs; out+="}";
   return out;
 }
 
@@ -490,7 +498,16 @@ int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
   FileMeta meta = parseMetadata(d.metadata);
   if(W) *W=meta.width;
   if(H) *H=meta.height;
-  if(N) *N=meta.frames;
+  // Streaming files carry "frames":null (the count isn't known when the header is emitted),
+  // so fall back to counting actual blocks on the busiest track. Callers size decode buffers
+  // from this N, so it must match what dc_decode_* will write.
+  int n = meta.frames;
+  if(n <= 0){
+    std::vector<int> seen;
+    for(auto& f : d.frames){ bool dup=false; for(int t:seen) if(t==f.track){dup=true;break;} if(!dup) seen.push_back(f.track); }
+    for(int t : seen){ int c=0; for(auto& f : d.frames) if(f.track==t) c++; n=std::max(n,c); }
+  }
+  if(N) *N=n;
   if(fps) *fps=meta.fps;
   if(has_rgb) *has_rgb = meta.has_rgb ? 1 : 0;
   const SignalMeta* depth = findSignal(meta, "depth");

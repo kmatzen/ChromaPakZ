@@ -45,6 +45,7 @@ jobs:
           python -m pip install . --no-build-isolation || python -m pip install .
           python tests/roundtrip.py
           python tests/cross_interop.py
+          python tests/stream_interop.py
 
       - name: ffmpeg decode-interop (full-range / bit-exact regression guard)
         run: python tests/ffmpeg_interop.py
