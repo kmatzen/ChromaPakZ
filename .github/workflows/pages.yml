@@ -1,0 +1,37 @@
+name: pages
+
+# Publishes the in-browser demo to GitHub Pages so it has a shareable live URL.
+# The demo is static (demo/index.html imports ../src/*.js with relative paths), so
+# serving the repo root works directly: the demo lands at
+#   https://<owner>.github.io/<repo>/demo/
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-progress one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          # Serve the repo root so demo/ can reach ../src/ and ../docs/ assets.
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4
