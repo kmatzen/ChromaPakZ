@@ -36,10 +36,12 @@ publishes via **Trusted Publishing** — OIDC, so there is **no API token to sto
    - `workflow_dispatch` builds the artifacts without publishing — handy for testing the wheel build.
 
 ### Notes / gotchas
-- The first wheel build may need libvpx tweaks: `scripts/install-libvpx.sh` tries distro packages
-  (EPEL `libvpx-devel`) then falls back to a source build (pinned libvpx 1.14.1). Adjust the version or
-  package list there if a manylinux image changes.
+- **Linux** builds libvpx from source (pinned 1.14.1) via `scripts/install-libvpx.sh`, because EPEL's
+  libvpx predates the VP9 encoder controls we use; a system libvpx is accepted only if ≥ 1.10. Bump `VER`
+  there to move libvpx. The script installs `nasm`/`yasm` (one is required to build libvpx).
+- **macOS** uses the Homebrew libvpx bottle and pins `MACOSX_DEPLOYMENT_TARGET` to the runner's macOS (15.0
+  today) so delocate can bundle that bottle — see `[tool.cibuildwheel.macos]`. If `macos-latest` moves to a
+  newer macOS, bump this value to match. Wheels build for the runner's arch (arm64); add `archs` or an Intel
+  runner for `x86_64`/`universal2` coverage.
 - Windows wheels are not configured (libvpx on MSVC is fiddly); add a `[tool.cibuildwheel.windows]`
   `before-all` (e.g. vcpkg) when needed.
-- macOS wheels build for the runner's arch (arm64 on `macos-latest`); add `archs` or an Intel runner for
-  `x86_64`/`universal2` coverage.

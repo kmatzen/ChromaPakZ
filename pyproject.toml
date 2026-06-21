@@ -34,4 +34,7 @@ environment = { PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkg
 
 [tool.cibuildwheel.macos]
 before-all = "brew install libvpx pkg-config ninja"
-# delocate (run automatically by cibuildwheel) bundles libvpx into the wheel.
+# The Homebrew libvpx bottle is compiled for the runner's macOS, so the wheel's deployment target must
+# match it or delocate refuses to bundle the dylib. macos-latest is currently macOS 15 (arm64); bump this
+# if the runner image moves. delocate then bundles libvpx into the wheel automatically.
+environment = { MACOSX_DEPLOYMENT_TARGET = "15.0" }
