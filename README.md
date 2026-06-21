@@ -2,24 +2,19 @@
 
 <p align="center"><img src="docs/logo.png" alt="ChromaPakZ — lossless RGBD video encoder" width="680"></p>
 
-**A lossless RGBD video codec** (クロマパックZ): one ordinary `.webm` that carries an 8-bit **RGB** track
-alongside **bit-exact 16-bit auxiliary signals** — depth, object IDs, packed normals, or any other `W×H`
-`uint16` plane — in sync. It is built so that
+**A lossless RGBD video codec** (クロマパックZ): a single ordinary `.webm` that carries an 8-bit **RGB**
+track alongside **bit-exact 16-bit auxiliary signals** — depth, object IDs, packed normals, or any other
+`W×H` `uint16` plane — all kept in sync. Its design goals:
 
-- a **legacy player shows plain RGB** — the depth rides in extra tracks a normal player ignores;
-- it uses only **royalty-free** codecs (VP9 / libvpx, BSD) — no GPL encoder, no patent pool;
-- it runs **in the browser via WebCodecs** — **no WASM on Chromium**, with a small libvpx-WASM fallback for engines whose native path isn't bit-exact; and
-- depth is packed with one **reversible map**, not the range-slice bookkeeping of older schemes;
-- **multiple lossless uint16 signals** (depth, object IDs, …) share one container in sync.
-
-It's a clean-room redo of an older MP4/x264 approach (RGB as YUV, plus 16-bit depth sliced into several
-lossless-10-bit ranges). That design worked but had three thorns: x264 is GPL, the range-slicing was
-fiddly, and the browser always needed a WASM codec. ChromaPakZ removes the first two outright; for the
-third, Chromium runs end-to-end on WebCodecs with **no WASM**, and a small libvpx-WASM build is kept only
-as a per-operation fallback for engines whose native path isn't bit-exact (Firefox, Safari).
+- a **legacy player shows plain RGB** — the depth rides in extra tracks an ordinary player ignores;
+- it uses only **royalty-free** codecs (VP9 / libvpx, BSD-licensed) — no GPL encoder, no patent pool;
+- it runs **in the browser through WebCodecs** — **no WASM on Chromium**, with a small libvpx-WASM
+  fallback for engines whose native path isn't bit-exact;
+- each 16-bit signal is packed with a single **reversible map**, not a stack of per-range slices to manage;
+- **multiple lossless uint16 signals** (depth, object IDs, …) share one container, frame-aligned.
 
 The same format is implemented three times — **browser (WebCodecs)**, **C++ (libvpx)**, and **Python** —
-and a file written by any one decodes bit-exactly in the others.
+and a file written by any one of them decodes bit-exactly in the other two.
 
 ## Quickstart
 
@@ -58,11 +53,12 @@ cmake -S . -B build && cmake --build build -j     # or: native/build.sh
 sensors behave. Float can't be stored losslessly in 16 bits, so this quantization *is* the format's defined
 precision boundary; everything below it is bit-exact.
 
-**Triangle-fold** is the key trick. The naive low byte `d & 0xFF` is a sawtooth — a hard `255→0` cliff
-every 256 levels — and those manufactured edges wreck any spatial predictor (this is exactly why the old
-design needed range slices). Reflecting every other segment (`lo = (high&1) ? 255-lo : lo`) turns it into a
-continuous triangle wave with no cliffs, so VP9's own predictor works. It's range-slicing collapsed into one
-reversible map, with nothing to manage.
+**Triangle-fold** is the key trick. Split a 16-bit value into a high and low byte the naive way (`d & 0xFF`)
+and the low byte becomes a sawtooth — a hard `255→0` cliff every 256 levels. Those manufactured edges defeat
+any spatial predictor, since the codec sees a discontinuity wherever the depth simply crosses a byte
+boundary. Reflecting every other segment (`lo = (high & 1) ? 255 - lo : lo`) turns that sawtooth into a
+continuous triangle wave with no cliffs, so VP9's predictor sees smooth gradients again. One reversible map,
+nothing to manage.
 
 **Full color range is signaled** in the bitstream (`VP9E_SET_COLOR_RANGE`), so a range-honouring decoder
 returns the packed luma unscaled instead of applying a limited-range conversion that would corrupt depth.
@@ -101,9 +97,10 @@ lossless coding must preserve every bit of it. On **real Kinect data** (TUM RGB-
 — depth round-tripped **bit-exact**. Reproduce with `examples/tum_fr1desk.py` (see its header for the
 one-line dataset fetch).
 
-The one knob that moves this is the **quantization precision** vs the sensor's noise floor. Spreading depth
-over all 65,535 codes makes one step far finer than the noise, so the codec faithfully archives randomness.
-Coarsening the grid to match the noise collapses the cost — without losing real signal. The sweep below is
+The one knob that moves this is the **quantization precision** relative to the sensor's noise floor. Spread
+depth across all 65,535 codes and each step is far finer than the noise, so the codec dutifully archives the
+randomness bit for bit. Coarsen the grid to match the noise and the cost collapses — with no loss of real
+signal. The sweep below is
 measured on the synthetic benchmark clip (`make_synthetic_rgbd.py`, range ≈0.9–7.8 m) — a separate clip from
 the TUM numbers above:
 
