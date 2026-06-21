@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
 # Provision libvpx inside the cibuildwheel manylinux container (run as cibuildwheel `before-all`).
-# Tries distro packages first, falls back to building libvpx from source. cibuildwheel's auditwheel
-# step then bundles the resulting shared library into the wheel, so the published wheel is self-contained.
+# cibuildwheel's auditwheel step then bundles the resulting shared library into the wheel, so the
+# published wheel is self-contained.
+#
+# A system libvpx is only accepted if it's new enough to expose the VP9 encoder controls we use
+# (VP9E_SET_COLOR_RANGE etc., added in libvpx 1.6). EPEL on older manylinux images ships a libvpx
+# that satisfies `pkg-config --exists vpx` but predates those symbols, which is why we version-gate
+# and otherwise build from source.
 set -euo pipefail
+
+MIN_MAJOR=1 MIN_MINOR=10   # require >= 1.10 to be safe
 
 PM=""
 command -v dnf >/dev/null 2>&1 && PM=dnf
 [ -z "$PM" ] && command -v yum >/dev/null 2>&1 && PM=yum
-
-if [ -n "$PM" ]; then
-  $PM install -y pkgconfig >/dev/null 2>&1 || true
-  ( $PM install -y epel-release >/dev/null 2>&1 && $PM install -y libvpx-devel >/dev/null 2>&1 ) || true
-fi
+[ -n "$PM" ] && $PM install -y pkgconfig >/dev/null 2>&1 || true
 
 if pkg-config --exists vpx; then
-  echo "libvpx from system package: $(pkg-config --modversion vpx)"
-  exit 0
+  V=$(pkg-config --modversion vpx); MAJ=${V%%.*}; REST=${V#*.}; MIN=${REST%%.*}
+  if [ "${MAJ:-0}" -gt "$MIN_MAJOR" ] || { [ "${MAJ:-0}" -eq "$MIN_MAJOR" ] && [ "${MIN:-0}" -ge "$MIN_MINOR" ]; }; then
+    echo "libvpx from system package: $V (>= ${MIN_MAJOR}.${MIN_MINOR}, ok)"; exit 0
+  fi
+  echo "system libvpx $V is too old (< ${MIN_MAJOR}.${MIN_MINOR}) — building from source"
 fi
 
 echo "building libvpx from source"
