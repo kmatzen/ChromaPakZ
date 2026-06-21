@@ -21,3 +21,7 @@ python/chromapakz/*.so
 _png16.png
 demo/preview.png
 experiments/**/package*.json
+
+# …but keep the committed regression fixtures (browser-streamed interop golden file)
+!tests/fixtures/stream.webm
+!tests/fixtures/stream_depth.u16

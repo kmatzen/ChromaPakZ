@@ -58,13 +58,16 @@
 <body>
 <div class="wrap">
 <header>
-  <h1><b>chromapakz</b> — RGB + lossless signals, one WebM, no WASM</h1>
+  <h1><b>chromapakz</b> — RGB + lossless signals, one WebM</h1>
   <p>Generate (or load) an RGBD clip, encode it in-browser via WebCodecs VP9, then decode and view it back.
-     The RGB pane is what a legacy player shows; depth (and other uint16 signals) ride along, bit-exact.</p>
+     The RGB pane is what a legacy player shows; depth (and other uint16 signals) ride along, bit-exact.
+     On Chromium this runs entirely on WebCodecs with no WASM; other engines transparently load a small
+     libvpx-WASM fallback.</p>
 </header>
 
-<div id="unsupported">This browser doesn't expose <code>VideoEncoder</code> (WebCodecs). Try Chrome,
-  Edge, Firefox&nbsp;130+, or Safari&nbsp;26+.</div>
+<div id="unsupported">This browser's <code>WebCodecs</code> path isn't bit-exact here, so the demo will use the
+  bundled <b>libvpx-WASM</b> fallback (correct, just slower to load). For the fastest, fully native path, try
+  Chrome or Edge.</div>
 
 <div class="card">
   <h2>Source &amp; encode settings</h2>

@@ -3,6 +3,7 @@
 The TUM data isn't redistributed here (their terms ask you to cite the paper, not re-host), so fetch
 it first — about 344 MB for the smallest sequence, fr1/desk:
 
+    pip install pillow          # this example reads the dataset's 16-bit PNGs (not a core dependency)
     curl -L -o /tmp/fr1desk.tgz \\
       https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_desk.tgz
     mkdir -p /tmp/tum && tar xzf /tmp/fr1desk.tgz -C /tmp/tum

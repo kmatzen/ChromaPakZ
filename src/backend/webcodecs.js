@@ -11,7 +11,7 @@ export const id = 'webcodecs';
 
 // ── frame in/out helpers ──
 function lumaFrame(plane, W, H, tsUs){
-  const cW=W>>1, cH=H>>1, buf=new Uint8Array(W*H+2*cW*cH);
+  const cW=(W+1)>>1, cH=(H+1)>>1, buf=new Uint8Array(W*H+2*cW*cH);  // I420 chroma is ceil(W/2)×ceil(H/2)
   buf.set(plane,0); buf.fill(128, W*H);
   return new VideoFrame(buf,{ format:'I420', codedWidth:W, codedHeight:H, timestamp:tsUs,
     colorSpace:{ primaries:'bt709', transfer:'iec61966-2-1', matrix:'bt709', fullRange:true }});
