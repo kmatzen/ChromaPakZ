@@ -33,5 +33,7 @@ before-all = "bash {project}/scripts/install-libvpx.sh"
 environment = { PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig" }
 
 [tool.cibuildwheel.macos]
-before-all = "brew install libvpx pkg-config ninja"
-# delocate (run automatically by cibuildwheel) bundles libvpx into the wheel.
+before-all = "bash {project}/scripts/install-libvpx-macos.sh"
+# libvpx is built from source (not brew) at a fixed deployment target so delocate can bundle it into
+# a wheel that isn't pinned to the runner's newest macOS; delocate then runs automatically.
+environment = { MACOSX_DEPLOYMENT_TARGET = "13.0", PKG_CONFIG_PATH = "$HOME/.vpxbuild/lib/pkgconfig" }
