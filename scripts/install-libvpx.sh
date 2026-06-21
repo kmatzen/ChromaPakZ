@@ -14,7 +14,11 @@ MIN_MAJOR=1 MIN_MINOR=10   # require >= 1.10 to be safe
 PM=""
 command -v dnf >/dev/null 2>&1 && PM=dnf
 [ -z "$PM" ] && command -v yum >/dev/null 2>&1 && PM=yum
-[ -n "$PM" ] && $PM install -y pkgconfig >/dev/null 2>&1 || true
+# EPEL provides yasm on EL; install deps individually so a single missing package doesn't abort the
+# whole transaction (and leave us with no assembler — libvpx needs nasm or yasm).
+if [ -n "$PM" ]; then
+  for p in pkgconfig epel-release; do $PM install -y "$p" >/dev/null 2>&1 || true; done
+fi
 
 if pkg-config --exists vpx; then
   V=$(pkg-config --modversion vpx); MAJ=${V%%.*}; REST=${V#*.}; MIN=${REST%%.*}
@@ -25,7 +29,12 @@ if pkg-config --exists vpx; then
 fi
 
 echo "building libvpx from source"
-[ -n "$PM" ] && $PM install -y yasm nasm make gcc gcc-c++ curl tar >/dev/null 2>&1 || true
+if [ -n "$PM" ]; then
+  for p in make gcc gcc-c++ curl tar nasm yasm; do $PM install -y "$p" >/dev/null 2>&1 || true; done
+fi
+command -v nasm >/dev/null 2>&1 || command -v yasm >/dev/null 2>&1 || {
+  echo "ERROR: no assembler (nasm/yasm) available to build libvpx" >&2; exit 1; }
+
 VER=1.14.1
 curl -fsSL "https://github.com/webmproject/libvpx/archive/refs/tags/v${VER}.tar.gz" -o /tmp/vpx.tgz
 mkdir -p /tmp/vpx && tar xzf /tmp/vpx.tgz -C /tmp/vpx --strip-components=1
