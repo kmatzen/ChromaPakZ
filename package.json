@@ -24,7 +24,7 @@
   "scripts": {
     "build:wasm": "bash native/wasm/build-wasm.sh",
     "build": "vite build",
-    "test": "node tests/js_quant.mjs && node tests/js_signals.mjs && node tests/js_metadata_v2.mjs && node tests/webm_stream.mjs && node tests/js_wasm_roundtrip.mjs"
+    "test": "node tests/js_quant.mjs && node tests/js_core_edge.mjs && node tests/js_signals.mjs && node tests/js_signals_plan.mjs && node tests/js_metadata_v2.mjs && node tests/webm_stream.mjs && node tests/js_webm_edge.mjs && node tests/js_wasm_roundtrip.mjs && node tests/js_wasm_multisignal.mjs"
   },
   "devDependencies": {
     "playwright": "^1.60.0",
