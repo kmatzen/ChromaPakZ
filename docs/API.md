@@ -239,7 +239,10 @@ so zero the buffer first if you read all of it back — the Python bindings do.
 ## Tests
 
 Both suites are discovered by glob — every `tests/*.test.mjs` and every `tests/test_*.py` runs, so
-adding a file is enough to add it to CI. Node 22+ is required for the test runner's built-in glob.
+adding a file is enough to add it to CI.
+
+Running the Node suite needs Node 22+ (the test runner's built-in glob); the library itself has no
+such floor, which is why there is no `engines` field pushing it onto consumers.
 
 ```sh
 npm test                      # Node suite  (node --test 'tests/**/*.test.mjs')
