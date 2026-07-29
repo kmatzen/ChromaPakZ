@@ -78,14 +78,26 @@ libvpx too (`install-libvpx.sh` configures for `uname -m`), and cibuildwheel can
    - Environment name: `pypi`
 2. **Create the GitHub Environments** `pypi` and `npm` (Settings → Environments → New environment).
    Optionally add required reviewers so a human approves each publish.
-3. **Create an npm automation token** and store it as the repository secret `NPM_TOKEN`
-   (npmjs.com → Access Tokens → Generate → *Automation*, so 2FA does not block CI). Scope it to the
-   `chromapakz` package once that package exists.
-   - npm also supports tokenless **trusted publishing** (OIDC), but it can only be configured on a
-     package that already exists. After the first release, set it up on npmjs.com → the package →
-     *Settings* → *Trusted publisher*, then drop the `NODE_AUTH_TOKEN` env from the `publish-npm`
-     job and delete the secret. The `id-token: write` permission is already in place.
-4. (Optional) Repeat step 1 with TestPyPI and a second job to dry-run first.
+3. **Create an npm granular access token** and store it as the repository secret `NPM_TOKEN`
+   (npmjs.com → Access Tokens → Generate New Token → *Granular Access Token*). Legacy/"classic"
+   tokens, including the old *Automation* type, were removed in November 2025 — granular is the only
+   kind left. Three settings matter, and the defaults are wrong for all three:
+   - **Packages and scopes → Read and write**, applied to **All Packages**. Not *"Only select
+     packages and scopes"*: that list can only contain packages that already exist, and saving it
+     empty fails with `You must have at least one package added to this token`. Narrow it to
+     `chromapakz` after the first publish.
+   - **Bypass two-factor authentication** — check it. This replaced the Automation token type; left
+     unchecked (the default), a publish from CI is refused whenever 2FA is on.
+   - **Expiry** — granular tokens must have one. Note the date, or the next release fails at the
+     upload for a reason nothing in the log explains.
+4. **Switch to trusted publishing after the first release.** npm supports tokenless OIDC, but it is
+   configured per package and so cannot be set up before the package exists — which is the only
+   reason step 3 involves a token at all. Once `chromapakz` is on the registry: npmjs.com → the
+   package → *Settings* → *Trusted publisher*, with **Organization or user** `kmatzen`,
+   **Repository** `ChromaPakZ`, **Workflow filename** `release.yml`, **Environment** `npm` (all
+   fields are case-sensitive). Then delete the `NODE_AUTH_TOKEN` env from the `publish-npm` job and
+   revoke the secret. The `id-token: write` permission is already in place.
+5. (Optional) Repeat step 1 with TestPyPI and a second job to dry-run first.
 
 ### Cutting a release
 1. Bump `__version__` in `python/chromapakz/__init__.py` — the single source of truth;
