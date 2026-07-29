@@ -132,11 +132,41 @@ depth = cz.decode_signal(data, "depth")
 
 | Function | Purpose |
 |---|---|
-| `encode(signals, specs=, rgb=, …)` | Multi-signal encode |
+| `encode(signals, specs=, rgb=, fps=30, rgb_kbps=2000)` | Multi-signal encode → WebM bytes |
 | `decode(data, signal_ids=)` | Decode signals + optional RGB |
 | `decode_signal(data, id)` | One `(N,H,W)` uint16 plane |
-| `inverse_depth_spec(near, far, levels)` | Spec dict for depth signal (`3 <= levels <= 65536`) |
+| `decode_rgb(data)` | RGB track → `(N,H,W,4)` uint8 RGBA |
+| `probe(data)` | `width`, `height`, `frames`, `fps`, `near`, `far`, `levels`, `has_rgb`, `signals` |
 | `parse_metadata(data)` | Full v2 JSON |
+| `inverse_depth_spec(near, far, levels=65536)` | Spec dict for a depth signal (`3 <= levels <= 65536`) |
+| `quantize_inverse(z, near=, far=, levels=)` | Float depth → uint16 codes (`0` = invalid) |
+| `dequantize_inverse(d, near=, far=, levels=)` | uint16 codes → float32 metres (invalid → NaN) |
+
+`fps` and `rgb_kbps` are encode-time knobs: frame rate written to the container, and the VP9 bitrate
+for the *lossy* RGB track (signals are always lossless, and unaffected by `rgb_kbps`).
+
+The native core is loaded on first use, not at import — so `inverse_depth_spec`, the validation
+helpers and `chromapakz.webm_inspect` are usable (and unit-testable) without a compiled `_core`.
+
+### Ingestion (`chromapakz.ingest`, `chromapakz.webm_inspect`)
+
+```python
+from chromapakz.ingest import encode_clip, load_depth, load_rgb, auto_near_far
+from chromapakz.webm_inspect import track_sizes
+
+data, stats = encode_clip(depth=depth_NHW_float, rgb=rgb_NHWc)   # auto near/far, real bpp in stats
+track_sizes(data)          # {track: {'name', 'bytes', 'frames'}} — pure-Python EBML, no native deps
+```
+
+| Function | Purpose |
+|---|---|
+| `encode_clip(depth=, rgb=, near=, far=, fps=, rgb_kbps=, levels=)` | Quantize + encode → `(data, stats)` |
+| `load_depth(path, dtype=, shape=)` | `.exr` / `.npy` / `.npz` / 16-bit PNG·TIFF / raw → `(N,H,W)` |
+| `load_rgb(path)` | image glob, array file, or video (ffmpeg) → `(N,H,W,3\|4)` uint8 |
+| `auto_near_far(depth, lo=1, hi=99)` | Inverse-depth range from valid-pixel percentiles |
+| `track_sizes(data)` | Per-track byte/frame breakdown of a WebM |
+
+CLI (installed with the wheel): `chromapakz-ingest --depth 'd_*.exr' --rgb 'rgb_*.png' -o clip.webm --report --verify`
 
 Signals must be integer arrays inside `[0, 65535]` and `rgb` uint8 RGBA. Lossy inputs — metric
 float depth, `int32` above 65535, float RGB — raise `ValueError` rather than wrapping silently;
@@ -185,8 +215,9 @@ so zero the buffer first if you read all of it back — the Python bindings do.
 ## Tests
 
 ```sh
-node tests/js_quant.mjs && node tests/js_signals.mjs && node tests/js_metadata_v2.mjs && node tests/webm_stream.mjs
+npm test                     # full Node suite, incl. the version-consistency check
 cmake --build build && ./build/dccli selftest
+python tests/py_lazy_native.py && python tests/py_webm_inspect.py     # no compiled core needed
 python tests/roundtrip.py && python tests/cross_interop.py && python tests/ffmpeg_interop.py
 python tests/py_api_validation.py && python tests/py_decode_bounds.py
 cd experiments/webcodecs-lossless && node run.mjs multisignal && node smoke-demo.mjs
