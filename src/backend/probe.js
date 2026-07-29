@@ -4,7 +4,7 @@
 // round-trip catches that, so we probe rather than sniff the UA. Each verdict is memoized
 // in a module-level promise → at most one probe per page/process.
 
-const CODEC = 'vp09.00.10.08';
+import { encoderConfig, decoderConfig } from './codec-config.js';
 
 function hasWebCodecs(){
   return typeof VideoEncoder !== 'undefined' && typeof VideoDecoder !== 'undefined'
@@ -38,12 +38,13 @@ async function readLuma(frame, W, H){
 }
 
 // Encode one lossless keyframe and decode it back via WebCodecs; return the recovered Y plane.
+// The encoder config comes from ./codec-config.js so this measures what production will do.
 function nativeRoundTrip(plane, W, H){
   return new Promise((resolve,reject)=>{
     let recovered=null;
     const dec=new VideoDecoder({ output:async f=>{ try{ recovered=await readLuma(f,W,H); } finally{ f.close(); } }, error:reject });
     const enc=new VideoEncoder({ output:(chunk,meta)=>{ if(meta?.decoderConfig) dec.configure(meta.decoderConfig); dec.decode(chunk); }, error:reject });
-    enc.configure({ codec:CODEC, width:W, height:H, bitrateMode:'quantizer', latencyMode:'quality' });
+    enc.configure(encoderConfig({ lossless:true, W, H }));
     const fr=lumaFrame(plane,W,H); enc.encode(fr,{ keyFrame:true, vp9:{ quantizer:0 } }); fr.close();
     enc.flush().then(()=>dec.flush()).then(()=>{ enc.close(); dec.close(); resolve(recovered); }).catch(reject);
   });
@@ -54,7 +55,7 @@ function nativeDecodeOne(chunkBytes, W, H){
   return new Promise((resolve,reject)=>{
     let recovered=null;
     const dec=new VideoDecoder({ output:async f=>{ try{ recovered=await readLuma(f,W,H); } finally{ f.close(); } }, error:reject });
-    dec.configure({ codec:CODEC, codedWidth:W, codedHeight:H });
+    dec.configure(decoderConfig({ W, H }));
     dec.decode(new EncodedVideoChunk({ type:'key', timestamp:0, data:chunkBytes }));
     dec.flush().then(()=>{ dec.close(); resolve(recovered); }).catch(reject);
   });
@@ -69,7 +70,7 @@ async function _probeEncode(lossless){
       return !!rec && eq(plane,rec);
     }
     // Lossy: just confirm the config is constructible & supported.
-    const sup=await VideoEncoder.isConfigSupported({ codec:CODEC, width:W, height:H, bitrate:1_000_000 });
+    const sup=await VideoEncoder.isConfigSupported(encoderConfig({ lossless:false, W, H, bitrate:1_000_000 }));
     return !!sup?.supported;
   }catch{ return false; }
 }
