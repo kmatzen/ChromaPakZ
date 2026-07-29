@@ -12,16 +12,20 @@ export const id = 'wasm-decode';
 
 export function createTrackDecoder({ kind='luma', W, H }){
   const cKind = kind==='rgba' ? 1 : 0;
-  let mod=null, handle=0, lenPtr=0, closed=false;
+  let mod=null, handle=0, lenPtr=0, closed=false, readyP=null;
   const pending=[];   // raw chunks pushed but not yet decoded
   const planes=[];    // decoded planes ready to hand back
 
-  async function ensure(){
-    if(mod) return;
-    mod = await getModule();
-    handle = mod._dcvp9_dec_new(W, H, cKind);
-    if(!handle) throw new Error('dcvp9_dec_new failed');
-    lenPtr = mod._malloc(4);
+  // Memoized on the promise (as in ./encode.js): `if(mod) return` lets concurrent next()s all
+  // reach the allocation and clobber `handle`, leaking every libvpx decoder but the last.
+  function ensure(){
+    return readyP ??= (async()=>{
+      const m = await getModule();
+      const h = m._dcvp9_dec_new(W, H, cKind);
+      if(!h) throw new Error('dcvp9_dec_new failed');
+      mod = m; handle = h;
+      lenPtr = m._malloc(4);
+    })();
   }
   function drainPlanes(){
     for(;;){
