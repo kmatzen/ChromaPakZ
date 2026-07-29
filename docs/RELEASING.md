@@ -111,11 +111,24 @@ libvpx too (`install-libvpx.sh` configures for `uname -m`), and cibuildwheel can
    wheels and the sdist and skips both publish jobs, so the whole matrix can be proven on a branch
    before any tag exists.
 4. Commit, tag, and push: `git tag v0.3.0 && git push --tags`.
-5. Create a **GitHub Release** for that tag. Publishing the release triggers `release.yml`:
-   the version guard, then wheels + sdist, then `publish` (PyPI, OIDC) and `publish-npm`.
-   - `publish-npm` runs the Node suite and re-checks the tarball manifest first. It has to: `ci.yml`
-     triggers on pushes to `main` and on pull requests, and a tag push matches neither, so nothing
-     else tests the JavaScript at release time.
+5. Create a **GitHub Release** for that tag. Publishing the release triggers `release.yml`, whose
+   jobs run strictly in this order:
+
+   `version-guard` → `wheels` + `sdist` → `publish-npm` → `publish` (PyPI)
+
+   The order is the whole point, because publishing is the only step that cannot be undone or
+   retried — PyPI refuses to re-upload a version forever, and npm's unpublish window is 72 hours
+   after which the version number is burned. So everything that can fail cheaply fails first; then
+   npm, which no dry-run can exercise (`workflow_dispatch` skips both publish jobs, so a token or
+   provenance fault only ever surfaces on a real release); then PyPI, the path with a successful
+   run behind it. Running the two registries independently would mean an npm fault landing *after*
+   PyPI was already permanent.
+   - `publish-npm` also runs the Node suite and re-checks the tarball manifest before publishing.
+     It has to: `ci.yml` triggers on pushes to `main` and on pull requests, and a tag push matches
+     neither, so nothing else tests the JavaScript at release time.
+   - **If `publish-npm` fails**, nothing has been published — fix it and re-run the failed jobs, or
+     delete the release and start over. **If `publish` fails after it**, npm is already live: bump
+     to the next patch version rather than trying to reuse this one on PyPI.
 
 ### Notes / gotchas
 - **libvpx must be linked statically.** `_core` links `libvpx.a` and exports only its `dc_*` ABI, so it
