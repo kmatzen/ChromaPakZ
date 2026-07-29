@@ -80,9 +80,16 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  # Last, deliberately. Publishing is the only step here that cannot be undone or retried: PyPI
+  # refuses to re-upload a version forever, and npm's unpublish window is 72 hours after which the
+  # version number is burned. So the order is everything-that-can-fail-cheaply, then the registry
+  # that has never been published to (npm), then the one that has (PyPI carried 0.2.0 through this
+  # same job). Independent publish jobs would mean an npm token or provenance fault — in a code path
+  # no dry-run can exercise, since workflow_dispatch skips both — landing *after* PyPI was already
+  # permanent.
   publish:
     name: publish to PyPI
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, publish-npm]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi                 # configure a GitHub Environment named "pypi"
@@ -100,9 +107,12 @@ jobs:
   # step — package.json points `exports` straight at it), and the committed vp9-*.wasm ride along.
   # Nothing else validates it at tag time: ci.yml runs on pushes to main and on PRs, and a tag
   # matches neither, so the suite runs here before anything reaches the registry.
+  #
+  # Gated on the wheels even though it needs none of them: a Python build that fails after npm has
+  # published would leave a version on one registry that can never exist on the other.
   publish-npm:
     name: publish to npm
-    needs: [version-guard]
+    needs: [wheels, sdist]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: npm                  # configure a GitHub Environment named "npm"
