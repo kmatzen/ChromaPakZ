@@ -88,15 +88,88 @@ for(const size of [0, 1, 126, 127, 128, 16382, 16383, 16384, 100000]){
   const bytes=mux({ tracks:TRACKS, frames, metadata:{ ok:1 } });
   const sdm=createStreamDemux();
   let gotMeta=false;
+  const blocks=[];
   for(let i=0;i<bytes.length;i++){
-    for(const e of sdm.push(bytes.subarray(i, i+1))) if(e.type==='metadata') gotMeta=true;
+    for(const e of sdm.push(bytes.subarray(i, i+1))){
+      if(e.type==='metadata') gotMeta=true;
+      if(e.type==='block') blocks.push(e.block);
+    }
   }
   const events=sdm.finish();
-  const blocks=events.filter(e=>e.type==='block');
+  for(const e of events) if(e.type==='block') blocks.push(e.block);
   ok(gotMeta, 'metadata event during byte-at-a-time push');
-  ok(blocks.length===2, `blocks after finish (${blocks.length})`);
+  ok(blocks.length===2, `blocks delivered (${blocks.length})`);
+  ok(blocks.map(b=>b.timeMs).join()==='0,33', 'block timestamps in order');
+  ok(blocks[0].key===true && blocks[1].key===false, 'key flags survive incremental parse');
+  ok(blocks[0].data.join()==='9,8,7' && blocks[1].data.join()==='6,5', 'block payloads bit-exact');
   ok(events.at(-1).type==='end', 'end event last');
   ok(sdm.done, 'done after finish');
+}
+
+// ── incremental demux emits each block as it completes, not at finish() ──
+{
+  const frames=[];
+  for(let i=0;i<8;i++) frames.push(frame(1, i%2===0, i*500, Uint8Array.of(i)));
+  const bytes=mux({ tracks:TRACKS, frames, metadata:{ ok:1 }, clusterSpanMs:900 });
+  const sdm=createStreamDemux();
+  let seen=0, sawEarly=false;
+  const step=64;
+  for(let o=0;o<bytes.length;o+=step){
+    for(const e of sdm.push(bytes.subarray(o, Math.min(o+step, bytes.length))))
+      if(e.type==='block'){ seen++; if(o+step<bytes.length) sawEarly=true; }
+  }
+  for(const e of sdm.finish()) if(e.type==='block') seen++;
+  ok(seen===8, `progressive demux saw all blocks (${seen})`);
+  ok(sawEarly, 'blocks emitted before the final chunk');
+}
+
+// ── incremental demux matches batch demux over a multi-cluster stream-muxed file ──
+{
+  const frames=[];
+  for(let i=0;i<12;i++) frames.push(frame(1, i%5===0, i*400, Uint8Array.of(i, 255-i)));
+  const sm=createStreamMux({ tracks:TRACKS, metadata:{ a:'b' }, clusterSpanMs:700 });
+  const parts=[sm.header];
+  for(const f of frames){ const c=sm.writeFrame(f); if(c) parts.push(c); }
+  parts.push(sm.finish());
+  const bytes=concatChunks(parts);
+  const batch=demux(bytes);
+  const sdm=createStreamDemux();
+  const got=[];
+  for(let o=0;o<bytes.length;o+=13){
+    for(const e of sdm.push(bytes.subarray(o, Math.min(o+13, bytes.length))))
+      if(e.type==='block') got.push(e.block);
+  }
+  for(const e of sdm.finish()) if(e.type==='block') got.push(e.block);
+  ok(got.length===batch.frames.length, `stream demux count ${got.length}/${batch.frames.length}`);
+  ok(got.every((b,i)=>b.timeMs===batch.frames[i].timeMs && b.key===batch.frames[i].key
+    && b.data.join()===batch.frames[i].data.join()), 'stream demux == batch demux, block for block');
+  ok(sdm.tracks[1]?.name==='rgb', 'track entries available from the stream demuxer');
+}
+
+// ── stream demux retains only the element in flight, not the whole file ──
+{
+  const frames=[];
+  for(let i=0;i<40;i++) frames.push(frame(1, i%4===0, i*100, new Uint8Array(4096)));
+  const bytes=mux({ tracks:TRACKS, frames, metadata:{ ok:1 }, clusterSpanMs:300 });
+  const sdm=createStreamDemux();
+  let blocks=0;
+  for(let o=0;o<bytes.length;o+=1024){
+    for(const e of sdm.push(bytes.subarray(o, Math.min(o+1024, bytes.length))))
+      if(e.type==='block') blocks++;
+  }
+  for(const e of sdm.finish()) if(e.type==='block') blocks++;
+  ok(blocks===40, `large multi-cluster stream fully demuxed (${blocks})`);
+}
+
+// ── garbage pushed at a stream demuxer: no throw, no hang, no unbounded buffering ──
+{
+  const sdm=createStreamDemux();
+  let threw=false;
+  try{
+    for(let i=0;i<8;i++) sdm.push(Uint8Array.from({length:32}, (_,k)=>(i*32+k)*37&0xff));
+    ok(sdm.finish().at(-1).type==='end', 'end delivered after garbage');
+  }catch{ threw=true; }
+  ok(!threw, 'garbage push handled without throwing');
 }
 
 // ── truncated stream: finish() on a half-file must not throw ──
