@@ -7,6 +7,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Coverage instrumentation for the native core (gcov / llvm-cov). Off by default; CI turns it on
+# in a dedicated build directory so the shipped artifacts are never instrumented:
+#   cmake -S . -B build-cov -DCHROMAPAKZ_COVERAGE=ON && cmake --build build-cov -j
+#   ./build-cov/dccli selftest && gcovr --root . --filter native/ --txt
+option(CHROMAPAKZ_COVERAGE "Instrument the native build for gcov/llvm-cov coverage" OFF)
+if(CHROMAPAKZ_COVERAGE)
+  add_compile_options(--coverage -O0 -g)
+  add_link_options(--coverage)
+endif()
+
 # Royalty-free VP9 via libvpx (BSD). pkg-config provides include/lib flags.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)

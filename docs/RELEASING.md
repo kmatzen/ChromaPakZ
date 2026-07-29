@@ -2,13 +2,16 @@
 
 ## Continuous integration (`.github/workflows/ci.yml`)
 
-Runs on every push to `main` and every PR:
-- **build + test** on Linux and macOS — CMake + `dccli selftest`, `pip install .`,
-  `tests/roundtrip.py`, `tests/cross_interop.py`, and `tests/ffmpeg_interop.py`.
-  That job also runs `tests/py_lazy_native.py` and `tests/py_webm_inspect.py` *before* any build, to
-  prove the package imports and its pure-Python helpers work without a compiled `_core`.
-- **browser** — the full `npm test` suite (including `tests/version_consistency.mjs`), Playwright
-  probes (`single`, `streaming`, `network`, `multisignal`), and `smoke-demo.mjs`.
+Runs on every push to `main` and every PR. Both suites are glob-discovered, so no job lists
+individual test files — adding `tests/test_*.py` or `tests/*.test.mjs` is enough to get it run:
+- **build + test** on Linux and macOS — CMake + `dccli selftest`, `dccli goldencheck`,
+  `pip install .`, then `coverage run -m pytest tests` (the whole `tests/` directory).
+  That job first runs `tests/test_lazy_native.py` and `tests/test_webm_inspect.py` *before* any
+  build, to prove the package imports and its pure-Python helpers work without a compiled `_core`.
+  Those two are named explicitly because the ordering is the point, not to enumerate coverage.
+- **native coverage** — an instrumented `-DCHROMAPAKZ_COVERAGE=ON` build reported through `gcovr`.
+- **browser** — `npm run test:coverage` (the full Node suite), Playwright probes
+  (`single`, `streaming`, `network`, `multisignal`), and `smoke-demo.mjs`.
 
 Suggested branch flow: protect `main`, do work on feature branches, open PRs, require the `ci` checks to
 pass before merge (Settings → Branches → branch protection → require status checks).
