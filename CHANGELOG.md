@@ -74,9 +74,11 @@ ABI. The file format itself is unchanged: a `.webm` written by 0.2.0 decodes bit
   with build provenance. `src/` is the shipped artifact — there is no build step — and the
   committed `vp9-*.wasm` codecs are included for engines whose native WebCodecs path is not
   bit-exact.
-- **macOS x86_64 wheels** are built again (Intel runner in the matrix). macOS wheels also target
-  13.0 rather than 15.0: the deployment target used to be pinned by Homebrew's libvpx bottle, which
-  carries the build runner's own macOS as its minimum, and libvpx is now built from source instead.
+- **macOS wheels target 13.0 rather than 15.0**, so macOS 13 and 14 get a wheel instead of a source
+  build. The deployment target used to be pinned by Homebrew's libvpx bottle, which carries the
+  build runner's own macOS as its minimum; libvpx is now built from source. Still arm64 only —
+  GitHub retired the last Intel macOS runner image in December 2025, and Intel macOS continues to
+  fall back to the sdist.
 - **CPython 3.14 wheels** are built.
 - **Linux aarch64 wheels** are built on a native arm64 runner.
 

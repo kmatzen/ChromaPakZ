@@ -57,11 +57,17 @@ version present on one registry has to mean the same commit on the other:
 | Linux `x86_64` | `manylinux_2_28` | `ubuntu-latest` |
 | Linux `aarch64` | `manylinux_2_28` | `ubuntu-24.04-arm` (native arm64 — no QEMU) |
 | macOS `arm64`, 13.0+ | `macosx_13_0_arm64` | `macos-latest` |
-| macOS `x86_64`, 13.0+ | `macosx_13_0_x86_64` | `macos-13` (the Intel image) |
 
-Not built: Windows, musllinux, and 32-bit Linux (`manylinux_2_28` has no i686 image) — those fall
-back to a source build from the sdist. `archs = "auto64"` in `pyproject.toml` states the 64-bit-only
-intent rather than inheriting whatever cibuildwheel's `auto` means in a given release.
+Not built: macOS `x86_64`, Windows, musllinux, and 32-bit Linux (`manylinux_2_28` has no i686
+image) — those fall back to a source build from the sdist. `archs = "auto64"` in `pyproject.toml`
+states the 64-bit-only intent rather than inheriting whatever cibuildwheel's `auto` means in a
+given release.
+
+**On Intel macOS**: `macos-13` was the last x86_64 image and GitHub retired it in December 2025.
+The label still *resolves*, so a job requesting it queues indefinitely instead of failing — worth
+knowing before adding it back. Building x86_64 now means cross-compiling from the arm64 runner:
+libvpx too (`install-libvpx.sh` configures for `uname -m`), and cibuildwheel cannot run its
+`test-command` against a wheel it cross-built, so those wheels would ship untested.
 
 ### One-time setup
 1. **Create the PyPI project + trusted publisher.** On https://pypi.org → your account → *Publishing*,
