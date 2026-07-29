@@ -19,22 +19,28 @@ and a file written by any one of them decodes bit-exactly in the other two.
 ## Quickstart
 
 ```sh
-# Browser demo — encode→file→decode→view, entirely in-page (no WASM on Chromium)
-python3 -m http.server 8000      # from the repo root, then open http://localhost:8000/demo/
-
-# Python / C++ — the native libvpx core is compiled from source, so install the build
-# prerequisites first: libvpx (dev headers), pkg-config, CMake, and a C++17 compiler.
-#   macOS:   brew install libvpx pkg-config cmake ninja
-#   Debian:  sudo apt-get install libvpx-dev pkg-config cmake ninja-build g++
-pip install .                    # pip compiles the native core via CMake and bundles it
+# Python — self-contained wheels (libvpx is linked in; no build tools needed)
+pip install chromapakz
 python -c "import chromapakz as cz; print(cz.inverse_depth_spec(0.3, 9.0))"
 #   cz.encode({"depth": u16}, specs={"depth": cz.inverse_depth_spec(near, far)}, rgb=rgba)
 
-# Browser JS API — streaming encode/decode (see docs/API.md)
+# Browser — streaming encode/decode, WebCodecs with a per-operation WASM fallback (docs/API.md)
+npm install chromapakz
+#   import { createEncoder, createDecoder } from 'chromapakz';
 #   createEncoder({ signals: [{ id:'depth', near, far }, { id:'objectId' }] })
 #   createDecoder(bytes).readFrame() -> { rgb, signals: { depth: { u16 }, objectId: { u16 } } }
 
-# C++ / CLI
+# Browser demo — encode→file→decode→view, entirely in-page (no WASM on Chromium)
+python3 -m http.server 8000      # from the repo root, then open http://localhost:8000/demo/
+```
+
+Building from a checkout instead (C++ CLI, or a platform with no wheel) needs libvpx dev headers,
+pkg-config, CMake and a C++17 compiler — `brew install libvpx pkg-config cmake ninja`, or
+`apt-get install libvpx-dev pkg-config cmake ninja-build g++`:
+
+```sh
+pip install .                    # pip compiles the native core via CMake and bundles it
+
 cmake -S . -B build && cmake --build build -j     # or: native/build.sh
 ./build/dccli selftest
 ./build/dccli decodesignal clip.webm depth depth.u16
