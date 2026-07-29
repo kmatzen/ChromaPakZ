@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include <new>
 
 #include <vpx/vpx_encoder.h>
 #include <vpx/vpx_decoder.h>
@@ -310,18 +311,28 @@ void unpack(const uint8_t* hi, const uint8_t* lo, size_t n, uint16_t* d){
 }
 
 // ── libvpx VP9 lossless encode of an 8-bit luma-plane sequence (chroma const 128) ──
-bool encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int fps,
-                    std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
+// NO_LOSSLESS is separate from FAIL because it is the one failure a caller can act on: the
+// libvpx build cannot do what the metadata would claim.
+enum EncStatus { ENC_OK=0, ENC_FAIL=1, ENC_NO_LOSSLESS=2 };
+
+EncStatus encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int fps,
+                         std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
   vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
-  vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return false;
+  vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return ENC_FAIL;
   cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps;
   cfg.g_profile=0; cfg.g_lag_in_frames=0; cfg.rc_min_quantizer=0; cfg.rc_max_quantizer=0;
   cfg.kf_mode=VPX_KF_DISABLED; cfg.g_pass=VPX_RC_ONE_PASS; cfg.g_error_resilient=0;
-  vpx_codec_ctx_t c{}; if(vpx_codec_enc_init(&c,iface,&cfg,0)) return false;
-  vpx_codec_control(&c, VP9E_SET_LOSSLESS, 1);
-  vpx_codec_control(&c, VP8E_SET_CPUUSED, 1);
+  vpx_codec_ctx_t c{}; if(vpx_codec_enc_init(&c,iface,&cfg,0)) return ENC_FAIL;
+  // Gate on the lossless control: an old or misbuilt libvpx that rejects it would encode the
+  // packed depth planes LOSSY while the metadata still advertises "lossless":true. Silent data
+  // corruption is worse than a failed encode, so refuse rather than proceed.
+  if(vpx_codec_control(&c, VP9E_SET_LOSSLESS, 1)){ vpx_codec_destroy(&c); return ENC_NO_LOSSLESS; }
+  vpx_codec_control(&c, VP8E_SET_CPUUSED, 1);   // speed knob only — costs time, not fidelity
   vpx_codec_control(&c, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);   // signal full-range in the bitstream
-  vpx_image_t img; vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1);
+  // On failure vpx_img_alloc returns NULL and leaves img.planes unset — the copy loop below
+  // would then memcpy through wild pointers.
+  vpx_image_t img;
+  if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)){ vpx_codec_destroy(&c); return ENC_FAIL; }
   // Signal FULL range: depth is packed full-range 0..255 in luma. Without this the stream
   // defaults to limited ("tv") range and any decoder that honours it (e.g. ffmpeg) rescales/
   // clips the luma, corrupting depth. Full-range makes every conformant decoder reproduce Y exactly.
@@ -343,7 +354,7 @@ bool encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int
     }
   }
   vpx_img_free(&img); vpx_codec_destroy(&c);
-  return ok;
+  return ok ? ENC_OK : ENC_FAIL;
 }
 
 // ── decoding untrusted files ──
@@ -430,7 +441,8 @@ bool encodeRGBSeq(const std::vector<const uint8_t*>& rgba, int W, int H, int fps
   vpx_codec_control(&c, VP8E_SET_CPUUSED, 2);
   vpx_codec_control(&c, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
   vpx_codec_control(&c, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
-  vpx_image_t img; vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1);
+  vpx_image_t img;
+  if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)){ vpx_codec_destroy(&c); return false; }
   img.cs=VPX_CS_BT_709; img.range=VPX_CR_FULL_RANGE;
   bool ok=true; int keyEvery = fps>0?fps:30;          // ~1s keyframe interval → seekable RGB (Cues)
   for(size_t i=0;i<=rgba.size() && ok;i++){ vpx_image_t* in=nullptr;
@@ -486,8 +498,8 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
       pack(sp.data+(size_t)i*px, px, se.hiP[i].data(), se.loP[i].data());
       hp[i]=se.hiP[i].data(); lp[i]=se.loP[i].data();
     }
-    if(!encodePlaneSeq(hp,W,H,fps,se.hiF,se.hiK)) return 3;
-    if(!encodePlaneSeq(lp,W,H,fps,se.loF,se.loK)) return 4;
+    if(EncStatus st=encodePlaneSeq(hp,W,H,fps,se.hiF,se.hiK)) return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
+    if(EncStatus st=encodePlaneSeq(lp,W,H,fps,se.loF,se.loK)) return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:4;
     if((int)se.hiF.size()!=N || (int)se.loF.size()!=N) return 7;
     char hiName[128], loName[128];
     snprintf(hiName,sizeof hiName,"signal-%s-hi", sm.id.c_str());
@@ -506,6 +518,16 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
   int durationMs = (int)llround(N * 1000.0 / (fps>0?fps:30));
   file = mux(tracks, frames, buildMetadataJson(W,H,N,fps,hasRgb,sigMeta), durationMs);
   return 0;
+}
+// Every dc_* entry point allocates (std::vector/std::string sized from file or caller-supplied
+// dimensions), so std::bad_alloc is reachable with crafted input. Letting it unwind through
+// extern "C" is undefined behaviour and in practice calls std::terminate, killing the host
+// process — including the Python interpreter. Funnel every entry through this instead.
+template <class F>
+int guard(F&& body) noexcept {
+  try { return body(); }
+  catch(const std::bad_alloc&){ return DC_ERR_INTERNAL; }
+  catch(...){ return DC_ERR_INTERNAL; }
 }
 } // namespace
 
@@ -529,7 +551,8 @@ static int decStatusToRc(int st, int codecErr){
 }
 
 int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgba_cap){
-  if(!webm || !rgba_out) return 1;
+  if(!webm || !len || !rgba_out) return 1;
+  return guard([&]{
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
   if(d.metadata.find("\"rgb\":null")!=std::string::npos) return 6;
   double v; int W=0,H=0; jnum(d.metadata,"width",v); W=(int)v; jnum(d.metadata,"height",v); H=(int)v;
@@ -542,10 +565,13 @@ int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgb
   if(st) return decStatusToRc(st,3);
   for(size_t i=0;i<planes.size();i++) memcpy(rgba_out+i*frameBytes, planes[i].data(), frameBytes);
   return 0;
+  });
 }
 
 int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
              double* near_, double* far_, int* levels, int* has_rgb){
+  if(!webm || !len) return 1;
+  return guard([&]{
   Demuxed d = demux(webm,len); if(d.metadata.empty()) return 1;
   FileMeta meta = parseMetadata(d.metadata);
   if(W) *W=meta.width;
@@ -573,11 +599,13 @@ int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
     if(levels) *levels=65536;
   }
   return 0;
+  });
 }
 
 int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id,
                      uint16_t* out, size_t out_cap){
-  if(!webm || !signal_id || !out) return 1;
+  if(!webm || !len || !signal_id || !out) return 1;
+  return guard([&]{
   Demuxed d = demux(webm,len); if(d.metadata.empty()) return 1;
   FileMeta meta = parseMetadata(d.metadata);
   const SignalMeta* sig = findSignal(meta, signal_id);
@@ -597,25 +625,36 @@ int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id,
   if(hiP.size()!=loP.size()) return 5;
   for(size_t i=0;i<hiP.size();i++) unpack(hiP[i].data(), loP[i].data(), px, out+i*px);
   return 0;
+  });
 }
 
 int dc_get_metadata(const uint8_t* webm, size_t len, char** json_out, size_t* json_len){
-  if(!webm || !json_out || !json_len) return 1;
+  if(!webm || !len || !json_out || !json_len) return 1;
+  return guard([&]{
   Demuxed d = demux(webm,len); if(d.metadata.empty()) return 1;
-  *json_len = d.metadata.size();
-  *json_out = (char*)malloc(*json_len + 1);
-  if(!*json_out) return 5;
-  memcpy(*json_out, d.metadata.c_str(), *json_len);
-  (*json_out)[*json_len] = '\0';
+  size_t n = d.metadata.size();
+  char* buf = (char*)malloc(n + 1);
+  if(!buf) return 5;
+  memcpy(buf, d.metadata.c_str(), n);
+  buf[n] = '\0';
+  *json_out = buf; *json_len = n;   // publish only once both succeed, so a failed call frees nothing
   return 0;
+  });
 }
 
 int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
                     const dc_signal_spec_t* signals, int num_signals,
                     int W, int H, int N, int fps,
                     uint8_t** out, size_t* out_len){
-  if(!out || !out_len || W<=0 || H<=0 || N<=0) return 1;
+  // fps reaches the encoder timebase (g_timebase.den) and the block timestamps (1000*i/fps);
+  // at 0 the first divides by zero and the second yields inf, which is UB when cast to int.
+  // dimsUsable is the same bound the decoders enforce — here it also keeps the encoder's int
+  // plane arithmetic from wrapping (W=H=65536 wraps W*H to 0, so the encoder would read rows
+  // out of a zero-length plane).
+  if(!out || !out_len || N<=0 || fps<=0 || !dimsUsable(W,H)) return 1;
   if(num_signals<=0 && !rgba) return 1;
+  if(num_signals>0 && !signals) return 1;
+  return guard([&]{
   std::vector<SignalEncodeSpec> specs;
   for(int i=0;i<num_signals;i++){
     const dc_signal_spec_t& in=signals[i];
@@ -631,17 +670,36 @@ int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
   Bytes file; int rc=buildFileMulti(rgba, rgb_kbps, specs, W, H, N, fps, file);
   if(rc) return rc;
   return finish(file, out, out_len);
+  });
+}
+
+// The Python/JS wrappers reject an unusable inverse-depth range before they get here, but the ABI
+// is callable directly, so re-check: near_/far_ of 0 make 1/near_ infinite, near_==far_ makes the
+// a-b span 0, and levels<3 makes M=levels-2 zero — each divides by zero and floods the output with
+// inf/NaN. Emit the invalid code (0 / NaN) for the whole buffer instead, matching how these
+// functions already mark unrepresentable samples.
+static bool inverseRangeUsable(double near_, double far_, int levels){
+  if(levels<3) return false;
+  if(!(near_>0) || !(far_>0)) return false;
+  double a=1.0/near_, b=1.0/far_;
+  return std::isfinite(a) && std::isfinite(b) && a!=b;
 }
 
 void dc_quantize_inverse(const float* z, int n, double near_, double far_, int levels, uint16_t* out){
-  if(levels<=0) levels=65536; double M=levels-2, maxc=levels-1;
+  if(n<=0 || !z || !out) return;
+  if(levels<=0) levels=65536;
+  if(!inverseRangeUsable(near_,far_,levels)){ for(int i=0;i<n;i++) out[i]=0; return; }
+  double M=levels-2, maxc=levels-1;
   double a=1.0/near_, b=1.0/far_, inv=1.0/(a-b);
   for(int i=0;i<n;i++){ double v=z[i];
     if(!(v>0)){ out[i]=0; continue; }
     long q=lround((1.0/v - b)*inv*M)+1; out[i]=(uint16_t)(q<1?1:(q>maxc?(long)maxc:q)); }
 }
 void dc_dequantize_inverse(const uint16_t* d, int n, double near_, double far_, int levels, float* out){
-  if(levels<=0) levels=65536; double M=levels-2;
+  if(n<=0 || !d || !out) return;
+  if(levels<=0) levels=65536;
+  if(!inverseRangeUsable(near_,far_,levels)){ for(int i=0;i<n;i++) out[i]=NAN; return; }
+  double M=levels-2;
   double a=1.0/near_, b=1.0/far_;
   for(int i=0;i<n;i++){ unsigned c=d[i];
     out[i]= c==0 ? NAN : (float)(1.0/(((double)(c-1)/M)*(a-b)+b)); }

@@ -194,6 +194,19 @@ quantize float depth with `quantize_inverse()` first.
 | `dc_get_metadata` | CHROMAPAKZ JSON |
 | `dc_probe` / `dc_decode_rgb` | Header + RGB |
 
+Every entry point returns `0` on success and a nonzero code on failure — none of them throw, and
+none of them abort on NULL or degenerate arguments. Codes `1`–`8` are per-function, documented on
+each declaration in `native/chromapakz.h`; `9`–`12` mean the same thing everywhere:
+
+| Code | Meaning |
+|---|---|
+| `9` (`DC_ERR_CAPACITY`) | decode only — see [Decoding untrusted files](#decoding-untrusted-files) |
+| `10` (`DC_ERR_GEOMETRY`) | decode only — see [Decoding untrusted files](#decoding-untrusted-files) |
+| `11` (`DC_ERR_INTERNAL`) | out of memory, or an exception caught at the ABI boundary |
+| `12` (`DC_ERR_CODEC`) | this libvpx cannot do lossless VP9, so the encode would have silently produced lossy signal planes |
+
+On a nonzero return the out-params are unspecified and nothing needs freeing.
+
 ```sh
 ./build/dccli selftest
 ./build/dccli encode depth.u16 W H N fps near far out.webm
