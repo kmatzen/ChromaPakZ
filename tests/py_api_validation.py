@@ -47,12 +47,55 @@ expect_raises(ValueError, lambda: cz.inverse_depth_spec(0.5, 9, levels=2), "leve
 expect_raises(ValueError, lambda: cz.quantize_inverse(np.zeros(4, np.float32), 1, 0.5), "quantize bad range")
 expect_raises(ValueError, lambda: cz.dequantize_inverse(np.zeros(4, np.uint16), 0, 5), "dequantize bad near")
 
-# rgb shape validation
+# ── levels beyond uint16 must fail, not wrap codes mod 65536 ──
+for bad in (cz.LEVELS_FULL + 1, 1 << 18, 1 << 32):
+    expect_raises(ValueError, lambda b=bad: cz.inverse_depth_spec(0.2, 10.0, b), f"spec levels={bad}")
+    expect_raises(ValueError,
+                  lambda b=bad: cz.quantize_inverse(np.full(4, 1.0, np.float32), 0.2, 10.0, b),
+                  f"quantize levels={bad}")
+    expect_raises(ValueError,
+                  lambda b=bad: cz.dequantize_inverse(np.zeros(4, np.uint16), 0.2, 10.0, b),
+                  f"dequantize levels={bad}")
+    expect_raises(ValueError,
+                  lambda b=bad: cz.encode({"d": depth},
+                                          specs={"d": {"inverse_depth": True, "near": 0.2, "far": 10.0,
+                                                       "levels": b}}),
+                  f"encode spec levels={bad}")
+expect_raises(ValueError, lambda: cz.inverse_depth_spec(0.2, 10.0, 4096.0), "non-int levels")
+assert cz.inverse_depth_spec(0.2, 10.0, cz.LEVELS_FULL)["levels"] == cz.LEVELS_FULL, "levels==65536 allowed"
+
+# ── lossy signal casts are rejected, never wrapped into uint16 ──
+expect_raises(ValueError, lambda: cz.encode({"d": np.full((N, H, W), 3.7, np.float32)}),
+              "float signal rejected")
+expect_raises(ValueError, lambda: cz.encode({"d": depth.astype(np.float64)}), "float64 signal rejected")
+expect_raises(ValueError, lambda: cz.encode({"d": depth.astype(np.int64) + 65536}),
+              "signal above 65535 rejected")
+expect_raises(ValueError, lambda: cz.encode({"d": depth.astype(np.int32) * -1 - 1}),
+              "negative signal rejected")
+expect_raises(ValueError, lambda: cz.dequantize_inverse(np.array([-5.0, 3.0]), 0.2, 10.0),
+              "float codes rejected by dequantize")
+# in-range wide ints are fine — the guard is about loss, not dtype pedantry
+wide = depth.astype(np.int64)
+assert np.array_equal(cz.decode_signal(cz.encode({"d": wide}), "d"), depth), "int64 in-range accepted"
+
+# rgb shape + dtype validation
 expect_raises(ValueError,
               lambda: cz.encode({"d": depth}, rgb=np.zeros((N, H, W, 3), np.uint8)), "RGB (not RGBA) rejected")
 expect_raises(ValueError,
               lambda: cz.encode({"d": depth}, rgb=np.zeros((N, H + 1, W, 4), np.uint8)),
               "rgb/signal shape mismatch rejected")
+expect_raises(ValueError,
+              lambda: cz.encode({"d": depth}, rgb=np.full((N, H, W, 4), 0.5, np.float32)),
+              "float rgb rejected")
+expect_raises(ValueError,
+              lambda: cz.encode({"d": depth}, rgb=np.full((N, H, W, 4), 300, np.int32)),
+              "rgb above 255 rejected")
+
+# ── rgb-only encode validates shape before unpacking it ──
+expect_raises(ValueError, lambda: cz.encode(rgb=[[0, 0, 0, 255]]), "rgb list rejected as ValueError")
+expect_raises(ValueError, lambda: cz.encode(rgb=np.zeros((H, W), np.uint8)), "2-D rgb rejected as ValueError")
+rgb_only = cz.encode(rgb=np.zeros((N, H, W, 4), np.uint8))
+assert cz.probe(rgb_only)["has_rgb"] and cz.probe(rgb_only)["frames"] == N, "rgb-only encode dims"
 
 # ── garbage bytes: RuntimeError, never a crash ──
 for blob in (b"", b"\x00" * 64, bytes(range(256)) * 4):

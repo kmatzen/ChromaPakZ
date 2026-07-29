@@ -38,7 +38,9 @@ N, H, W = depth.shape
 valid = depth > 0
 rgba = np.concatenate([rgb, np.full((N, H, W, 1), 255, np.uint8)], axis=-1)
 
-data = cz.encode({"depth": depth}, specs={"depth": cz.inverse_depth_spec(0.5, 5.0)}, rgb=rgba, fps=30)
+# No quant spec: TUM codes are *linear* (metres = code/5000), not inverse-depth, and the container
+# only describes inverse-depth ranges. Claiming one here would make consumers reconstruct wrong metres.
+data = cz.encode({"depth": depth}, rgb=rgba, fps=30)
 px = N * W * H
 ok = np.array_equal(cz.decode_signal(data, "depth"), depth)
 
