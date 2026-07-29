@@ -37,6 +37,25 @@ const { signalSeries } = await decode(bytes);
 
 Network: `onChunk` on encode; `createDecoder()` + `push()` + `finish()` on decode.
 
+### Track layout and `hasRgb`
+
+`createEncoder` freezes the track numbering on the first `addFrame`: RGB, when present, is track 1
+and signal pairs follow it. If frame 0 carries no `rgb`, signals start at track 1 instead — so a
+clip whose RGB only starts later must say so up front:
+
+```javascript
+createEncoder({ W, H, signals, hasRgb: true });   // reserve track 1 for rgb before frame 0
+```
+
+Passing `rgb` on a later frame without that declaration throws, rather than writing RGB onto the
+first signal's track. `hasRgb: true` with no `rgb` frame at all also throws (at `finish()`), since
+an advertised-but-empty RGB track stalls the streaming decoder. The batch `encode()` helper sees
+every frame up front and declares this for you.
+
+Once a stream (RGB or a given signal) has been written, it must appear on every subsequent frame:
+a stream that stops and resumes is refused, because each track's timestamps come from its own frame
+counter and a gap cannot be realigned.
+
 ### Concurrency
 
 `addFrame()`, `finish()` and `readFrame()` are safe to call without awaiting the previous one —

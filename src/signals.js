@@ -14,6 +14,9 @@ const VP9 = 'vp09.00.10.08';
 const SCHEME_TRIFOLD = 'tri-fold-8+8';
 const QUANT_INVERSE_DEPTH = 'inverse-depth';
 
+/** Track number RGB always occupies when a file carries it; signal tracks start after it. */
+export const RGB_TRACK = 1;
+
 export const SIGNAL_DEPTH = {
   id: 'depth',
   scheme: SCHEME_TRIFOLD,
@@ -47,7 +50,9 @@ export function normalizeMetadata(meta){
 export function planSignals(specs, hasRgb){
   if(!specs?.length) throw new Error('planSignals: need at least one signal spec');
   const signals=[];
-  let next=hasRgb ? 2 : 1;
+  // Numbering is frozen here, so `hasRgb` must be final: a track reserved for RGB that never
+  // arrives (or an RGB track claimed after the fact) collides with signals[0].tracks.hi.
+  let next=hasRgb ? RGB_TRACK+1 : 1;
   for(const raw of specs){
     const id=raw.id ?? raw.name;
     if(!id) throw new Error('each signal needs an id');
@@ -76,7 +81,7 @@ export function planSignals(specs, hasRgb){
 
 export function buildTracksFromPlan(W, H, hasRgb, signals){
   const tracks=[];
-  if(hasRgb) tracks.push({ number:1, codecID:'V_VP9', name:'rgb', width:W, height:H });
+  if(hasRgb) tracks.push({ number:RGB_TRACK, codecID:'V_VP9', name:'rgb', width:W, height:H });
   for(const s of signals){
     tracks.push({ number:s.tracks.hi, codecID:'V_VP9', name:s.trackNames.hi, width:W, height:H });
     tracks.push({ number:s.tracks.lo, codecID:'V_VP9', name:s.trackNames.lo, width:W, height:H });
@@ -99,7 +104,7 @@ export function buildFileMetadata({ W, H, fps, n, hasRgb, signals, streaming=fal
     version: 2, width: W, height: H, fps,
     frames: streaming ? null : n,
     streaming: streaming || undefined,
-    rgb: hasRgb ? { track: 1, codec: VP9 } : null,
+    rgb: hasRgb ? { track: RGB_TRACK, codec: VP9 } : null,
     signals: sigMeta,
   };
 }
