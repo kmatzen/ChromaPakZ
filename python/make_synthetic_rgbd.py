@@ -3,10 +3,10 @@
 A stand-in for real sensor data until you have some — exercises the things that drive
 lossless-depth bitrate: smooth surfaces, sharp depth edges, distance-dependent noise
 (modeled in the disparity domain, as real stereo/ToF noise is), occlusion shadows, and
-dropout holes (invalid == 0). Run, then feed the .npz straight through ingest.py.
+dropout holes (invalid == 0). Run, then feed the .npz straight through `chromapakz-ingest`.
 
     python make_synthetic_rgbd.py           # -> sample_rgbd.npz
-    python ingest.py --depth sample_rgbd.npz --rgb sample_rgbd.npz -o real.webm --report --verify
+    chromapakz-ingest --depth sample_rgbd.npz --rgb sample_rgbd.npz -o real.webm --report --verify
 """
 import numpy as np
 

@@ -8,12 +8,12 @@ For multiple lossless signals (object IDs, etc.) use ``chromapakz.encode({...})`
 this CLI is depth + RGB focused.
 
 API:
-    from ingest import encode_clip, load_depth, load_rgb, auto_near_far
+    from chromapakz.ingest import encode_clip, load_depth, load_rgb, auto_near_far
     data, stats = encode_clip(depth=depth_NHW_float, rgb=rgb_NHWc, near=None, far=None)
 
-CLI:
-    python ingest.py --depth 'frames/d_*.exr' --rgb 'frames/rgb_*.png' -o clip.webm
-    python ingest.py --depth clip.npz -o clip.webm --report
+CLI (installed as `chromapakz-ingest`, or `python -m chromapakz.ingest`):
+    chromapakz-ingest --depth 'frames/d_*.exr' --rgb 'frames/rgb_*.png' -o clip.webm
+    chromapakz-ingest --depth clip.npz -o clip.webm --report
 """
 import glob
 import os
@@ -22,9 +22,8 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
 import chromapakz as dc
-import webm_inspect
+from . import webm_inspect
 
 
 # ── near/far + quantization ─────────────────────────────────────────────────
@@ -193,8 +192,10 @@ def print_report(stats):
         print(f"  {num:<6} {t['name']:<11} {t['frames']:>4}   {t['bytes']:>9}   {t['bpp']:.3f}")
 
 
-def _main(argv):
+def main(argv=None):
+    """CLI entry point (`chromapakz-ingest`). argv defaults to sys.argv[1:]."""
     import argparse
+    argv = sys.argv[1:] if argv is None else argv
     ap = argparse.ArgumentParser(description="Ingest RGBD data into a chromapakz .webm")
     ap.add_argument("--depth", help="depth file or glob (.exr/.npy/.npz/.png/.tif/.raw)")
     ap.add_argument("--rgb", help="rgb file/glob/video")
@@ -236,4 +237,4 @@ def _main(argv):
 
 
 if __name__ == "__main__":
-    _main(sys.argv[1:])
+    main()

@@ -49,7 +49,7 @@ def decode_signal_raw(data, frames, w, h, guard_frames=64):
     we can inspect afterwards — this is what the old code overran."""
     px = w * h
     buf = np.zeros((frames + guard_frames) * px, dtype=np.uint16)
-    rc = cz._lib.dc_decode_signal(
+    rc = cz._load().dc_decode_signal(
         (ctypes.c_uint8 * len(data)).from_buffer_copy(data), len(data), b"depth",
         buf.ctypes.data_as(u16p), frames * px)
     return rc, int(np.count_nonzero(buf[frames * px:]))
@@ -58,7 +58,7 @@ def decode_signal_raw(data, frames, w, h, guard_frames=64):
 def decode_rgb_raw(data, frames, w, h, guard_frames=64):
     nb = w * h * 4
     buf = np.zeros((frames + guard_frames) * nb, dtype=np.uint8)
-    rc = cz._lib.dc_decode_rgb(
+    rc = cz._load().dc_decode_rgb(
         (ctypes.c_uint8 * len(data)).from_buffer_copy(data), len(data),
         buf.ctypes.data_as(u8p), frames * nb)
     return rc, int(np.count_nonzero(buf[frames * nb:]))

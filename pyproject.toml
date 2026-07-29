@@ -1,25 +1,54 @@
 [build-system]
-requires = ["scikit-build-core>=0.8"]
+requires = ["scikit-build-core>=0.11"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "chromapakz"
-version = "0.2.0"
+dynamic = ["version"]          # single source of truth: python/chromapakz/__init__.py (see below)
 description = "Lossless RGB + bit-exact auxiliary signals (depth, object IDs, …) in one WebM (VP9)"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "kmatzen" }]
 dependencies = ["numpy>=1.20"]
 keywords = ["depth", "rgbd", "video", "codec", "vp9", "lossless", "webm", "signals", "object-id"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
 
 [project.urls]
 Homepage = "https://github.com/kmatzen/ChromaPakZ"
+Repository = "https://github.com/kmatzen/ChromaPakZ"
+Issues = "https://github.com/kmatzen/ChromaPakZ/issues"
+Documentation = "https://github.com/kmatzen/ChromaPakZ/blob/main/docs/API.md"
+
+[project.scripts]
+chromapakz-ingest = "chromapakz.ingest:main"
 
 [tool.scikit-build]
-minimum-version = "0.8"
+minimum-version = "0.11"
 cmake.build-type = "Release"
 wheel.packages = ["python/chromapakz"]
+
+# Version comes from `__version__` in the package, so a release bumps exactly one Python file.
+# tests/version_consistency.mjs asserts package.json agrees.
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "python/chromapakz/__init__.py"
 
 [tool.cibuildwheel]
 build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
@@ -33,9 +62,10 @@ before-all = "bash {project}/scripts/install-libvpx.sh"
 environment = { PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig" }
 
 [tool.cibuildwheel.macos]
-before-all = "brew install libvpx pkg-config ninja"
-# The build links Homebrew's libvpx.a statically into _core.dylib (nothing for delocate to bundle),
-# but the bottle's objects still carry the runner's macOS as their minimum version, so the wheel's
-# deployment target has to match or the link warns/fails. macos-latest is currently macOS 15
-# (arm64); bump this if the runner image moves.
-environment = { MACOSX_DEPLOYMENT_TARGET = "15.0" }
+# libvpx is built from source (static, PIC) rather than taken from Homebrew. The build links it into
+# _core.dylib, but a bottle's objects carry the runner's own macOS as their minimum version, which
+# forced MACOSX_DEPLOYMENT_TARGET=15.0 on every wheel. Building it ourselves lets us target 13.0.
+# Wheels are still built for the runner's arch only (arm64 on macos-latest); x86_64 needs an Intel
+# runner in release.yml.
+before-all = "bash {project}/scripts/install-libvpx.sh"
+environment = { MACOSX_DEPLOYMENT_TARGET = "13.0", PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig" }

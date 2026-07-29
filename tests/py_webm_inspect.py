@@ -1,8 +1,8 @@
-"""Tests for the pure-Python EBML inspector (no native library, no numpy).
+"""Tests for the pure-Python EBML inspector (no compiled native library needed).
 
 Builds minimal WebM files in-process (mirroring src/webm.js output) — definite-size and
 streamed unknown-size, laced and BlockGroup-wrapped — and checks that
-webm_inspect.track_sizes reports the right per-track byte/frame breakdown.
+chromapakz.webm_inspect.track_sizes reports the right per-track byte/frame breakdown.
 Also parses the streaming golden fixture the JS muxer produced.
 Run: python tests/py_webm_inspect.py
 """
@@ -10,7 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
-from webm_inspect import EbmlError, track_sizes
+from chromapakz.webm_inspect import EbmlError, track_sizes
 
 _SEGMENT, _TRACKS, _TRACKENTRY = 0x18538067, 0x1654AE6B, 0xAE
 _TRACKNUMBER, _NAME = 0xD7, 0x536E
