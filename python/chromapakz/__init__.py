@@ -20,6 +20,14 @@ import numpy as np
 __version__ = "0.2.0"
 LEVELS_FULL = 65536
 
+# dc_decode_* return codes worth naming: both mean the file's bitstream contradicts its own
+# metadata, which is either corruption or a deliberately crafted file. The core refuses the
+# decode rather than writing past the buffer we sized from the header.
+_DECODE_ERRORS = {
+    9: "the file holds more frames than its header declares",
+    10: "a decoded frame is not the size the header declares",
+}
+
 
 def _find_lib():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -57,8 +65,8 @@ _lib.dc_encode_multi.argtypes = [
     ctypes.POINTER(u8p), ctypes.POINTER(_Z),
 ]
 _lib.dc_probe.argtypes = [u8p, _Z, intp, intp, intp, intp, dblp, dblp, intp, intp]
-_lib.dc_decode_signal.argtypes = [u8p, _Z, ctypes.c_char_p, u16p]
-_lib.dc_decode_rgb.argtypes = [u8p, _Z, u8p]
+_lib.dc_decode_signal.argtypes = [u8p, _Z, ctypes.c_char_p, u16p, _Z]
+_lib.dc_decode_rgb.argtypes = [u8p, _Z, u8p, _Z]
 _lib.dc_get_metadata.argtypes = [u8p, _Z, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_Z)]
 _lib.dc_quantize_inverse.argtypes = [f32p, _I, _D, _D, _I, u16p]
 _lib.dc_dequantize_inverse.argtypes = [u16p, _I, _D, _D, _I, f32p]
@@ -210,15 +218,22 @@ def probe(data):
     )
 
 
+def _out_buffer(shape, dtype):
+    """Zeroed, so a file that carries fewer frames than its header claims can never hand back
+    uninitialised heap — the core only writes the frames it actually decodes."""
+    return np.zeros(shape, dtype=dtype)
+
+
 def decode_signal(data, signal_id):
     """Decode one signal by id to (N, H, W) uint16."""
     info = probe(data)
     N, H, W = info["frames"], info["height"], info["width"]
-    out = np.empty((N, H, W), dtype=np.uint16)
+    out = _out_buffer((N, H, W), np.uint16)
     buf = _buf(data)
     sid = signal_id.encode("utf-8")
-    if _lib.dc_decode_signal(buf, len(data), sid, out.ctypes.data_as(u16p)):
-        raise RuntimeError(f"decode_signal({signal_id!r}) failed")
+    rc = _lib.dc_decode_signal(buf, len(data), sid, out.ctypes.data_as(u16p), out.size)
+    if rc:
+        raise RuntimeError(f"decode_signal({signal_id!r}) failed ({_DECODE_ERRORS.get(rc, rc)})")
     return out
 
 
@@ -228,10 +243,11 @@ def decode_rgb(data):
     if not info["has_rgb"]:
         raise RuntimeError("file has no RGB track")
     N, H, W = info["frames"], info["height"], info["width"]
-    out = np.empty((N, H, W, 4), dtype=np.uint8)
+    out = _out_buffer((N, H, W, 4), np.uint8)
     buf = _buf(data)
-    if _lib.dc_decode_rgb(buf, len(data), out.ctypes.data_as(u8p)):
-        raise RuntimeError("decode_rgb failed")
+    rc = _lib.dc_decode_rgb(buf, len(data), out.ctypes.data_as(u8p), out.nbytes)
+    if rc:
+        raise RuntimeError(f"decode_rgb failed ({_DECODE_ERRORS.get(rc, rc)})")
     return out
 
 

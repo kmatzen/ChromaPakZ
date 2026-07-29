@@ -154,9 +154,18 @@ dcvp9_dec* dcvp9_dec_new(int W, int H, int kind){
   return d;
 }
 
+// The copy loops read planes[0] as 8-bit rows of W bytes and planes[1..2] at half resolution,
+// so a frame whose coded size or format differs from what the caller declared would read past
+// libvpx's plane allocations. W/H come from the file's metadata, which the bitstream is under
+// no obligation to match — check every image and fail the decode rather than copy garbage.
+static bool dec_image_ok(const vpx_image_t* img, const dcvp9_dec* d){
+  return img && img->fmt==VPX_IMG_FMT_I420 && (int)img->d_w==d->W && (int)img->d_h==d->H;
+}
+
 static void dec_drain(dcvp9_dec* d){
   vpx_image_t* img; vpx_codec_iter_t it=nullptr;
   while((img=vpx_codec_get_frame(&d->ctx,&it))){
+    if(!dec_image_ok(img,d)){ d->ok=false; return; }
     if(d->kind==0){
       Bytes plane((size_t)d->W*d->H);
       for(int r=0;r<d->H;r++) memcpy(plane.data()+(size_t)r*d->W, img->planes[0]+r*img->stride[0], d->W);

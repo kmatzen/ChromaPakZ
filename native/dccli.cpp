@@ -42,7 +42,7 @@ int main(int argc, char** argv){
     uint8_t* buf; size_t len;
     if(encodeDepthOnly(depth.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
     std::vector<uint16_t> back((size_t)px*N);
-    if(dc_decode_signal(buf,len,"depth",back.data())){ fprintf(stderr,"decode failed\n"); return 1; }
+    if(dc_decode_signal(buf,len,"depth",back.data(),back.size())){ fprintf(stderr,"decode failed\n"); return 1; }
     int dMax=0; for(size_t i=0;i<back.size();i++){ int dd=abs((int)depth[i]-(int)back[i]); if(dd>dMax) dMax=dd; }
     printf("selftest: %dx%d x%d  file=%.1f KiB  bit-exact=%s (maxΔ=%d)\n",
            W,H,N,len/1024.0, dMax==0?"YES":"NO", dMax);
@@ -54,7 +54,7 @@ int main(int argc, char** argv){
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
     std::vector<uint16_t> out((size_t)W*H*N);
-    if(dc_decode_signal(webm.data(),webm.size(),argv[3],out.data())){ fprintf(stderr,"decode signal failed\n"); return 1; }
+    if(dc_decode_signal(webm.data(),webm.size(),argv[3],out.data(),out.size())){ fprintf(stderr,"decode signal failed\n"); return 1; }
     writeFile(argv[4],(uint8_t*)out.data(),out.size()*2);
     printf("decoded signal %s %dx%d x%d → %s\n",argv[3],W,H,N,argv[4]); return 0;
   }
@@ -64,7 +64,7 @@ int main(int argc, char** argv){
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
     std::vector<uint16_t> depth((size_t)W*H*N);
-    if(dc_decode_signal(webm.data(),webm.size(),"depth",depth.data())){ fprintf(stderr,"decode failed\n"); return 1; }
+    if(dc_decode_signal(webm.data(),webm.size(),"depth",depth.data(),depth.size())){ fprintf(stderr,"decode failed\n"); return 1; }
     writeFile(argv[3],(uint8_t*)depth.data(),depth.size()*2);
     printf("decoded %dx%d x%d → %s\n",W,H,N,argv[3]); return 0;
   }
@@ -98,7 +98,7 @@ int main(int argc, char** argv){
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
     if(!rgb){ fprintf(stderr,"file has no RGB track\n"); return 1; }
     std::vector<uint8_t> out((size_t)W*H*N*4);
-    if(dc_decode_rgb(webm.data(),webm.size(),out.data())){ fprintf(stderr,"rgb decode failed\n"); return 1; }
+    if(dc_decode_rgb(webm.data(),webm.size(),out.data(),out.size())){ fprintf(stderr,"rgb decode failed\n"); return 1; }
     writeFile(argv[3],out.data(),out.size()); printf("decoded RGB %dx%d x%d → %s\n",W,H,N,argv[3]); return 0;
   }
 
