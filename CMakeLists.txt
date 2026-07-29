@@ -84,20 +84,25 @@ set_target_properties(_core PROPERTIES
 target_include_directories(_core PRIVATE native)
 target_link_libraries(_core PRIVATE chromapakz_vpx)
 
-# Keep the statically linked libvpx objects out of the dynamic symbol table. Our own sources are
-# already hidden by the visibility presets above; archive members are compiled without them, so
-# the linker has to strip them explicitly or _core would re-export vpx_* to the global namespace
-# and become the source of the very conflict this guards against.
-if(_vpx_static)
-  if(APPLE)
-    # ld64 honours globs in an exported-symbols list; everything unlisted becomes local.
-    target_link_options(_core PRIVATE
-      "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/native/exported_symbols.txt")
-    set_property(TARGET _core APPEND PROPERTY LINK_DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/native/exported_symbols.txt")
-  elseif(UNIX)
-    target_link_options(_core PRIVATE "-Wl,--exclude-libs,ALL")
-  endif()
+# Pin the exported ABI to exactly the dc_* entry points. The visibility presets above are not
+# enough on their own: a statically linked libvpx's archive members are compiled without them, and
+# libstdc++ declares `namespace std _GLIBCXX_VISIBILITY(default)` — an explicit attribute that
+# -fvisibility=hidden cannot override — so std:: template instantiations would leak into the
+# dynamic symbol table too. Anything exported here is a symbol another extension could interpose
+# on, or be hijacked by, which is precisely what this guards against.
+if(APPLE)
+  # ld64 honours globs in an exported-symbols list; everything unlisted becomes local.
+  set(_export_list "${CMAKE_CURRENT_SOURCE_DIR}/native/exported_symbols.txt")
+  target_link_options(_core PRIVATE "-Wl,-exported_symbols_list,${_export_list}")
+elseif(UNIX)
+  set(_export_list "${CMAKE_CURRENT_SOURCE_DIR}/native/version.map")
+  # --exclude-libs keeps the static archive's symbols out of the dynamic table; the version script
+  # localises everything else our own objects would still export.
+  target_link_options(_core PRIVATE
+    "-Wl,--exclude-libs,ALL" "-Wl,--version-script,${_export_list}")
+endif()
+if(_export_list)
+  set_property(TARGET _core APPEND PROPERTY LINK_DEPENDS "${_export_list}")
 endif()
 
 # Command-line tool (dev/testing; not shipped in the Python wheel).
