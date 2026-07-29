@@ -22,6 +22,14 @@ _png16.png
 demo/preview.png
 experiments/**/package*.json
 
-# …but keep the committed regression fixtures (browser-streamed interop golden file)
-!tests/fixtures/stream.webm
-!tests/fixtures/stream_depth.u16
+# …but tests/fixtures/ holds committed regression fixtures, so nothing in it is ignored.
+# Naming each file individually (as this used to) silently untracks every *new* fixture:
+# `git add` reports nothing, CI reads a file that is not in the repo, and the omission only
+# surfaces on a fresh clone.
+!tests/fixtures/**
+
+# Native coverage builds (see CHROMAPAKZ_COVERAGE in CMakeLists.txt)
+build-cov/
+*.gcda
+*.gcno
+.coverage

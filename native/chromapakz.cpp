@@ -750,7 +750,15 @@ void dc_quantize_inverse(const float* z, int n, double near_, double far_, int l
   double a=1.0/near_, b=1.0/far_, inv=1.0/(a-b);
   for(int i=0;i<n;i++){ double v=z[i];
     if(!(v>0)){ out[i]=0; continue; }
-    long q=lround((1.0/v - b)*inv*M)+1; out[i]=(uint16_t)(q<1?1:(q>maxc?(long)maxc:q)); }
+    double t=(1.0/v - b)*inv*M;
+    // Clamp in double space *before* the integer conversion. A depth just above zero drives t to
+    // ~1e34, and lround() of a value outside long's range is undefined behaviour: the same source
+    // returned maxc at -O2 and 1 — the *farthest* code for the nearest possible depth — at -O0.
+    // Clamping first also makes this agree with the JS Math.round path on negative t, where
+    // lround (half away from zero) and Math.round (half up) otherwise differ.
+    if(!(t>0.0)){ out[i]=1; continue; }              // t <= 0, or NaN from a degenerate range
+    if(t>=maxc){ out[i]=(uint16_t)maxc; continue; }
+    long q=lround(t)+1; out[i]=(uint16_t)(q<1?1:(q>maxc?(long)maxc:q)); }
 }
 void dc_dequantize_inverse(const uint16_t* d, int n, double near_, double far_, int levels, float* out){
   if(n<=0 || !d || !out) return;

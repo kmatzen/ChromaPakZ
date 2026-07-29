@@ -45,17 +45,34 @@ cmake.build-type = "Release"
 wheel.packages = ["python/chromapakz"]
 
 # Version comes from `__version__` in the package, so a release bumps exactly one Python file.
-# tests/version_consistency.mjs asserts package.json agrees.
+# tests/js_version_consistency.test.mjs asserts package.json agrees.
 [tool.scikit-build.metadata.version]
 provider = "scikit_build_core.metadata.regex"
 input = "python/chromapakz/__init__.py"
+
+[tool.pytest.ini_options]
+# Discovery is glob-driven: every tests/test_*.py runs, so a new test file cannot be forgotten
+# the way the hand-maintained lists in package.json / ci.yml / this file used to forget one.
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+# The tests import the *installed* package, so measure it by module name rather than by path.
+source = ["chromapakz", "webm_inspect"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = ["if __name__ == .__main__.:"]
 
 [tool.cibuildwheel]
 build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
 skip = "*-musllinux* pp*"
 build-frontend = "build"
-test-requires = "numpy"
-test-command = "python {project}/tests/roundtrip.py && python {project}/tests/cross_interop.py && python {project}/tests/py_symbol_isolation.py"
+test-requires = "numpy pytest"
+# Whatever is in tests/ runs — no list to keep in sync. Tests that need tools absent from the
+# wheel-test environment (ffmpeg) skip themselves.
+test-command = "python -m pytest {project}/tests"
 
 [tool.cibuildwheel.linux]
 before-all = "bash {project}/scripts/install-libvpx.sh"

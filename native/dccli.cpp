@@ -1,9 +1,11 @@
 // chromapakz CLI / test driver. Commands:
 //   selftest                                  encode→decode synthetic depth, assert bit-exact
+//   goldencheck <quant_golden.csv>            replay the cross-language quantizer golden vectors
 //   decode  <in.webm> <out.u16>               decode depth track to raw uint16-LE
 //   encode  <in.u16> W H N fps near far <out.webm>
 //   info    <in.webm>                         print header
 #include "chromapakz.h"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +55,56 @@ static int encodeDepthOnly(const uint16_t* depth, int W, int H, int N, int fps,
   return dc_encode_multi(nullptr, 0, &spec, 1, W, H, N, fps, out, out_len);
 }
 
+// ── cross-language quantizer golden vectors ─────────────────────────────────────────────────
+// tests/fixtures/quant_golden.csv is generated from the JS quantizer and replayed here and in
+// Python, so all three implementations are pinned to the same codes. The format is deliberately
+// CSV rather than JSON so this side needs no parser: near,far,levels,z,code,back — where z and
+// back are the token nan/inf/-inf or 0x + the float32 bit pattern, which crosses the language
+// boundary without decimal rounding.
+static float decodeFloatToken(const char* tok){
+  if(!strcmp(tok,"nan")) return NAN;
+  if(!strcmp(tok,"inf")) return INFINITY;
+  if(!strcmp(tok,"-inf")) return -INFINITY;
+  uint32_t bits=(uint32_t)strtoul(tok, nullptr, 16);
+  float f; memcpy(&f, &bits, sizeof f); return f;
+}
+
+static int goldenCheck(const char* path){
+  FILE* f=fopen(path,"r");
+  if(!f){ perror(path); return 1; }
+  char line[512];
+  long checked=0, failed=0;
+  while(fgets(line, sizeof line, f)){
+    if(line[0]=='#' || line[0]=='\n' || !strncmp(line,"near,",5)) continue;
+    char zt[64], bt[64]; double near_, far_; int levels; unsigned code;
+    if(sscanf(line, "%lf,%lf,%d,%63[^,],%u,%63[^,\n]", &near_, &far_, &levels, zt, &code, bt)!=6){
+      fprintf(stderr,"malformed golden line: %s", line); fclose(f); return 1; }
+
+    float z=decodeFloatToken(zt), want_back=decodeFloatToken(bt);
+    uint16_t got_code=0;
+    dc_quantize_inverse(&z, 1, near_, far_, levels, &got_code);
+    if(got_code!=code){
+      fprintf(stderr,"MISMATCH code near=%g far=%g levels=%d z=%g: got %u want %u\n",
+              near_, far_, levels, (double)z, got_code, code);
+      failed++;
+    }
+    uint16_t in_code=(uint16_t)code; float got_back=0;
+    dc_dequantize_inverse(&in_code, 1, near_, far_, levels, &got_back);
+    bool back_ok = std::isnan(want_back) ? std::isnan(got_back)
+                                         : (memcmp(&got_back, &want_back, sizeof(float))==0);
+    if(!back_ok){
+      fprintf(stderr,"MISMATCH depth near=%g far=%g levels=%d code=%u: got %g want %g\n",
+              near_, far_, levels, code, (double)got_back, (double)want_back);
+      failed++;
+    }
+    checked++;
+  }
+  fclose(f);
+  if(checked<100){ fprintf(stderr,"golden file looks truncated: only %ld cases\n", checked); return 1; }
+  printf("goldencheck: %ld cases, %ld mismatches — %s\n", checked, failed, failed?"FAIL":"bit-exact with JS/Python");
+  return failed?1:0;
+}
+
 int main(int argc, char** argv){
   if(argc<2){ fprintf(stderr,"usage: dccli <selftest|decode|decodesignal|encode|info|...> ...\n"); return 2; }
   std::string cmd=argv[1];
@@ -75,6 +127,11 @@ int main(int argc, char** argv){
     printf("selftest: %dx%d x%d  file=%.1f KiB  bit-exact=%s (maxΔ=%d)\n",
            W,H,N,len/1024.0, dMax==0?"YES":"NO", dMax);
     dc_free(buf); return dMax==0?0:1;
+  }
+
+  if(cmd=="goldencheck"){
+    if(argc<3){ fprintf(stderr,"goldencheck <quant_golden.csv>\n"); return 2; }
+    return goldenCheck(argv[2]);
   }
 
   if(cmd=="decodesignal"){

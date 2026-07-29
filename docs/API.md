@@ -238,11 +238,39 @@ so zero the buffer first if you read all of it back — the Python bindings do.
 
 ## Tests
 
+Both suites are discovered by glob — every `tests/*.test.mjs` and every `tests/test_*.py` runs, so
+adding a file is enough to add it to CI.
+
+Running the Node suite needs Node 22+ (the test runner's built-in glob); the library itself has no
+such floor, which is why there is no `engines` field pushing it onto consumers.
+
 ```sh
-npm test                     # full Node suite, incl. the version-consistency check
+npm test                      # Node suite  (node --test 'tests/**/*.test.mjs')
+npm run test:coverage         # …with a per-file coverage report
+pytest tests                  # Python suite (needs an installed chromapakz)
+coverage run -m pytest tests && coverage report
+pytest tests/test_lazy_native.py tests/test_webm_inspect.py   # these two need no compiled core
+
 cmake --build build && ./build/dccli selftest
-python tests/py_lazy_native.py && python tests/py_webm_inspect.py     # no compiled core needed
-python tests/roundtrip.py && python tests/cross_interop.py && python tests/ffmpeg_interop.py
-python tests/py_api_validation.py && python tests/py_decode_bounds.py
+./build/dccli goldencheck tests/fixtures/quant_golden.csv   # C++ side of the cross-language vectors
+
 cd experiments/webcodecs-lossless && node run.mjs multisignal && node smoke-demo.mjs
+```
+
+Python tests assert through `unittest`'s `assert*` methods rather than bare `assert`, because
+`python -O` strips `assert` statements and would make the suite pass vacuously;
+`tests/test_suite_hygiene.py` enforces this.
+
+### Fixtures
+
+| File | Regenerate with | Checked by |
+| --- | --- | --- |
+| `tests/fixtures/stream.webm`, `stream_depth.u16` | `node tests/fixtures/regen_stream.mjs` | `tests/js_fixture_stream.test.mjs` (staleness + JS decode), `tests/test_stream_interop.py` (native decode) |
+| `tests/fixtures/quant_golden.csv` | `node tests/fixtures/regen_quant_golden.mjs` | `tests/js_quant_golden.test.mjs`, `tests/test_quant_golden.py`, `dccli goldencheck` |
+
+Native coverage is off by default; build it separately so nothing shipped is instrumented:
+
+```sh
+cmake -S . -B build-cov -DCHROMAPAKZ_COVERAGE=ON && cmake --build build-cov -j
+./build-cov/dccli selftest && gcovr --root . --filter native/ --txt
 ```
