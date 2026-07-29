@@ -8,8 +8,34 @@ on:
   workflow_dispatch: {}        # manual runs build artifacts without publishing
 
 jobs:
+  # Tagging v0.3.0 while the package still says 0.2.0 would publish the wrong version to PyPI
+  # under a name nothing else agrees with, with no way to take it back. Check first, build after.
+  # `npm test` already runs this file on every PR; it runs again here because a tag is pushed
+  # independently of the commit it points at, so only the release itself can check the tag.
+  version-guard:
+    name: tag matches the declared version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: package.json and the Python package agree on the version
+        run: node --test tests/js_version_consistency.test.mjs
+      - name: ...and match the release tag
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          declared="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$declared" ]; then
+            echo "::error::release tag $GITHUB_REF_NAME does not match the declared version $declared"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches version $declared"
+
   wheels:
     name: wheels (${{ matrix.os }})
+    needs: [version-guard]
     strategy:
       fail-fast: false
       matrix:
@@ -28,10 +54,20 @@ jobs:
           path: wheelhouse/*.whl
 
   sdist:
+    needs: [version-guard]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: pipx run build --sdist
+      # A file missing from the sdist used to surface only for whoever pip-installed it.
+      - name: Install the sdist in a clean environment and import it
+        run: |
+          sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config cmake ninja-build
+          python -m venv /tmp/sdistenv
+          /tmp/sdistenv/bin/pip install --upgrade pip
+          /tmp/sdistenv/bin/pip install numpy
+          /tmp/sdistenv/bin/pip install dist/*.tar.gz
+          cd /tmp && /tmp/sdistenv/bin/python -c "import chromapakz; from chromapakz import ingest, webm_inspect; print(chromapakz.__version__)"
       - uses: actions/upload-artifact@v4
         with:
           name: sdist

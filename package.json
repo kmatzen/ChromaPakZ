@@ -10,6 +10,7 @@
     ".": "./src/chromapakz.js",
     "./signals": "./src/signals.js",
     "./webm": "./src/webm.js",
+    "./core": "./src/chromapakz-core.js",
     "./package.json": "./package.json"
   },
   "files": [
