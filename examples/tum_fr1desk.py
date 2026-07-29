@@ -22,7 +22,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 import chromapakz as cz
-import webm_inspect
+from chromapakz import webm_inspect
 
 base = sys.argv[1] if len(sys.argv) > 1 else "/tmp/tum/rgbd_dataset_freiburg1_desk"
 n = int(sys.argv[2]) if len(sys.argv) > 2 else 30

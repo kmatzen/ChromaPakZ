@@ -113,7 +113,7 @@ the TUM numbers above:
 
 (Reproduce the bpp column with `python python/benchmark_codecs.py`.) `levels` is a first-class,
 metadata-stored parameter (default 65536 = full 16-bit) shared by all three implementations, so
-reduced-precision files reconstruct identically everywhere. Set it with `ingest.py --depth-bits N` or the
+reduced-precision files reconstruct identically everywhere. Set it with `chromapakz-ingest --depth-bits N` or the
 `levels=` argument.
 
 ### Codec rate-distortion
@@ -153,15 +153,22 @@ Format schema: [`docs/FORMAT.md`](docs/FORMAT.md). API: [`docs/API.md`](docs/API
 ./build/dccli decodergb  clip.webm rgb.rgba
 ```
 
-## Real-data ingestion (`python/`)
+## Real-data ingestion
 
-- **`ingest.py`** — load depth (`.exr` / `.npy` / `.npz` / 16-bit PNG·TIFF / raw) and optional RGB (image
-  sequence, video via ffmpeg, or array), auto-derive inverse-depth `near`/`far` from percentiles, encode,
-  and report real per-track bpp. Invalid pixels (`<=0`/NaN) map to code 0.
-  `python ingest.py --depth 'd_*.exr' --rgb 'rgb_*.png' -o clip.webm --report --verify`
+Shipped in the wheel, so these work straight after `pip install chromapakz`:
+
+- **`chromapakz.ingest`** — load depth (`.exr` / `.npy` / `.npz` / 16-bit PNG·TIFF / raw) and optional RGB
+  (image sequence, video via ffmpeg, or array), auto-derive inverse-depth `near`/`far` from percentiles,
+  encode, and report real per-track bpp. Invalid pixels (`<=0`/NaN) map to code 0. Importable
+  (`from chromapakz.ingest import encode_clip`) or as the `chromapakz-ingest` command:
+  `chromapakz-ingest --depth 'd_*.exr' --rgb 'rgb_*.png' -o clip.webm --report --verify`
+- **`chromapakz.webm_inspect`** — pure-Python EBML parser for the per-track byte breakdown (no native deps).
+
+Repo-only dev scripts under `python/`:
+
 - **`make_synthetic_rgbd.py`** — a realistic RGBD generator (smooth surfaces, depth edges, disparity-domain
   noise, occlusion shadows, dropout holes) for when you don't have a sensor handy.
-- **`webm_inspect.py`** — pure-Python EBML parser for the per-track byte breakdown.
+- **`benchmark_codecs.py`**, **`plot_rd.py`** — the benchmark and rate-distortion plots.
 
 ## How it relates to RealSense / Kinect
 
@@ -192,12 +199,13 @@ the browser. Sources:
 ```
 src/          chromapakz.js, signals.js, webm.js, chromapakz-core.js
 native/       chromapakz.{h,cpp}, dccli.cpp
-python/       chromapakz/ (pip package), ingest.py, make_synthetic_rgbd.py
+python/       chromapakz/ (pip package: __init__.py, ingest.py, webm_inspect.py)
+              make_synthetic_rgbd.py, benchmark_codecs.py, plot_rd.py   (repo-only dev scripts)
 demo/         index.html                     in-browser encode→decode→view
 examples/     tum_fr1desk.py
 experiments/  webcodecs-lossless/            run.mjs, smoke-demo.mjs, headless tests
 docs/         FORMAT.md, API.md, EVALUATION.md, RELEASING.md
-tests/        roundtrip.py, cross_interop.py, stream_interop.py, ffmpeg_interop.py, js_*.mjs
+tests/        roundtrip.py, cross_interop.py, stream_interop.py, ffmpeg_interop.py, py_*.py, js_*.mjs
 ```
 
 CI builds and tests on Linux + macOS and runs the in-browser VP9-lossless probe in headless Chromium;

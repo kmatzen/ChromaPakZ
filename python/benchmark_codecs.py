@@ -7,7 +7,8 @@ Requires ffmpeg (ffv1/x265/x264), Pillow (PNG-16); JPEG-XL/AV1 noted if absent.
 import os, subprocess, tempfile, lzma, zlib, bz2, sys
 import numpy as np
 sys.path.insert(0, ".")
-import chromapakz as dc, webm_inspect
+import chromapakz as dc
+from chromapakz import webm_inspect
 
 NPZ = "sample_rgbd.npz"
 if not os.path.exists(NPZ):
