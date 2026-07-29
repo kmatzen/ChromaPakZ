@@ -40,10 +40,15 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-24.04-arm is a native arm64 runner — manylinux aarch64 wheels without QEMU
-        # emulation (which would make the from-source libvpx build take hours). macos-13 is the
-        # Intel runner; macos-latest is arm64, and cross-building x86_64 from it would mean
-        # cross-building libvpx too, which scripts/install-libvpx.sh configures for `uname -m`.
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-latest]
+        # emulation (which would make the from-source libvpx build take hours).
+        #
+        # macOS is arm64 only, and not by choice: macos-13 was the last Intel image and GitHub
+        # retired it in December 2025. The label still resolves, so a job requesting it queues
+        # forever rather than failing — which is how this was found. Building x86_64 would now
+        # mean cross-compiling from the arm64 runner, including libvpx (install-libvpx.sh
+        # configures for `uname -m`), and cibuildwheel cannot run its test-command against a
+        # wheel it cross-built. Intel macOS falls back to a source build from the sdist.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
