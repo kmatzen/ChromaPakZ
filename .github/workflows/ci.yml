@@ -47,6 +47,7 @@ jobs:
           python tests/cross_interop.py
           python tests/stream_interop.py
           python tests/py_api_validation.py
+          python tests/py_decode_bounds.py
           python tests/py_webm_inspect.py
           python tests/py_symbol_isolation.py
 

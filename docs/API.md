@@ -135,6 +135,27 @@ quantize float depth with `quantize_inverse()` first.
 ./build/dccli decodesignal clip.webm depth out.u16
 ```
 
+### Decoding untrusted files
+
+`dc_probe` reports what a file's header *claims*; nothing in the container makes the VP9
+bitstreams agree with it. So both decoders take the capacity of the output buffer and treat
+the header as a hint they verify rather than a promise they trust:
+
+```c
+int dc_decode_signal(const uint8_t* webm, size_t len, const char* id,
+                     uint16_t* out, size_t out_cap);   // out_cap in uint16 elements
+int dc_decode_rgb(const uint8_t* webm, size_t len,
+                  uint8_t* rgba_out, size_t rgba_cap); // rgba_cap in bytes
+```
+
+| Code | Meaning |
+|---|---|
+| `9` (`DC_ERR_CAPACITY`) | the track decodes to more frames than the capacity holds — the header under-declared `frames`, or a block carried a VP9 superframe |
+| `10` (`DC_ERR_GEOMETRY`) | a decoded frame is not the 8-bit I420 `W×H` the metadata declares |
+
+Neither ever writes past `*_cap`. Frames the file does not actually contain are left untouched,
+so zero the buffer first if you read all of it back — the Python bindings do.
+
 ---
 
 ## Tests
@@ -143,5 +164,6 @@ quantize float depth with `quantize_inverse()` first.
 node tests/js_quant.mjs && node tests/js_signals.mjs && node tests/js_metadata_v2.mjs && node tests/webm_stream.mjs
 cmake --build build && ./build/dccli selftest
 python tests/roundtrip.py && python tests/cross_interop.py && python tests/ffmpeg_interop.py
+python tests/py_api_validation.py && python tests/py_decode_bounds.py
 cd experiments/webcodecs-lossless && node run.mjs multisignal && node smoke-demo.mjs
 ```
