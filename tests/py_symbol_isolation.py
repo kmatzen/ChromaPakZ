@@ -30,8 +30,8 @@ VPX_SYMBOLS = [
 
 
 def _core_path():
-    import chromapakz  # noqa: F401  (import resolves and loads the native core)
-    return chromapakz._lib._name
+    import chromapakz
+    return chromapakz._load()._name       # the native core loads on first use, not at import
 
 
 def _nm(args):

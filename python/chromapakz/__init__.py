@@ -17,6 +17,8 @@ import os
 
 import numpy as np
 
+# Single source of truth for the version: pyproject.toml reads it from here (scikit-build-core's
+# regex metadata provider) and tests/version_consistency.mjs asserts package.json matches.
 __version__ = "0.2.0"
 LEVELS_FULL = 65536
 
@@ -28,21 +30,6 @@ _DECODE_ERRORS = {
     10: "a decoded frame is not the size the header declares",
 }
 
-
-def _find_lib():
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(os.path.dirname(here))
-    pats = ("_core*.so", "_core*.dylib", "_core*.pyd")
-    for d in (here, os.path.join(repo, "build"), os.path.join(repo, "native")):
-        for pat in pats:
-            hits = [h for h in sorted(glob.glob(os.path.join(d, pat)))
-                    if not h.endswith((".cpp", ".h", ".a"))]
-            if hits:
-                return hits[0]
-    raise OSError("ChromaPakZ native library not found — run `pip install .` or `cmake --build build`.")
-
-
-_lib = ctypes.CDLL(_find_lib())
 
 u16p, u8p, f32p = (ctypes.POINTER(t) for t in (ctypes.c_uint16, ctypes.c_uint8, ctypes.c_float))
 intp, dblp = ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_double)
@@ -60,24 +47,50 @@ class _SignalSpec(ctypes.Structure):
     ]
 
 
-_lib.dc_encode_multi.argtypes = [
-    u8p, _I, ctypes.POINTER(_SignalSpec), _I, _I, _I, _I, _I,
-    ctypes.POINTER(u8p), ctypes.POINTER(_Z),
-]
-_lib.dc_probe.argtypes = [u8p, _Z, intp, intp, intp, intp, dblp, dblp, intp, intp]
-_lib.dc_decode_signal.argtypes = [u8p, _Z, ctypes.c_char_p, u16p, _Z]
-_lib.dc_decode_rgb.argtypes = [u8p, _Z, u8p, _Z]
-_lib.dc_get_metadata.argtypes = [u8p, _Z, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_Z)]
-_lib.dc_quantize_inverse.argtypes = [f32p, _I, _D, _D, _I, u16p]
-_lib.dc_dequantize_inverse.argtypes = [u16p, _I, _D, _D, _I, f32p]
-for fn in ("dc_encode_multi", "dc_probe", "dc_decode_signal", "dc_decode_rgb", "dc_get_metadata"):
-    getattr(_lib, fn).restype = ctypes.c_int
-_lib.dc_free.argtypes = [u8p]
+def _find_lib():
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))
+    pats = ("_core*.so", "_core*.dylib", "_core*.pyd")
+    for d in (here, os.path.join(repo, "build"), os.path.join(repo, "native")):
+        for pat in pats:
+            hits = [h for h in sorted(glob.glob(os.path.join(d, pat)))
+                    if not h.endswith((".cpp", ".h", ".a"))]
+            if hits:
+                return hits[0]
+    raise OSError("ChromaPakZ native library not found — run `pip install .` or `cmake --build build`.")
+
+
+# Loaded on first use, not at import: the pure-Python helpers (validation, specs, the EBML
+# inspector) then stay importable — and unit-testable — without a compiled `_core`.
+_lib = None
+
+
+def _load():
+    """Load and bind the native core (idempotent). Raises OSError if it isn't built."""
+    global _lib
+    if _lib is not None:
+        return _lib
+    lib = ctypes.CDLL(_find_lib())
+    lib.dc_encode_multi.argtypes = [
+        u8p, _I, ctypes.POINTER(_SignalSpec), _I, _I, _I, _I, _I,
+        ctypes.POINTER(u8p), ctypes.POINTER(_Z),
+    ]
+    lib.dc_probe.argtypes = [u8p, _Z, intp, intp, intp, intp, dblp, dblp, intp, intp]
+    lib.dc_decode_signal.argtypes = [u8p, _Z, ctypes.c_char_p, u16p, _Z]
+    lib.dc_decode_rgb.argtypes = [u8p, _Z, u8p, _Z]
+    lib.dc_get_metadata.argtypes = [u8p, _Z, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_Z)]
+    lib.dc_quantize_inverse.argtypes = [f32p, _I, _D, _D, _I, u16p]
+    lib.dc_dequantize_inverse.argtypes = [u16p, _I, _D, _D, _I, f32p]
+    for fn in ("dc_encode_multi", "dc_probe", "dc_decode_signal", "dc_decode_rgb", "dc_get_metadata"):
+        getattr(lib, fn).restype = ctypes.c_int
+    lib.dc_free.argtypes = [u8p]
+    _lib = lib
+    return _lib
 
 
 def _take(out, out_len):
     data = ctypes.string_at(out, out_len.value)
-    _lib.dc_free(out)
+    _load().dc_free(out)
     return data
 
 
@@ -180,7 +193,7 @@ def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
         c_specs[i].far_ = sp.get("far", 0.0)
         c_specs[i].levels = sp.get("levels", LEVELS_FULL)
     out, out_len = u8p(), _Z()
-    rc = _lib.dc_encode_multi(
+    rc = _load().dc_encode_multi(
         rgb_p, rgb_kbps, c_specs if ids else None, len(ids), W, H, N, fps,
         ctypes.byref(out), ctypes.byref(out_len),
     )
@@ -193,13 +206,13 @@ def parse_metadata(data):
     """Return the CHROMAPAKZ metadata dict (v2 ``signals[]``)."""
     buf = _buf(data)
     json_out, json_len = ctypes.c_char_p(), _Z()
-    rc = _lib.dc_get_metadata(buf, len(data), ctypes.byref(json_out), ctypes.byref(json_len))
+    rc = _load().dc_get_metadata(buf, len(data), ctypes.byref(json_out), ctypes.byref(json_len))
     if rc:
         raise RuntimeError("parse_metadata failed — not a ChromaPakZ file?")
     try:
         return json.loads(ctypes.string_at(json_out, json_len.value).decode("utf-8"))
     finally:
-        _lib.dc_free(ctypes.cast(json_out, u8p))
+        _load().dc_free(ctypes.cast(json_out, u8p))
 
 
 def probe(data):
@@ -207,7 +220,7 @@ def probe(data):
     buf = _buf(data)
     W, H, N, fps, levels, rgb = (ctypes.c_int() for _ in range(6))
     near, far = ctypes.c_double(), ctypes.c_double()
-    rc = _lib.dc_probe(buf, len(data), *(ctypes.byref(x) for x in (W, H, N, fps, near, far, levels, rgb)))
+    rc = _load().dc_probe(buf, len(data), *(ctypes.byref(x) for x in (W, H, N, fps, near, far, levels, rgb)))
     if rc:
         raise RuntimeError("probe failed — not a ChromaPakZ file?")
     meta = parse_metadata(data)
@@ -231,7 +244,7 @@ def decode_signal(data, signal_id):
     out = _out_buffer((N, H, W), np.uint16)
     buf = _buf(data)
     sid = signal_id.encode("utf-8")
-    rc = _lib.dc_decode_signal(buf, len(data), sid, out.ctypes.data_as(u16p), out.size)
+    rc = _load().dc_decode_signal(buf, len(data), sid, out.ctypes.data_as(u16p), out.size)
     if rc:
         raise RuntimeError(f"decode_signal({signal_id!r}) failed ({_DECODE_ERRORS.get(rc, rc)})")
     return out
@@ -245,7 +258,7 @@ def decode_rgb(data):
     N, H, W = info["frames"], info["height"], info["width"]
     out = _out_buffer((N, H, W, 4), np.uint8)
     buf = _buf(data)
-    rc = _lib.dc_decode_rgb(buf, len(data), out.ctypes.data_as(u8p), out.nbytes)
+    rc = _load().dc_decode_rgb(buf, len(data), out.ctypes.data_as(u8p), out.nbytes)
     if rc:
         raise RuntimeError(f"decode_rgb failed ({_DECODE_ERRORS.get(rc, rc)})")
     return out
@@ -269,7 +282,7 @@ def quantize_inverse(z, near=0.2, far=10.0, levels=LEVELS_FULL):
     _check_inverse_depth(near, far, levels)
     z = np.ascontiguousarray(z, dtype=np.float32)
     out = np.empty(z.shape, dtype=np.uint16)
-    _lib.dc_quantize_inverse(z.ctypes.data_as(f32p), z.size, near, far, levels, out.ctypes.data_as(u16p))
+    _load().dc_quantize_inverse(z.ctypes.data_as(f32p), z.size, near, far, levels, out.ctypes.data_as(u16p))
     return out
 
 
@@ -278,5 +291,5 @@ def dequantize_inverse(d, near=0.2, far=10.0, levels=LEVELS_FULL):
     _check_inverse_depth(near, far, levels)
     d = _as_u16(d, "codes")
     out = np.empty(d.shape, dtype=np.float32)
-    _lib.dc_dequantize_inverse(d.ctypes.data_as(u16p), d.size, near, far, levels, out.ctypes.data_as(f32p))
+    _load().dc_dequantize_inverse(d.ctypes.data_as(u16p), d.size, near, far, levels, out.ctypes.data_as(f32p))
     return out
