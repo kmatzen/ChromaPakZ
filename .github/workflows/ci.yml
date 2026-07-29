@@ -56,6 +56,7 @@ jobs:
           python tests/py_api_validation.py
           python tests/py_decode_bounds.py
           python tests/py_c_abi.py
+          python tests/py_malformed.py
           python tests/py_symbol_isolation.py
           chromapakz-ingest --help > /dev/null   # console script is wired up and importable
 
