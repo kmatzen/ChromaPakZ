@@ -1,0 +1,4 @@
+# Mach-O export list for _core.dylib (see -Wl,-exported_symbols_list in CMakeLists.txt).
+# Only the C ABI declared in chromapakz.h is exported; the statically linked libvpx stays
+# internal, so it can neither be interposed by nor interpose on another extension's libvpx.
+_dc_*

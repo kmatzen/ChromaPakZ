@@ -48,6 +48,7 @@ jobs:
           python tests/stream_interop.py
           python tests/py_api_validation.py
           python tests/py_webm_inspect.py
+          python tests/py_symbol_isolation.py
 
       - name: ffmpeg decode-interop (full-range / bit-exact regression guard)
         run: python tests/ffmpeg_interop.py
