@@ -109,13 +109,24 @@ export function buildFileMetadata({ W, H, fps, n, hasRgb, signals, streaming=fal
   };
 }
 
-export function u16FromFramePayload(payload, signal){
+/**
+ * @param pixels — expected sample count (W*H). Pass it whenever the frame geometry is known:
+ *   a plane that is not exactly W*H is a caller bug, and left unchecked it reaches the codec
+ *   backends as an out-of-range copy (the WASM one writes straight into the libvpx heap).
+ */
+export function u16FromFramePayload(payload, signal, pixels=null){
   if(!payload) return null;
-  if(payload.u16) return payload.u16;
+  const check=(plane, what)=>{
+    if(pixels!=null && plane.length!==pixels)
+      throw new Error(`signal "${signal.id}": ${what} plane has ${plane.length} samples, expected ${pixels}`);
+    return plane;
+  };
+  if(payload.u16) return check(payload.u16, 'u16');
   if(payload.float){
     const q=signal.quant;
     if(!q || q.type !== QUANT_INVERSE_DEPTH)
       throw new Error(`signal "${signal.id}": float requires inverse-depth quant`);
+    check(payload.float, 'float');
     return quantizeInverseDepth(payload.float, q.near, q.far, q.levels ?? LEVELS_FULL);
   }
   throw new Error(`signal "${signal.id}": pass { u16 } or { float }`);

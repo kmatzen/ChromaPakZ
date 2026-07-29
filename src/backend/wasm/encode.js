@@ -38,6 +38,11 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
 
   return {
     async push(src){
+      // HEAPU8 is the whole WASM heap, so .set() copies src.length bytes with no bound of its own:
+      // an oversized plane would scribble past the inPtr allocation over live libvpx state, an
+      // undersized one would encode stale heap bytes. Both are caller bugs — refuse them here.
+      if(src.length!==planeBytes)
+        throw new Error(`wasm encode: ${kind} plane has ${src.length} bytes, expected ${planeBytes} (${W}x${H})`);
       await ensure();
       mod.HEAPU8.set(src, inPtr);
       const rc = mod._dcvp9_enc_encode(handle, inPtr, 0);
