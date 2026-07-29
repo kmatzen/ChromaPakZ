@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -228,25 +229,221 @@ Demuxed demux(const uint8_t* b, size_t len){
   return d;
 }
 
-// ── metadata (v2 signals) ──
-bool jnum(const std::string& j, const char* key, double& out){
-  std::string k = std::string("\"")+key+"\":"; auto p=j.find(k); if(p==std::string::npos) return false;
-  p+=k.size(); while(p<j.size() && (j[p]==' '||j[p]=='\t')) p++;
-  // Report failure when nothing numeric follows (e.g. `"width":null`) so callers keep
-  // their default instead of silently adopting strtod's 0.
-  const char* s=j.c_str()+p; char* e=nullptr; double v=strtod(s,&e);
+// ── metadata JSON ──
+// The CHROMAPAKZ tag is a JSON document, and which implementation wrote the file decides what is
+// in it. The JS encoder serialises with JSON.stringify, so strings arrive with real escapes and a
+// signal id may contain *any* character — including `"`, `\` and `]`. This used to be read with
+// substring search, which broke three ways: `j.find(']')` to end the signals array stopped at the
+// first `]` inside an id, `j.find('"')` to end an id stopped at an escaped quote, and a signal
+// entry was bounded by a fixed 480-character window, so a signal with no quantization inherited
+// the *next* signal's inverse-depth near/far.
+//
+// So both directions are structural now. jsonEscape() on the way out; on the way in, a scanner
+// that walks values in place — no DOM, no allocation beyond the strings it returns. The input is
+// untrusted, so every function here is total: it reports failure rather than running off the end
+// of the buffer, and nesting is depth-capped so a crafted document cannot exhaust the stack.
+// Parsing is deliberately lenient about *content* (an unreadable member keeps the caller's
+// default) and strict about *structure* (a malformed document stops the walk where it faults,
+// keeping only what was already read).
+
+constexpr int JSON_MAX_DEPTH = 32;   // this metadata nests 3 deep; anything near 32 is hostile
+
+std::string jsonEscape(const std::string& s){
+  std::string out; out.reserve(s.size()+2);
+  for(unsigned char c : s){
+    switch(c){
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b";  break;
+      case '\f': out += "\\f";  break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if(c < 0x20){ char u[8]; snprintf(u,sizeof u,"\\u%04x",(unsigned)c); out += u; }
+        else out += (char)c;   // >= 0x20 passes through, so a UTF-8 id stays UTF-8
+    }
+  }
+  return out;
+}
+
+void jWs(const std::string& j, size_t& p){
+  while(p<j.size() && (j[p]==' '||j[p]=='\t'||j[p]=='\n'||j[p]=='\r')) p++;
+}
+
+void utf8Append(std::string& out, unsigned cp){
+  if(cp<0x80) out+=(char)cp;
+  else if(cp<0x800){ out+=(char)(0xC0|(cp>>6)); out+=(char)(0x80|(cp&0x3F)); }
+  else if(cp<0x10000){ out+=(char)(0xE0|(cp>>12)); out+=(char)(0x80|((cp>>6)&0x3F)); out+=(char)(0x80|(cp&0x3F)); }
+  else { out+=(char)(0xF0|(cp>>18)); out+=(char)(0x80|((cp>>12)&0x3F));
+         out+=(char)(0x80|((cp>>6)&0x3F)); out+=(char)(0x80|(cp&0x3F)); }
+}
+
+bool jHex4(const std::string& j, size_t& p, unsigned& out){
+  if(p+4>j.size()) return false;
+  out=0;
+  for(int i=0;i<4;i++){
+    char c=j[p+i]; unsigned d;
+    if(c>='0'&&c<='9') d=(unsigned)(c-'0');
+    else if(c>='a'&&c<='f') d=10u+(unsigned)(c-'a');
+    else if(c>='A'&&c<='F') d=10u+(unsigned)(c-'A');
+    else return false;
+    out=(out<<4)|d;
+  }
+  p+=4; return true;
+}
+
+/** Parse the string at j[p] (must be '"') into `out`; leaves p just past the closing quote. */
+bool jString(const std::string& j, size_t& p, std::string& out){
+  if(p>=j.size() || j[p]!='"') return false;
+  p++; out.clear();
+  while(p<j.size()){
+    char c=j[p];
+    if(c=='"'){ p++; return true; }
+    if(c!='\\'){
+      if((unsigned char)c < 0x20) return false;   // a raw control byte is not legal JSON
+      out+=c; p++; continue;
+    }
+    if(++p>=j.size()) return false;
+    char e=j[p++];
+    switch(e){
+      case '"':  out+='"';  break;
+      case '\\': out+='\\'; break;
+      case '/':  out+='/';  break;
+      case 'b':  out+='\b'; break;
+      case 'f':  out+='\f'; break;
+      case 'n':  out+='\n'; break;
+      case 'r':  out+='\r'; break;
+      case 't':  out+='\t'; break;
+      case 'u': {
+        unsigned cp;
+        if(!jHex4(j,p,cp)) return false;
+        if(cp>=0xD800 && cp<=0xDBFF && p+1<j.size() && j[p]=='\\' && j[p+1]=='u'){
+          size_t q=p+2; unsigned lo;                       // a surrogate pair is one code point
+          if(jHex4(j,q,lo) && lo>=0xDC00 && lo<=0xDFFF){ cp=0x10000u+((cp-0xD800u)<<10)+(lo-0xDC00u); p=q; }
+        }
+        utf8Append(out,cp);
+        break;
+      }
+      default: return false;
+    }
+  }
+  return false;   // ran out of input before the closing quote
+}
+
+bool jNumber(const std::string& j, size_t& p, double& out){
+  const char* s=j.c_str()+p; char* e=nullptr;
+  double v=strtod(s,&e);
   if(e==s) return false;
-  out=v; return true;
+  p += (size_t)(e-s); out=v; return true;
 }
-bool jstr(const std::string& j, const char* key, std::string& out){
-  std::string k = std::string("\"")+key+"\":"; auto p=j.find(k); if(p==std::string::npos) return false;
-  p+=k.size(); while(p<j.size() && (j[p]==' '||j[p]=='\t')) p++;
-  if(p>=j.size() || j[p]!='"') return false; p++;
-  auto e=j.find('"',p); if(e==std::string::npos) return false;
-  out=j.substr(p,e-p); return true;
+
+bool jLiteral(const std::string& j, size_t& p, const char* lit){
+  size_t n=strlen(lit);
+  if(j.compare(p,n,lit)!=0) return false;
+  p+=n; return true;
 }
-bool jint(const std::string& j, const char* key, int& out){
-  double v; if(!jnum(j,key,v)) return false; out=(int)v; return true;
+
+bool jSkipValue(const std::string& j, size_t& p, int depth);
+
+/** Objects and arrays differ only in their brackets and whether items carry a `"key":` prefix. */
+bool jSkipContainer(const std::string& j, size_t& p, char open, char close, bool keyed, int depth){
+  if(depth>=JSON_MAX_DEPTH) return false;
+  if(p>=j.size() || j[p]!=open) return false;
+  p++; jWs(j,p);
+  if(p<j.size() && j[p]==close){ p++; return true; }
+  for(;;){
+    jWs(j,p);
+    if(keyed){
+      std::string k;
+      if(!jString(j,p,k)) return false;
+      jWs(j,p);
+      if(p>=j.size() || j[p]!=':') return false;
+      p++;
+    }
+    if(!jSkipValue(j,p,depth+1)) return false;
+    jWs(j,p);
+    if(p>=j.size()) return false;
+    if(j[p]==','){ p++; continue; }
+    if(j[p]==close){ p++; return true; }
+    return false;
+  }
+}
+
+bool jSkipValue(const std::string& j, size_t& p, int depth){
+  jWs(j,p);
+  if(p>=j.size()) return false;
+  switch(j[p]){
+    case '{': return jSkipContainer(j,p,'{','}',true,depth);
+    case '[': return jSkipContainer(j,p,'[',']',false,depth);
+    case '"': { std::string s; return jString(j,p,s); }
+    case 't': return jLiteral(j,p,"true");
+    case 'f': return jLiteral(j,p,"false");
+    case 'n': return jLiteral(j,p,"null");
+    default:  { double v; return jNumber(j,p,v); }
+  }
+}
+
+/**
+ * Walk the members of the object at j[p]. `fn(key, p)` is called with p at each member's value and
+ * must leave p exactly past that value. Key order is irrelevant — that is the point of walking
+ * rather than searching for `"key":` in the raw text.
+ */
+template <typename F>
+bool jEachMember(const std::string& j, size_t& p, int depth, F fn){
+  if(depth>=JSON_MAX_DEPTH) return false;
+  jWs(j,p);
+  if(p>=j.size() || j[p]!='{') return false;
+  p++; jWs(j,p);
+  if(p<j.size() && j[p]=='}'){ p++; return true; }
+  for(;;){
+    jWs(j,p);
+    std::string key;
+    if(!jString(j,p,key)) return false;
+    jWs(j,p);
+    if(p>=j.size() || j[p]!=':') return false;
+    p++; jWs(j,p);
+    if(!fn(key,p)) return false;
+    jWs(j,p);
+    if(p>=j.size()) return false;
+    if(j[p]==','){ p++; continue; }
+    if(j[p]=='}'){ p++; return true; }
+    return false;
+  }
+}
+
+/** As jEachMember, for the elements of the array at j[p]. */
+template <typename F>
+bool jEachElement(const std::string& j, size_t& p, int depth, F fn){
+  if(depth>=JSON_MAX_DEPTH) return false;
+  jWs(j,p);
+  if(p>=j.size() || j[p]!='[') return false;
+  p++; jWs(j,p);
+  if(p<j.size() && j[p]==']'){ p++; return true; }
+  for(;;){
+    jWs(j,p);
+    if(!fn(p)) return false;
+    jWs(j,p);
+    if(p>=j.size()) return false;
+    if(j[p]==','){ p++; continue; }
+    if(j[p]==']'){ p++; return true; }
+    return false;
+  }
+}
+
+/**
+ * Read the value at p as a number. Returns true (and consumes it) when it is one. A value of any
+ * other type — `"frames":null` is the one that actually occurs, in streamed files — is skipped and
+ * false returned, so the caller keeps its default. `ok` goes false only for malformed structure.
+ */
+bool jNumberValue(const std::string& j, size_t& p, int depth, double& out, bool& ok){
+  jWs(j,p);
+  if(p<j.size() && (j[p]=='-' || (j[p]>='0' && j[p]<='9'))){
+    if(!jNumber(j,p,out)){ ok=false; return false; }
+    return true;
+  }
+  if(!jSkipValue(j,p,depth)) ok=false;
+  return false;
 }
 
 struct SignalQuantMeta { bool inverse_depth=false; double near_=0, far_=0; int levels=65536; };
@@ -257,51 +454,116 @@ struct FileMeta {
   std::vector<SignalMeta> signals;
 };
 
-void parseSignalsV2(const std::string& j, FileMeta& m){
-  auto start=j.find("\"signals\":[");
-  if(start==std::string::npos) return;
-  start+=11;
-  auto arr_end=j.find(']', start);
-  if(arr_end==std::string::npos) return;
-  size_t pos=start;
-  while(pos<arr_end){
-    auto idk=j.find("\"id\":", pos);
-    if(idk==std::string::npos || idk>=arr_end) break;
-    SignalMeta s;
-    size_t p=idk+5; while(p<j.size() && j[p]==' ') p++;
-    if(p>=j.size() || j[p]!='"'){ pos=idk+1; continue; }
-    p++; auto e=j.find('"', p); if(e==std::string::npos) break;
-    s.id=j.substr(p,e-p);
-    size_t chunk_end=std::min(arr_end, e+480);
-    std::string chunk=j.substr(idk, chunk_end-idk);
-    double hi=0, lo=0;
-    if(jnum(chunk,"hi",hi)) s.track_hi=clampToInt(hi);
-    if(jnum(chunk,"lo",lo)) s.track_lo=clampToInt(lo);
-    if(chunk.find("inverse-depth")!=std::string::npos){
-      s.quant.inverse_depth=true;
-      jnum(chunk,"near",s.quant.near_); jnum(chunk,"far",s.quant.far_);
-      double lv; if(jnum(chunk,"levels",lv)){ int l=clampToInt(lv); s.quant.levels = l>0 ? l : 65536; }
+/** The `"quant"` member of one signal: an object, or null when the signal is unquantized. */
+bool parseQuantValue(const std::string& j, size_t& p, int depth, SignalQuantMeta& q){
+  jWs(j,p);
+  if(p<j.size() && j[p]=='n') return jLiteral(j,p,"null");   // "quant":null — carried as raw codes
+  SignalQuantMeta got; bool isInverse=false, ok=true;
+  bool wf=jEachMember(j,p,depth,[&](const std::string& k, size_t& vp)->bool{
+    if(k=="type"){
+      jWs(j,vp);
+      if(vp<j.size() && j[vp]=='"'){
+        std::string t; if(!jString(j,vp,t)) return false;
+        isInverse=(t=="inverse-depth"); return true;
+      }
+      return jSkipValue(j,vp,depth+1);
     }
+    double v=0;
+    if(k=="near"){   if(jNumberValue(j,vp,depth+1,v,ok)) got.near_=v; return ok; }
+    if(k=="far"){    if(jNumberValue(j,vp,depth+1,v,ok)) got.far_ =v; return ok; }
+    if(k=="levels"){ if(jNumberValue(j,vp,depth+1,v,ok)){ int l=clampToInt(v); got.levels = l>0?l:65536; } return ok; }
+    return jSkipValue(j,vp,depth+1);
+  });
+  if(!wf || !ok) return false;
+  // Only an inverse-depth quant means anything to this core; an unrecognised `type` leaves the
+  // signal unquantized rather than adopting a near/far it does not know how to apply.
+  if(isInverse){ got.inverse_depth=true; q=got; }
+  return true;
+}
+
+/** One element of `signals[]`. */
+bool parseSignalEntry(const std::string& j, size_t& p, int depth, SignalMeta& s, bool& haveId){
+  bool ok=true, quantIsInverseString=false;
+  SignalQuantMeta sibling;   // the pre-v2 shape put near/far/levels on the signal itself
+  bool wf=jEachMember(j,p,depth,[&](const std::string& k, size_t& vp)->bool{
+    if(k=="id"){
+      jWs(j,vp);
+      if(vp<j.size() && j[vp]=='"'){
+        if(!jString(j,vp,s.id)) return false;
+        haveId=true; return true;
+      }
+      return jSkipValue(j,vp,depth+1);
+    }
+    if(k=="tracks"){
+      return jEachMember(j,vp,depth+1,[&](const std::string& tk, size_t& tp)->bool{
+        double v=0;
+        if(tk=="hi"){ if(jNumberValue(j,tp,depth+2,v,ok)) s.track_hi=clampToInt(v); return ok; }
+        if(tk=="lo"){ if(jNumberValue(j,tp,depth+2,v,ok)) s.track_lo=clampToInt(v); return ok; }
+        return jSkipValue(j,tp,depth+2);
+      });
+    }
+    if(k=="quant"){
+      jWs(j,vp);
+      if(vp<j.size() && j[vp]=='"'){   // "quant":"inverse-depth", with near/far as siblings
+        std::string t; if(!jString(j,vp,t)) return false;
+        quantIsInverseString=(t=="inverse-depth"); return true;
+      }
+      return parseQuantValue(j,vp,depth+1,s.quant);
+    }
+    double v=0;
+    if(k=="near"){   if(jNumberValue(j,vp,depth+1,v,ok)) sibling.near_=v; return ok; }
+    if(k=="far"){    if(jNumberValue(j,vp,depth+1,v,ok)) sibling.far_ =v; return ok; }
+    if(k=="levels"){ if(jNumberValue(j,vp,depth+1,v,ok)){ int l=clampToInt(v); sibling.levels = l>0?l:65536; } return ok; }
+    return jSkipValue(j,vp,depth+1);
+  });
+  if(!wf || !ok) return false;
+  if(quantIsInverseString){ s.quant=sibling; s.quant.inverse_depth=true; }
+  return true;
+}
+
+/** `signals[]`, starting at the array's `[`. A malformed element ends the walk, prefix kept. */
+void parseSignalsV2(const std::string& j, size_t at, FileMeta& m){
+  size_t p=at;
+  jEachElement(j,p,1,[&](size_t& ep)->bool{
+    SignalMeta s; bool haveId=false;
+    if(!parseSignalEntry(j,ep,2,s,haveId)) return false;
     // A signal whose two planes are missing or aliased cannot be decoded; drop it here so
     // dc_decode_signal reports "no such signal" rather than unpacking mismatched planes.
-    if(s.track_hi>0 && s.track_lo>0 && s.track_hi!=s.track_lo) m.signals.push_back(s);
-    pos=e+1;
-  }
+    if(haveId && s.track_hi>0 && s.track_lo>0 && s.track_hi!=s.track_lo) m.signals.push_back(s);
+    return true;
+  });
 }
 
 FileMeta parseMetadata(const std::string& j){
-  FileMeta m; m.has_rgb = j.find("\"rgb\":null")==std::string::npos && j.find("\"rgb\":")!=std::string::npos;
-  // Each key keeps the struct's default when absent — reading an indeterminate `double v`
-  // (as this used to) is undefined and produced garbage geometry from truncated metadata.
-  double v=0;
-  if(jnum(j,"width",v))  m.width =clampToInt(v);
-  if(jnum(j,"height",v)) m.height=clampToInt(v);
-  if(jnum(j,"fps",v))    m.fps   =clampToInt(v);
-  if(jnum(j,"frames",v)) m.frames=clampToInt(v);
-  if(jnum(j,"version",v)){ int ver=clampToInt(v); m.version = ver>0 ? ver : 1; }
+  FileMeta m;
+  size_t p=0, signalsAt=std::string::npos;
+  bool ok=true;
+  // `signals` is parsed after the walk rather than during it, because whether to parse it at all
+  // depends on `version`, which JSON does not promise to have seen first.
+  jEachMember(j,p,0,[&](const std::string& k, size_t& vp)->bool{
+    double v=0;
+    if(k=="width"){   if(jNumberValue(j,vp,1,v,ok)) m.width =clampToInt(v); return ok; }
+    if(k=="height"){  if(jNumberValue(j,vp,1,v,ok)) m.height=clampToInt(v); return ok; }
+    if(k=="fps"){     if(jNumberValue(j,vp,1,v,ok)) m.fps   =clampToInt(v); return ok; }
+    if(k=="frames"){  if(jNumberValue(j,vp,1,v,ok)) m.frames=clampToInt(v); return ok; }
+    if(k=="version"){ if(jNumberValue(j,vp,1,v,ok)){ int ver=clampToInt(v); m.version = ver>0?ver:1; } return ok; }
+    if(k=="rgb"){
+      jWs(j,vp);
+      m.has_rgb = !(vp<j.size() && j[vp]=='n');   // present and not null
+      if(m.has_rgb && vp<j.size() && j[vp]=='{')
+        return jEachMember(j,vp,1,[&](const std::string& rk, size_t& rp)->bool{
+          double t=0;
+          if(rk=="track"){ if(jNumberValue(j,rp,2,t,ok)) m.rgb_track=clampToInt(t); return ok; }
+          return jSkipValue(j,rp,2);
+        });
+      return jSkipValue(j,vp,1);
+    }
+    if(k=="signals"){ signalsAt=vp; return jSkipValue(j,vp,1); }
+    return jSkipValue(j,vp,1);
+  });
   if(m.fps<=0) m.fps=30;
   if(m.frames<0) m.frames=0;
-  if(m.version>=2) parseSignalsV2(j,m);
+  if(m.version>=2 && signalsAt!=std::string::npos) parseSignalsV2(j,signalsAt,m);
   return m;
 }
 
@@ -311,9 +573,15 @@ const SignalMeta* findSignal(const FileMeta& m, const char* id){
 }
 
 std::string quantJson(const SignalQuantMeta& q){
-  if(!q.inverse_depth) return "null";
-  char buf[128];
-  snprintf(buf,sizeof buf,"{\"type\":\"inverse-depth\",\"near\":%g,\"far\":%g,\"levels\":%d}",
+  // JSON has no inf/nan, and printf would emit exactly those bare words for a range the C ABI was
+  // handed directly (the JS and Python wrappers reject it up front, a C caller need not). Writing
+  // them would produce a document no JSON reader can load, so record "no quantization" instead.
+  if(!q.inverse_depth || !std::isfinite(q.near_) || !std::isfinite(q.far_)) return "null";
+  char buf[192];
+  // %.17g, not %g: %g keeps 6 significant digits, so a near/far that needed more came back out of
+  // the file as a different number than went in, and dequantized to slightly different metres.
+  // 17 significant digits round-trip an IEEE double exactly.
+  snprintf(buf,sizeof buf,"{\"type\":\"inverse-depth\",\"near\":%.17g,\"far\":%.17g,\"levels\":%d}",
            q.near_, q.far_, q.levels);
   return buf;
 }
@@ -326,7 +594,7 @@ std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::v
     if(i) sigs+=",";
     const auto& s=signals[i];
     char nums[64]; snprintf(nums,sizeof nums,"\"hi\":%d,\"lo\":%d", s.track_hi, s.track_lo);
-    sigs += "{\"id\":\""; sigs += s.id; sigs += "\",\"tracks\":{"; sigs += nums;
+    sigs += "{\"id\":\""; sigs += jsonEscape(s.id); sigs += "\",\"tracks\":{"; sigs += nums;
     sigs += "},\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
             "\"dtype\":\"uint16\",\"invalidCode\":0,\"quant\":";
     sigs += quantJson(s.quant); sigs += "}";
@@ -610,8 +878,8 @@ int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgb
   if(!webm || !len || !rgba_out) return 1;
   return guard([&]{
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
-  if(d.metadata.find("\"rgb\":null")!=std::string::npos) return 6;
   FileMeta meta=parseMetadata(d.metadata);   // reads the keys once, with defaults when absent
+  if(!meta.has_rgb) return 6;                // structural, not a `"rgb":null` substring search
   int W=meta.width, H=meta.height;
   if(!dimsUsable(W,H)) return 2;
   size_t frameBytes=(size_t)W*H*4;
