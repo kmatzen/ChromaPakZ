@@ -214,9 +214,16 @@ def parse_metadata(data):
     if rc:
         raise RuntimeError("parse_metadata failed — not a ChromaPakZ file?")
     try:
-        return json.loads(ctypes.string_at(json_out, json_len.value).decode("utf-8"))
+        raw = ctypes.string_at(json_out, json_len.value)
     finally:
         _load().dc_free(ctypes.cast(json_out, u8p))
+    # A truncated file can still carry a well-formed tag whose payload is cut off, so the
+    # blob is untrusted even when dc_get_metadata succeeds. Keep the documented contract:
+    # malformed input raises RuntimeError, never a JSON/Unicode error from the internals.
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise RuntimeError(f"parse_metadata failed — malformed CHROMAPAKZ metadata ({e})") from e
 
 
 def probe(data):
