@@ -33,6 +33,31 @@ jobs:
           fi
           echo "tag $GITHUB_REF_NAME matches version $declared"
 
+      # The tag freezes the tree, and the sdist carries CHANGELOG.md into PyPI permanently — so a
+      # section still headed "unreleased" cannot be corrected after the fact, only apologised for.
+      # 0.3.0 shipped exactly that way. Checked only on a release: on a PR the upcoming section is
+      # *supposed* to say unreleased, which is why this cannot live in the test suite.
+      - name: The changelog has a dated section for this version
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          heading="$(grep -m1 -E "^## +${tag//./\\.}( |$)" CHANGELOG.md || true)"
+          if [ -z "$heading" ]; then
+            echo "::error::CHANGELOG.md has no '## $tag' section — add one before tagging"
+            exit 1
+          fi
+          case "$(printf '%s' "$heading" | tr '[:upper:]' '[:lower:]')" in
+            *unreleased*|*tbd*|*todo*)
+              echo "::error::CHANGELOG.md still marks $tag unreleased: $heading"
+              echo "::error::Stamp the date and re-tag — the sdist ships this file to PyPI for good."
+              exit 1 ;;
+          esac
+          if ! printf '%s' "$heading" | grep -qE '[0-9]{4}-[0-9]{2}-[0-9]{2}'; then
+            echo "::error::CHANGELOG.md section for $tag carries no YYYY-MM-DD date: $heading"
+            exit 1
+          fi
+          echo "changelog: $heading"
+
   wheels:
     name: wheels (${{ matrix.os }})
     needs: [version-guard]

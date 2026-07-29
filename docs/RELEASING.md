@@ -106,13 +106,33 @@ libvpx too (`install-libvpx.sh` configures for `uname -m`), and cibuildwheel can
    if the two drift. **Check the version is not already published** — PyPI and npm both refuse to
    overwrite an existing version, and the guard below only compares the tag to the source, so a
    re-used version gets through every job and fails at the upload.
-2. Add the release's section to `CHANGELOG.md`.
+2. Add the release's section to `CHANGELOG.md`, and **stamp it with the date before you tag** —
+   `## 0.3.0 — 2026-07-29`, not `## 0.3.0 — unreleased`. The tag freezes the tree and the sdist
+   carries this file into PyPI permanently, so a section that still says "unreleased" at tag time
+   cannot be corrected afterwards; 0.3.0 shipped exactly that way. `version-guard` now fails the
+   release on it, but only once the tag exists, and by then the fix costs a re-tag.
 3. **Dry-run the build**: `gh workflow run release.yml --ref <branch>`. `workflow_dispatch` builds
    wheels and the sdist and skips both publish jobs, so the whole matrix can be proven on a branch
    before any tag exists.
-4. Commit, tag, and push: `git tag v0.3.0 && git push --tags`.
-5. Create a **GitHub Release** for that tag. Publishing the release triggers `release.yml`, whose
-   jobs run strictly in this order:
+4. Merge, then tag the **merge commit** once its `main` CI is green, and push the tag:
+   `git tag -a v0.3.0 <sha> -m "…" && git push origin v0.3.0`. Pushing a tag publishes nothing —
+   `release.yml` triggers on `release: published`, not on tag push — so the tag can sit there while
+   you check things over.
+   - **To move a tag** that has not been released yet: `git push origin :refs/tags/v0.3.0`, then
+     `git tag -d v0.3.0`, then re-create and push. Delete-and-recreate rather than `--force`, so
+     anyone who already fetched it gets an error instead of a silently different tag.
+5. Create a **GitHub Release** for that tag, with the notes taken from that version's changelog
+   section rather than the whole file:
+
+   ```sh
+   python3 - <<'PY' > /tmp/notes.md
+   import re; s=open('CHANGELOG.md').read()
+   print(re.search(r'^## 0\.3\.0[^\n]*\n(.*?)(?=^## )', s, re.S|re.M).group(1).strip())
+   PY
+   gh release create v0.3.0 --verify-tag --title v0.3.0 --notes-file /tmp/notes.md
+   ```
+
+   Publishing the release triggers `release.yml`, whose jobs run strictly in this order:
 
    `version-guard` → `wheels` + `sdist` → `publish-npm` → `publish` (PyPI)
 
