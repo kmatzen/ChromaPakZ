@@ -13,6 +13,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # src/backend/wasm/vp9-*.{js,wasm} are committed *binaries* that no push-triggered job rebuilds,
+  # so editing native/wasm/dc_vp9.cpp does nothing until someone runs `npm run build:wasm` by hand
+  # — and npm ships whatever was last committed. Needs no toolchain, so it runs first and fails in
+  # seconds. .github/workflows/wasm.yml is the other half: a real emsdk rebuild.
+  wasm-fresh:
+    name: wasm freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: committed vp9-*.wasm were built from the current native/wasm/ sources
+        run: bash scripts/check-wasm-fresh.sh
+
   # Pure-JS suite: no native build, no node_modules (node --test is built in), so it is cheap
   # enough to run on every OS — including Windows, which nothing covered before.
   node:
@@ -128,9 +140,13 @@ jobs:
       matrix:
         engine: [chromium, firefox, webkit]
     runs-on: ubuntu-latest
-    # chromium is the gate; firefox/webkit are the engines the WASM fallback exists for but have
-    # never run here, so they report without blocking until they have a track record.
-    continue-on-error: ${{ matrix.engine != 'chromium' }}
+    # All three gate. firefox/webkit were advisory only because they had never run here; they have
+    # now, green, on every run of this branch — and they are the engines that actually exercise the
+    # fallback (under backend:'auto' both fetch vp9-encode.wasm *and* vp9-decode.wasm, where
+    # chromium fetches neither). What was stopping them was Playwright's 30s default navigation
+    # timeout, too tight for firefox to compile the ~850 KiB encoder .wasm; tests/browser/run.mjs
+    # raises it. Make this `continue-on-error: ${{ matrix.engine != 'chromium' }}` again if they
+    # ever turn flaky.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

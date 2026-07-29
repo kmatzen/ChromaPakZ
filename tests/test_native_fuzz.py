@@ -36,9 +36,26 @@ TIMEOUT_S = 600
 
 
 def _setup():
+    # Prefer the source tree, whose _find_lib() also picks up a CMake build/ — that is the dev and
+    # ci.yml layout. But this suite also runs where only an *installed* package exists and nothing
+    # has been compiled into python/: cibuildwheel's test-command runs pytest over {project}/tests
+    # against the built wheel, and release.yml runs it from an extracted sdist. Pinning sys.path to
+    # the source tree there imports a chromapakz with no _core to load, and the sweep dies on import
+    # rather than on anything it set out to measure.
     sys.path.insert(0, REPO_PYTHON)
     import numpy as np
     import chromapakz as cz
+    try:
+        cz._find_lib()
+    except OSError:
+        # _find_lib() raises only when there is no compiled _core anywhere the source tree looks,
+        # which means we are running against an installed package. Swap to it. Deliberately not
+        # `_load()`: that also raises OSError when the library exists but fails to dlopen (wrong
+        # architecture, missing libvpx), and silently falling back would bury that real error.
+        sys.path.remove(REPO_PYTHON)
+        for name in [m for m in sys.modules if m == "chromapakz" or m.startswith("chromapakz.")]:
+            del sys.modules[name]
+        import chromapakz as cz          # noqa: F811 — the installed one this time
 
     W, H, N = 8, 8, 4
     rng = np.random.default_rng(7)
