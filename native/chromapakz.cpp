@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <cstdint>
 #include <algorithm>
 #include <new>
 
@@ -16,6 +17,16 @@
 
 namespace {
 using Bytes = std::vector<uint8_t>;
+
+// strtod on crafted metadata yields NaN/inf/1e300, and casting those to int is undefined.
+// Saturate into int range first. (Geometry is separately range-checked by dimsUsable below,
+// which is what actually decides whether a header describes a usable frame.)
+int clampToInt(double v){
+  if(std::isnan(v)) return 0;
+  if(v <= (double)INT32_MIN) return INT32_MIN;
+  if(v >= (double)INT32_MAX) return INT32_MAX;
+  return (int)v;
+}
 
 // ── EBML element IDs (same set as src/webm.js) ──
 enum : uint32_t {
@@ -33,7 +44,9 @@ enum : uint32_t {
 void append(Bytes& a, const Bytes& b){ a.insert(a.end(), b.begin(), b.end()); }
 
 Bytes vint(uint64_t n){
-  int L=1; while(n >= ((1ULL<<(7*L))-1)) L++;
+  // EBML length vints top out at 8 bytes; without the L<8 bound a nonsense size would
+  // shift by >=64, which is undefined. Payloads that big are not representable anyway.
+  int L=1; while(L<8 && n >= ((1ULL<<(7*L))-1)) L++;
   uint64_t v = n + (1ULL<<(7*L)); Bytes out(L);
   for(int i=L-1;i>=0;i--){ out[i]=v&0xff; v>>=8; } return out;
 }
@@ -127,28 +140,51 @@ Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
 }
 
 // ── demux ──
+// Everything below parses untrusted bytes. The invariant the readers maintain is that a
+// Child's dStart/dEnd always satisfy start <= dStart <= dEnd <= end, so `dEnd - dStart`
+// can never wrap and no read ever leaves the caller's buffer.
 struct Child { uint32_t id; size_t dStart, dEnd; };
-int readId(const uint8_t* b, size_t p, uint32_t& id){
+
+// Returns the header length, or 0 if the vint is malformed or would run past `end`.
+int readId(const uint8_t* b, size_t p, size_t end, uint32_t& id){
+  if(p>=end) return 0;
   uint8_t first=b[p]; int L=1, m=0x80; while(L<=4 && !(first&m)){ m>>=1; L++; }
+  if(L>4) return 0;                          // no marker bit in the first four positions
+  if((size_t)L > end-p) return 0;            // header straddles the buffer/parent end
   id=0; for(int k=0;k<L;k++) id=(id<<8)|b[p+k]; return L;
 }
-int readSize(const uint8_t* b, size_t p, uint64_t& size, bool* unknown=nullptr){
+int readSize(const uint8_t* b, size_t p, size_t end, uint64_t& size, bool* unknown=nullptr){
+  if(p>=end) return 0;
   uint8_t first=b[p]; int L=1, m=0x80; while(L<=8 && !(first&m)){ m>>=1; L++; }
+  if(L>8) return 0;                          // all-zero descriptor: not a valid length vint
+  if((size_t)L > end-p) return 0;
   size = first & (m-1); for(int k=1;k<L;k++) size=(size<<8)|b[p+k];
   // An all-ones value (the reserved vint pattern) marks an unknown-size element —
   // the JS streaming muxer emits these for the Segment. Mirror src/webm.js readSize().
   if(unknown){ uint64_t allOnes=((uint64_t)1<<(7*L))-1; *unknown=(size==allOnes); }
   return L;
 }
-uint64_t readUint(const uint8_t* b, size_t s, size_t e){ uint64_t v=0; for(size_t k=s;k<e;k++) v=(v<<8)|b[k]; return v; }
+// EBML unsigned ints are 1..8 bytes. Anything longer is malformed, and shifting it in
+// would silently wrap, so refuse it instead of returning a fabricated value.
+uint64_t readUint(const uint8_t* b, size_t s, size_t e){
+  if(e<=s || e-s>8) return 0;
+  uint64_t v=0; for(size_t k=s;k<e;k++) v=(v<<8)|b[k]; return v;
+}
 std::vector<Child> kids(const uint8_t* b, size_t start, size_t end){
-  std::vector<Child> r; size_t p=start;
-  while(p<end){ uint32_t id; size_t la=readId(b,p,id); bool unk=false; uint64_t sz; size_t lb=readSize(b,p+la,sz,&unk);
-    size_t ds=p+la+lb; size_t de = unk ? end : ds+sz;
-    if(de>end) de=end;                       // unknown-size, or a truncated/oversized element: clamp to parent
-    r.push_back({id, ds, de});
+  std::vector<Child> r;
+  if(start>=end) return r;
+  size_t p=start;
+  while(p<end){
+    uint32_t id; int la=readId(b,p,end,id);
+    if(!la) break;                           // truncated or malformed header: stop, don't guess
+    bool unk=false; uint64_t sz=0; int lb=readSize(b,p+la,end,sz,&unk);
+    if(!lb) break;
+    size_t ds=p+(size_t)la+(size_t)lb;       // readSize checked ds<=end, so this cannot pass the end
+    size_t de = (unk || sz > (uint64_t)(end-ds)) ? end : ds+(size_t)sz;
+    r.push_back({id, ds, de});               // ds<=de<=end by construction
     if(unk) break;                           // unknown size runs to the parent's end (matches the JS demuxer)
-    p=de; }
+    p=de;                                    // de>=ds>p (la,lb>=1), so this always advances
+  }
   return r;
 }
 
@@ -173,9 +209,17 @@ Demuxed demux(const uint8_t* b, size_t len){
   auto walkCluster=[&](size_t s, size_t e){ uint64_t base=0;
     for(auto& c : kids(b,s,e)){
       if(c.id==ID_Timestamp) base=readUint(b,c.dStart,c.dEnd);
-      else if(c.id==ID_SimpleBlock){ size_t p=c.dStart; uint64_t tv; size_t lt=readSize(b,p,tv); p+=lt;
+      else if(c.id==ID_SimpleBlock){
+        size_t p=c.dStart; uint64_t tv=0; int lt=readSize(b,p,c.dEnd,tv);
+        if(!lt) continue; p+=lt;
+        if(c.dEnd-p < 3) continue;           // needs rel-timecode (2 bytes) + flags (1)
+        if(tv > (uint64_t)INT32_MAX) continue;                       // absurd track number
         int rel=(int)(int16_t)((b[p]<<8)|b[p+1]); p+=2; uint8_t flags=b[p]; p+=1;
-        d.frames.push_back({(int)tv, (flags&0x80)!=0, (int)(base+rel), b+p, c.dEnd-p}); } } };
+        // timeMs only orders frames, but base is attacker-controlled, so saturate rather
+        // than let the int64→int conversion go out of range.
+        int64_t t=(int64_t)(base & (uint64_t)INT64_MAX)+rel;
+        if(t>INT32_MAX) t=INT32_MAX; else if(t<INT32_MIN) t=INT32_MIN;
+        d.frames.push_back({(int)tv, (flags&0x80)!=0, (int)t, b+p, c.dEnd-p}); } } };
   for(auto& top : kids(b,0,len)) if(top.id==ID_Segment)
     for(auto& c : kids(b,top.dStart,top.dEnd)){
       if(c.id==ID_Tracks) walkTracks(c.dStart,c.dEnd);
@@ -188,7 +232,11 @@ Demuxed demux(const uint8_t* b, size_t len){
 bool jnum(const std::string& j, const char* key, double& out){
   std::string k = std::string("\"")+key+"\":"; auto p=j.find(k); if(p==std::string::npos) return false;
   p+=k.size(); while(p<j.size() && (j[p]==' '||j[p]=='\t')) p++;
-  out=strtod(j.c_str()+p, nullptr); return true;
+  // Report failure when nothing numeric follows (e.g. `"width":null`) so callers keep
+  // their default instead of silently adopting strtod's 0.
+  const char* s=j.c_str()+p; char* e=nullptr; double v=strtod(s,&e);
+  if(e==s) return false;
+  out=v; return true;
 }
 bool jstr(const std::string& j, const char* key, std::string& out){
   std::string k = std::string("\"")+key+"\":"; auto p=j.find(k); if(p==std::string::npos) return false;
@@ -221,34 +269,39 @@ void parseSignalsV2(const std::string& j, FileMeta& m){
     if(idk==std::string::npos || idk>=arr_end) break;
     SignalMeta s;
     size_t p=idk+5; while(p<j.size() && j[p]==' ') p++;
-    if(j[p]!='"'){ pos=idk+1; continue; }
+    if(p>=j.size() || j[p]!='"'){ pos=idk+1; continue; }
     p++; auto e=j.find('"', p); if(e==std::string::npos) break;
     s.id=j.substr(p,e-p);
     size_t chunk_end=std::min(arr_end, e+480);
     std::string chunk=j.substr(idk, chunk_end-idk);
     double hi=0, lo=0;
-    if(jnum(chunk,"hi",hi)) s.track_hi=(int)hi;
-    if(jnum(chunk,"lo",lo)) s.track_lo=(int)lo;
+    if(jnum(chunk,"hi",hi)) s.track_hi=clampToInt(hi);
+    if(jnum(chunk,"lo",lo)) s.track_lo=clampToInt(lo);
     if(chunk.find("inverse-depth")!=std::string::npos){
       s.quant.inverse_depth=true;
       jnum(chunk,"near",s.quant.near_); jnum(chunk,"far",s.quant.far_);
-      double lv; if(jnum(chunk,"levels",lv)) s.quant.levels=(int)lv;
+      double lv; if(jnum(chunk,"levels",lv)){ int l=clampToInt(lv); s.quant.levels = l>0 ? l : 65536; }
     }
-    m.signals.push_back(s);
+    // A signal whose two planes are missing or aliased cannot be decoded; drop it here so
+    // dc_decode_signal reports "no such signal" rather than unpacking mismatched planes.
+    if(s.track_hi>0 && s.track_lo>0 && s.track_hi!=s.track_lo) m.signals.push_back(s);
     pos=e+1;
   }
 }
 
 FileMeta parseMetadata(const std::string& j){
   FileMeta m; m.has_rgb = j.find("\"rgb\":null")==std::string::npos && j.find("\"rgb\":")!=std::string::npos;
-  double v;
-  jnum(j,"width",v); m.width=(int)v;
-  jnum(j,"height",v); m.height=(int)v;
-  jnum(j,"fps",v); m.fps=(int)v;
-  jnum(j,"frames",v); m.frames=(int)v;
-  jnum(j,"version",v); m.version = v>0 ? (int)v : 1;
+  // Each key keeps the struct's default when absent — reading an indeterminate `double v`
+  // (as this used to) is undefined and produced garbage geometry from truncated metadata.
+  double v=0;
+  if(jnum(j,"width",v))  m.width =clampToInt(v);
+  if(jnum(j,"height",v)) m.height=clampToInt(v);
+  if(jnum(j,"fps",v))    m.fps   =clampToInt(v);
+  if(jnum(j,"frames",v)) m.frames=clampToInt(v);
+  if(jnum(j,"version",v)){ int ver=clampToInt(v); m.version = ver>0 ? ver : 1; }
+  if(m.fps<=0) m.fps=30;
+  if(m.frames<0) m.frames=0;
   if(m.version>=2) parseSignalsV2(j,m);
-  if(m.signals.empty()) return m; // caller checks
   return m;
 }
 
@@ -475,6 +528,9 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
                    const std::vector<SignalEncodeSpec>& specs,
                    int W, int H, int N, int fps, Bytes& file){
   if(specs.empty() && !rgba) return 1;
+  if(!dimsUsable(W,H) || N<=0 || fps<=0) return 1;
+  // Guard the per-frame strides used below ((size_t)i*W*H*4) against wrapping.
+  if((size_t)N > SIZE_MAX/((size_t)W*(size_t)H*4)) return 1;
   std::vector<Track> tracks; std::vector<Frame> frames;
   bool hasRgb=rgba!=nullptr;
   auto sigMeta=planSignalTracks(specs, hasRgb);
@@ -485,7 +541,7 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
     if((int)rgbF.size()!=N) return 6;
     tracks.push_back({1,"V_VP9","rgb",W,H});
   }
-  int px=W*H;
+  size_t px=(size_t)W*(size_t)H;
   struct SigEnc { std::vector<Bytes> hiF, loF, hiP, loP; std::vector<bool> hiK, loK; };
   std::vector<SigEnc> enc(specs.size());
   for(size_t si=0; si<specs.size(); si++){
@@ -555,7 +611,8 @@ int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgb
   return guard([&]{
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
   if(d.metadata.find("\"rgb\":null")!=std::string::npos) return 6;
-  double v; int W=0,H=0; jnum(d.metadata,"width",v); W=(int)v; jnum(d.metadata,"height",v); H=(int)v;
+  FileMeta meta=parseMetadata(d.metadata);   // reads the keys once, with defaults when absent
+  int W=meta.width, H=meta.height;
   if(!dimsUsable(W,H)) return 2;
   size_t frameBytes=(size_t)W*H*4;
   int rgbTrack=1; for(auto& t:d.tracks) if(t.name=="rgb") rgbTrack=t.number;
