@@ -150,6 +150,10 @@ def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
     signals = dict(signals or {})
     if not signals and rgb is None:
         raise ValueError("need at least one signal or rgb")
+    # fps drives the encoder timebase and the block timestamps; the native side rejects fps <= 0,
+    # but raise here so the caller gets the offending value rather than a bare error code.
+    if not isinstance(fps, (int, np.integer)) or fps <= 0:
+        raise ValueError(f"fps must be a positive integer (got {fps!r})")
     specs = dict(specs or {})
     ids = list(signals.keys())
     arrays = []
