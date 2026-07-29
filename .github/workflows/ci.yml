@@ -33,13 +33,14 @@ jobs:
           python-version: "3.12"
 
       # Deliberately before any build: the package must import, and its pure-Python helpers must
-      # work, with no compiled _core on disk (the native load is lazy).
+      # work, with no compiled _core on disk (the native load is lazy). These two are named
+      # explicitly because that *ordering* is the point, not because the list is a coverage
+      # inventory — the full suite below is glob-discovered.
       - name: Pure-Python checks (no compiled core)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy
-          python tests/py_lazy_native.py
-          python tests/py_webm_inspect.py
+          python -m pip install numpy pytest coverage
+          python -m pytest tests/test_lazy_native.py tests/test_webm_inspect.py
 
       - name: CMake build + C++ self-test (bit-exact)
         run: |
@@ -47,22 +48,42 @@ jobs:
           cmake --build build -j
           ./build/dccli selftest
 
-      - name: pip install (compiles via CMake) + Python round-trip
+      - name: C++ side of the cross-language quantizer golden vectors
+        run: ./build/dccli goldencheck tests/fixtures/quant_golden.csv
+
+      # The whole tests/ directory runs via pytest discovery — no list to keep in sync here.
+      # ffmpeg is installed above, so tests/test_ffmpeg_interop.py runs rather than skipping.
+      - name: pip install (compiles via CMake) + Python suite, with coverage
         run: |
           python -m pip install . --no-build-isolation || python -m pip install .
-          python tests/roundtrip.py
-          python tests/cross_interop.py
-          python tests/stream_interop.py
-          python tests/py_api_validation.py
-          python tests/py_decode_bounds.py
-          python tests/py_c_abi.py
-          python tests/py_malformed.py
-          python tests/py_native_fuzz.py
-          python tests/py_symbol_isolation.py
+          coverage run -m pytest tests
+          coverage report
           chromapakz-ingest --help > /dev/null   # console script is wired up and importable
 
-      - name: ffmpeg decode-interop (full-range / bit-exact regression guard)
-        run: python tests/ffmpeg_interop.py
+  native-coverage:
+    name: native coverage (gcov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libvpx + tools
+        run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config cmake ninja-build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install gcovr
+
+      # Instrumented build lives in its own directory so nothing shipped is ever built --coverage.
+      - name: Build instrumented and exercise the core
+        run: |
+          cmake -S . -B build-cov -DCMAKE_BUILD_TYPE=Debug -DCHROMAPAKZ_COVERAGE=ON
+          cmake --build build-cov -j
+          ./build-cov/dccli selftest
+          ./build-cov/dccli goldencheck tests/fixtures/quant_golden.csv
+
+      # Reported, not gated: the point is that untested error paths in the C++ core stop being
+      # invisible. Add a --fail-under-line once the number has settled.
+      - name: Coverage report
+        run: gcovr --root . --filter native/ --txt --print-summary
 
   browser:
     name: in-browser VP9 lossless (Chromium)
@@ -73,14 +94,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config cmake ninja-build
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # >=22 for the test runner's built-in glob, which is what makes discovery automatic.
+          node-version: "22"
       - name: Run the headless WebCodecs probe (asserts bit-exact encode->decode)
         working-directory: experiments/webcodecs-lossless
         run: |
           npm init -y >/dev/null 2>&1
           npm i -D playwright
           npx playwright install --with-deps chromium
-          (cd ../.. && npm test)   # full Node suite, incl. the WASM (libvpx) fallback round-trips
+          # Full Node suite (glob-discovered, incl. the WASM fallback round-trips) with coverage.
+          (cd ../.. && npm run test:coverage)
           BROWSER=chromium node run.mjs single 256 | tee out.txt
           grep -q "EXACT" out.txt
           BROWSER=chromium node run.mjs streaming 256 12 | tee stream.txt

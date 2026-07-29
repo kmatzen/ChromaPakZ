@@ -205,7 +205,7 @@ demo/         index.html                     in-browser encode→decode→view
 examples/     tum_fr1desk.py
 experiments/  webcodecs-lossless/            run.mjs, smoke-demo.mjs, headless tests
 docs/         FORMAT.md, API.md, EVALUATION.md, RELEASING.md
-tests/        roundtrip.py, cross_interop.py, stream_interop.py, ffmpeg_interop.py, py_*.py, js_*.mjs
+tests/        test_*.py (pytest) + *.test.mjs (node --test), both glob-discovered; fixtures/
 ```
 
 CI builds and tests on Linux + macOS and runs the in-browser VP9-lossless probe in headless Chromium;
