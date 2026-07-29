@@ -37,6 +37,20 @@ const { signalSeries } = await decode(bytes);
 
 Network: `onChunk` on encode; `createDecoder()` + `push()` + `finish()` on decode.
 
+### Concurrency
+
+`addFrame()`, `finish()` and `readFrame()` are safe to call without awaiting the previous one —
+overlapping calls are serialized internally **in call order**, so
+
+```javascript
+await Promise.all(frames.map(f => enc.addFrame(f)));   // == awaiting each in turn
+```
+
+produces byte-identical output to the sequential loop. VP9 is inherently sequential (each frame
+predicts from the last), so this buys correctness, not parallelism: fanning out does not make
+encoding faster. Prefer the plain `for … await` loop when you want backpressure — the fan-out form
+holds every frame's input buffer live until its turn comes.
+
 Quant helpers: `quantizeInverseDepth`, `dequantizeInverseDepth`, `autoNearFar`, `triFoldPack`, `triFoldUnpack`.
 
 ### Codec backend & WASM fallback
