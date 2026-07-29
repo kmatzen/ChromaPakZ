@@ -4,18 +4,52 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 6 * * 1"       # Monday 06:00 UTC — exercises the release-only wheel path
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Pure-JS suite: no native build, no node_modules (node --test is built in), so it is cheap
+  # enough to run on every OS — including Windows, which nothing covered before.
+  node:
+    name: node suite (${{ matrix.os }} / node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["22"]
+        include:
+          - os: ubuntu-latest
+            node: "24"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # >=22 for the test runner's built-in glob, which is what makes discovery automatic.
+          node-version: ${{ matrix.node }}
+      # Discovery-based: `node --test 'tests/**/*.test.mjs'` — adding a test file is enough to
+      # run it. The coverage variant is the same run plus a per-file report, so it costs nothing
+      # extra to keep the numbers visible on every leg.
+      - run: npm run test:coverage
+
   native-python:
-    name: build + test (${{ matrix.os }})
+    name: build + test (${{ matrix.os }} / py${{ matrix.python }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        python: ["3.12"]
+        include:
+          # requires-python is >=3.9 and wheels build cp39–cp313; cover both ends of that range.
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.13"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +64,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
       # Deliberately before any build: the package must import, and its pure-Python helpers must
       # work, with no compiled _core on disk (the native load is lazy). These two are named
@@ -85,32 +119,113 @@ jobs:
       - name: Coverage report
         run: gcovr --root . --filter native/ --txt --print-summary
 
-  browser:
-    name: in-browser VP9 lossless (Chromium)
+  bundle:
+    name: vite build + built bundle in a real browser (${{ matrix.engine }})
+    # Nothing exercised `npm run build` or tests/browser/run.mjs, so vite.config.js — whose entire
+    # purpose is preserving the per-operation .wasm code-split chunks — was never validated.
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [chromium, firefox, webkit]
+    runs-on: ubuntu-latest
+    # chromium is the gate; firefox/webkit are the engines the WASM fallback exists for but have
+    # never run here, so they report without blocking until they have a track record.
+    continue-on-error: ${{ matrix.engine != 'chromium' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Check the code-split chunks survived the build
+        run: |
+          test -f dist/chromapakz.js
+          ls dist/assets/vp9-encode.wasm dist/assets/vp9-decode.wasm
+          # Each fallback must stay in its own chunk, or a decode-only page downloads the encoder.
+          test "$(grep -rl dcvp9_enc_new dist/chunks | wc -l)" -ge 1
+          test "$(grep -rl dcvp9_dec_new dist/chunks | wc -l)" -ge 1
+      - run: npx playwright install --with-deps ${{ matrix.engine }}
+      - run: node tests/browser/run.mjs ${{ matrix.engine }}
+
+  webcodecs:
+    name: in-browser VP9 lossless (Chromium WebCodecs)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install libvpx
-        run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config cmake ninja-build
       - uses: actions/setup-node@v4
         with:
-          # >=22 for the test runner's built-in glob, which is what makes discovery automatic.
           node-version: "22"
-      - name: Run the headless WebCodecs probe (asserts bit-exact encode->decode)
+          cache: npm
+      # playwright comes from the pinned devDependency, not an unpinned `npm i -D` in experiments/.
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # Each of these sets a nonzero exit code on failure, so the step status is the assertion —
+      # no grepping stdout for an emoji.
+      - name: WebCodecs probes
         working-directory: experiments/webcodecs-lossless
+        env:
+          BROWSER: chromium
         run: |
-          npm init -y >/dev/null 2>&1
-          npm i -D playwright
-          npx playwright install --with-deps chromium
-          # Full Node suite (glob-discovered, incl. the WASM fallback round-trips) with coverage.
-          (cd ../.. && npm run test:coverage)
-          BROWSER=chromium node run.mjs single 256 | tee out.txt
-          grep -q "EXACT" out.txt
-          BROWSER=chromium node run.mjs streaming 256 12 | tee stream.txt
-          grep -q "YES ✓" stream.txt
-          BROWSER=chromium node run.mjs network 256 8 | tee network.txt
-          grep -q "YES ✓" network.txt
-          BROWSER=chromium node run.mjs multisignal 128 6 | tee multi.txt
-          grep -q "YES ✓" multi.txt
-          node smoke-demo.mjs | tee demo.txt
-          grep -q "bit-exact" demo.txt
+          node run.mjs single 256
+          node run.mjs streaming 256 12
+          node run.mjs network 256 8
+          node run.mjs multisignal 128 6
+          node smoke-demo.mjs
+
+  packaging:
+    name: npm pack + sdist install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The `files` manifest was never checked: a src/ restructure or a docs rename would ship a
+      # broken npm package and only surface after publish.
+      - name: npm pack dry-run
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const f = require("./pack.json")[0].files.map(x => x.path);
+            const need = ["src/chromapakz.js", "src/webm.js", "src/signals.js", "docs/API.md", "README.md", "LICENSE"];
+            const missing = need.filter(n => !f.includes(n));
+            if (missing.length) { console.error("missing from npm tarball:", missing); process.exit(1); }
+            console.log("npm tarball carries " + f.length + " files, all required entries present");
+          '
+
+      # An sdist that is missing a file only fails for an end user; install it here instead.
+      - name: Build sdist and install it from scratch
+        run: |
+          sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config cmake ninja-build
+          pipx run build --sdist
+          python -m venv /tmp/sdistenv
+          /tmp/sdistenv/bin/pip install --upgrade pip
+          /tmp/sdistenv/bin/pip install numpy
+          /tmp/sdistenv/bin/pip install dist/*.tar.gz
+          cd /tmp && /tmp/sdistenv/bin/python -c '
+          import chromapakz, numpy as np
+          from chromapakz import webm_inspect
+          from chromapakz.ingest import encode_clip
+          data, stats = encode_clip(depth=np.zeros((2, 8, 8), np.uint16))
+          assert webm_inspect.track_sizes(data), "the inspector must ship in the wheel"
+          print("sdist install OK -", chromapakz.__version__, stats["bytes"], "bytes")
+          '
+          /tmp/sdistenv/bin/chromapakz-ingest --help > /dev/null
+
+  wheels-dry-run:
+    name: cibuildwheel dry-run (libvpx provisioning)
+    # A broken scripts/install-libvpx.sh or a runner-image bump used to be discovered mid-release,
+    # because cibuildwheel only ran on `release: published`. One representative build, weekly.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_BUILD: cp312-manylinux_x86_64

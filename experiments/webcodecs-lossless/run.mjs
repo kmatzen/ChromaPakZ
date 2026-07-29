@@ -74,6 +74,10 @@ if (MODE === 'caps') {
       `${bpp(r.hiBytes, r.px).padStart(6)}   ${bpp(r.loBytes, r.px).padStart(6)}   ` +
       `${bpp(r.totalBytes, r.px).padStart(9)}   ${relStr}`);
   }
+  // Exit nonzero when no codec round-trips triangle-fold exactly, so CI can assert on the exit
+  // code instead of grepping this table for an emoji. Rows for unsupported codecs carry an
+  // `error` and no verdict, which is why this asks for a positive result rather than no failures.
+  if (!out.rows.some(r => r.scheme === 'triangle-fold' && r.lossless)) process.exitCode = 1;
 } else if (MODE === 'gop') {
   const out = await page.evaluate(([w, h, n]) => window.__runProbeGOP(w, h, n), [SIZE, SIZE, N]).catch(e => ({ error: String(e) }));
   if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
@@ -89,6 +93,9 @@ if (MODE === 'caps') {
       `${bpp(r.hiBytes, r.px).padStart(6)}   ${bpp(r.loBytes, r.px).padStart(6)}   ` +
       `${bpp(r.totalBytes, r.px).padStart(9)}   ${relStr}`);
   }
+  // Every GOP mode here is expected to be bit-exact — none of them has an unsupported path — so
+  // this asserts the whole table rather than just one row.
+  if (!out.rows.length || out.rows.some(r => !r.lossless)) process.exitCode = 1;
 } else if (MODE === 'split') {
   const out = await page.evaluate(([w, h, n]) => window.__runProbe10GOP(w, h, n), [SIZE, SIZE, N]).catch(e => ({ error: String(e) }));
   if (out.error) { await browser.close(); server.close(); console.error('FATAL:', out.error); process.exit(1); }
@@ -104,6 +111,8 @@ if (MODE === 'caps') {
       `${bpp(r.hiBytes, r.px).padStart(6)}   ${bpp(r.loBytes, r.px).padStart(6)}   ` +
       `${bpp(r.totalBytes, r.px).padStart(9)}   ${relStr}`);
   }
+  // Both splits (8+8 and 10+6) are expected to be bit-exact, so assert the whole table.
+  if (!out.rows.length || out.rows.some(r => !r.lossless)) process.exitCode = 1;
 } else if (MODE === 'streaming') {
   const out = await page.evaluate(([w, h, n]) => window.__runStreamingWebM(w, h, n), [SIZE, SIZE, N])
     .catch(e => ({ error: String(e) }));
