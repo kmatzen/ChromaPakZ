@@ -141,6 +141,7 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   let streamMux=null, byteParts=null;
   const muxFrames=[];
   const rgbKeyEvery=Math.max(1, Math.round(fps));
+  const pixels=W*H;   // samples per signal plane; rgb is pixels*4 bytes (RGBA)
 
   // Backends are picked once per encoder, lazily, on first frame. Lossless (signals) and
   // lossy (rgb) probe independently — a browser may have native lossy but need WASM lossless.
@@ -263,6 +264,12 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   async function addFrameImpl(frame){
     const writes=[];
     if(frame.rgb){
+      // Plane geometry is checked before anything stateful: a wrong-length plane is a caller bug
+      // the codec backends cannot absorb (the WASM one copies it into a W*H*4 allocation on the
+      // libvpx heap), and it says nothing about how this encoder was configured.
+      const rgbBytes=frame.rgb.byteLength ?? frame.rgb.length;
+      if(rgbBytes!==pixels*4)
+        throw new Error(`addFrame: rgb plane has ${rgbBytes} bytes, expected ${pixels*4} (${W}x${H} RGBA)`);
       // Track numbers were frozen without an RGB track, so this frame's RGB would be written to
       // track 1 — already owned by signals[0].tracks.hi. Fail here rather than emit a file whose
       // RGB and first signal decode as the same track.
@@ -276,11 +283,11 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     }
     ensurePlan();
     const inputs=collectFrameInputs(frame, signalPlan);
-    // Quantize and gap-check everything this frame carries *before* pushing any of it into a
-    // stateful encoder, so a rejected frame leaves the encoders untouched.
+    // Quantize, size-check and gap-check everything this frame carries *before* pushing any of it
+    // into a stateful encoder, so a rejected frame leaves the encoders untouched.
     const present=[];
     for(const s of signalPlan){
-      const u16=u16FromFramePayload(inputs[s.id], s);
+      const u16=u16FromFramePayload(inputs[s.id], s, pixels);
       if(u16) present.push({ s, u16 });
     }
     if(!frame.rgb && !present.length) throw new Error('addFrame: pass rgb and/or signals');

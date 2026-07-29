@@ -80,6 +80,12 @@ Once a stream (RGB or a given signal) has been written, it must appear on every 
 a stream that stops and resumes is refused, because each track's timestamps come from its own frame
 counter and a gap cannot be realigned.
 
+### Plane sizes
+
+Every plane handed to `addFrame()` must match the encoder's geometry exactly: `W*H` samples for a
+signal (`u16` or `float`), `W*H*4` bytes for `rgb` (RGBA). A mismatch throws before any encoder is
+touched, so the rejected frame is not counted and the encoder stays usable for the next one.
+
 ### Concurrency
 
 `addFrame()`, `finish()` and `readFrame()` are safe to call without awaiting the previous one —
