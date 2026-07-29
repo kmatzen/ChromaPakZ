@@ -4,7 +4,7 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-07-29
 
 First release of the browser library to npm, and the first with a breaking change to the native C
 ABI. The file format itself is unchanged: a `.webm` written by 0.2.0 decodes bit-exactly under
