@@ -54,8 +54,11 @@ async function load(){
   const page = await browser.newPage();
   page.on('pageerror', e => console.error('  [pageerror]', e.message));
   const wasm = fetchedWasm(page);
-  await page.goto(`http://localhost:${port}${PAGE}`);
-  await page.waitForFunction('window.__ready === true', { timeout: 15000 });
+  // Playwright's default 30s navigation timeout is not enough for firefox here: the page pulls an
+  // ~850 KiB encoder .wasm and firefox compiles it far more slowly than chromium, so the second
+  // navigation reliably tripped the default. Not flakiness — just a genuinely slow load.
+  await page.goto(`http://localhost:${port}${PAGE}`, { timeout: 60000 });
+  await page.waitForFunction('window.__ready === true', { timeout: 60000 });
   return { page, wasm };
 }
 

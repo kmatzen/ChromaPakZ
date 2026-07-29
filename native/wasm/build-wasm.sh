@@ -68,5 +68,14 @@ emcc "${EMCC_COMMON[@]}" "$WASM_SRC/dc_vp9.cpp" "$BUILD/libvpx-decode/libvpx.a" 
 # ── 4. regenerate the decode probe's reference chunk (uses the freshly-built encoder) ──
 node "$WASM_SRC/gen-decode-ref.mjs"
 
+# ── 5. record the sources these binaries were built from ──
+# scripts/check-wasm-fresh.sh re-verifies this manifest, so editing dc_vp9.cpp without rebuilding
+# fails CI. It is content-based on purpose: an earlier version compared git history instead, and a
+# rebase happily moves a rebuild commit *after* a source commit whose changes it does not contain.
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+( cd "$ROOT" && sha256 native/wasm/dc_vp9.cpp native/wasm/dc_vp9.h \
+    native/wasm/build-wasm.sh native/wasm/gen-decode-ref.mjs ) > "$OUT/BUILD_SOURCES.sha256"
+
 echo "built:"
 ls -la "$OUT"/vp9-*.wasm
+echo "source manifest: $OUT/BUILD_SOURCES.sha256"
