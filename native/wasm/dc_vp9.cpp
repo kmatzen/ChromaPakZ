@@ -74,14 +74,18 @@ dcvp9_enc* dcvp9_enc_new(int W, int H, int fps, int kind, int bitrate_kbps, int 
   }
   if(vpx_codec_enc_init(&e->ctx,iface,&cfg,0)){ e->ok=false; return e; }
   if(kind==0){
-    vpx_codec_control(&e->ctx, VP9E_SET_LOSSLESS, 1);
-    vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, 1);
+    // Gate on lossless: a libvpx that rejects this control would encode the packed signal planes
+    // lossy while the container metadata still claims "lossless":true. Fail the encoder instead.
+    if(vpx_codec_control(&e->ctx, VP9E_SET_LOSSLESS, 1)){ e->ok=false; return e; }
+    vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, 1);   // speed only
   }else{
     vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, 2);
     vpx_codec_control(&e->ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
   }
   vpx_codec_control(&e->ctx, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
-  vpx_img_alloc(&e->img, VPX_IMG_FMT_I420, W, H, 1);
+  // On failure vpx_img_alloc returns NULL and leaves img.planes unset — the first encode would
+  // then memcpy into wild pointers.
+  if(!vpx_img_alloc(&e->img, VPX_IMG_FMT_I420, W, H, 1)){ e->ok=false; return e; }
   e->img.cs=VPX_CS_BT_709; e->img.range=VPX_CR_FULL_RANGE;
   return e;
 }

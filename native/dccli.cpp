@@ -7,16 +7,44 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <climits>
 #include <vector>
 #include <string>
+#include <sys/stat.h>   // fstat/S_ISREG — POSIX; dccli is a dev tool built only on Linux/macOS
+#include <unistd.h>
 
 static std::vector<uint8_t> readFile(const char* p){
   FILE* f=fopen(p,"rb"); if(!f){ perror(p); exit(1); }
-  fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-  std::vector<uint8_t> b(n); if(fread(b.data(),1,n,f)!=(size_t)n){ perror("read"); exit(1); } fclose(f); return b;
+  // Only a regular file can be sized with ftell, and the failure modes differ by platform:
+  // ftell returns -1 for a pipe, but a directory *opens* on Linux and its SEEK_END offset is a
+  // directory-hash cookie (astronomically large on ext4), not a byte count. Sizing a vector from
+  // either would attempt an absurd allocation — the negative case sign-extends to ~2^64, the
+  // Linux directory case is simply enormous — so check the file type up front instead of trying
+  // to sanity-check the number afterwards.
+  struct stat st;
+  if(fstat(fileno(f),&st)!=0){ perror(p); fclose(f); exit(1); }
+  if(!S_ISREG(st.st_mode)){ fprintf(stderr,"%s: not a regular file\n",p); fclose(f); exit(1); }
+  if(fseek(f,0,SEEK_END)!=0){ perror(p); fclose(f); exit(1); }
+  long n=ftell(f);
+  if(n<0){ perror(p); fclose(f); exit(1); }
+  if(fseek(f,0,SEEK_SET)!=0){ perror(p); fclose(f); exit(1); }
+  std::vector<uint8_t> b((size_t)n);
+  if(n && fread(b.data(),1,(size_t)n,f)!=(size_t)n){ perror("read"); fclose(f); exit(1); }
+  fclose(f); return b;
 }
 static void writeFile(const char* p, const uint8_t* d, size_t n){
-  FILE* f=fopen(p,"wb"); if(!f){ perror(p); exit(1); } fwrite(d,1,n,f); fclose(f);
+  FILE* f=fopen(p,"wb"); if(!f){ perror(p); exit(1); }
+  // A short fwrite or a failing fclose (full disk, quota, I/O error) would otherwise leave a
+  // silently truncated file behind while the command still reports success.
+  if(n && fwrite(d,1,n,f)!=n){ perror(p); fclose(f); exit(1); }
+  if(fclose(f)!=0){ perror(p); exit(1); }
+}
+
+// atoi has no way to report garbage or overflow; every dimension here must be a positive count.
+static int posInt(const char* s, const char* what){
+  char* end=nullptr; long v=strtol(s,&end,10);
+  if(end==s || *end || v<=0 || v>INT_MAX){ fprintf(stderr,"%s must be a positive integer (got \"%s\")\n",what,s); exit(2); }
+  return (int)v;
 }
 
 static int encodeDepthOnly(const uint16_t* depth, int W, int H, int N, int fps,
@@ -40,9 +68,9 @@ int main(int argc, char** argv){
         long zi=(long)(z<0?0:(z>65535?65535:z)); depth[(size_t)f*px+r*W+c]=(uint16_t)zi; } }
 
     uint8_t* buf; size_t len;
-    if(encodeDepthOnly(depth.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
+    if(int rc=encodeDepthOnly(depth.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed (%d)\n",rc); return 1; }
     std::vector<uint16_t> back((size_t)px*N);
-    if(dc_decode_signal(buf,len,"depth",back.data(),back.size())){ fprintf(stderr,"decode failed\n"); return 1; }
+    if(int rc=dc_decode_signal(buf,len,"depth",back.data(),back.size())){ fprintf(stderr,"decode failed (%d)\n",rc); return 1; }
     int dMax=0; for(size_t i=0;i<back.size();i++){ int dd=abs((int)depth[i]-(int)back[i]); if(dd>dMax) dMax=dd; }
     printf("selftest: %dx%d x%d  file=%.1f KiB  bit-exact=%s (maxΔ=%d)\n",
            W,H,N,len/1024.0, dMax==0?"YES":"NO", dMax);
@@ -53,8 +81,11 @@ int main(int argc, char** argv){
     if(argc<5){ fprintf(stderr,"decodesignal <in.webm> <signal-id> <out.u16>\n"); return 2; }
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
+    // Every decode below sizes its output buffer from these; a file reporting 0 would leave the
+    // buffer empty while the decoder still has frames to write.
+    if(W<=0||H<=0||N<=0){ fprintf(stderr,"file reports empty dimensions (%dx%d x%d)\n",W,H,N); return 1; }
     std::vector<uint16_t> out((size_t)W*H*N);
-    if(dc_decode_signal(webm.data(),webm.size(),argv[3],out.data(),out.size())){ fprintf(stderr,"decode signal failed\n"); return 1; }
+    if(int rc=dc_decode_signal(webm.data(),webm.size(),argv[3],out.data(),out.size())){ fprintf(stderr,"decode signal failed (%d)\n",rc); return 1; }
     writeFile(argv[4],(uint8_t*)out.data(),out.size()*2);
     printf("decoded signal %s %dx%d x%d → %s\n",argv[3],W,H,N,argv[4]); return 0;
   }
@@ -63,32 +94,40 @@ int main(int argc, char** argv){
     if(argc<4){ fprintf(stderr,"decode <in.webm> <out.u16>\n"); return 2; }
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
+    // Every decode below sizes its output buffer from these; a file reporting 0 would leave the
+    // buffer empty while the decoder still has frames to write.
+    if(W<=0||H<=0||N<=0){ fprintf(stderr,"file reports empty dimensions (%dx%d x%d)\n",W,H,N); return 1; }
     std::vector<uint16_t> depth((size_t)W*H*N);
-    if(dc_decode_signal(webm.data(),webm.size(),"depth",depth.data(),depth.size())){ fprintf(stderr,"decode failed\n"); return 1; }
+    if(int rc=dc_decode_signal(webm.data(),webm.size(),"depth",depth.data(),depth.size())){ fprintf(stderr,"decode failed (%d)\n",rc); return 1; }
     writeFile(argv[3],(uint8_t*)depth.data(),depth.size()*2);
     printf("decoded %dx%d x%d → %s\n",W,H,N,argv[3]); return 0;
   }
 
   if(cmd=="encode"){
     if(argc<10){ fprintf(stderr,"encode <in.u16> W H N fps near far <out.webm>\n"); return 2; }
-    auto raw=readFile(argv[2]); int W=atoi(argv[3]),H=atoi(argv[4]),N=atoi(argv[5]),fps=atoi(argv[6]);
+    auto raw=readFile(argv[2]);
+    int W=posInt(argv[3],"W"),H=posInt(argv[4],"H"),N=posInt(argv[5],"N"),fps=posInt(argv[6],"fps");
     double near_=atof(argv[7]),far_=atof(argv[8]);
-    if(raw.size()!=(size_t)W*H*N*2){ fprintf(stderr,"size mismatch: %zu vs %d\n",raw.size(),W*H*N*2); return 1; }
+    size_t want=(size_t)W*H*N*2;
+    if(raw.size()!=want){ fprintf(stderr,"size mismatch: %zu vs %zu\n",raw.size(),want); return 1; }
     uint8_t* buf; size_t len;
-    if(encodeDepthOnly((const uint16_t*)raw.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed\n"); return 1; }
+    if(int rc=encodeDepthOnly((const uint16_t*)raw.data(),W,H,N,fps,near_,far_,65536,&buf,&len)){ fprintf(stderr,"encode failed (%d)\n",rc); return 1; }
     writeFile(argv[9],buf,len); printf("encoded → %s (%.1f KiB)\n",argv[9],len/1024.0); dc_free(buf); return 0;
   }
 
   if(cmd=="encodergbd"){
-    if(argc<11){ fprintf(stderr,"encodergbd <rgba.bin> <depth.u16> W H N fps near far kbps <out.webm>\n"); return 2; }
+    // The command reads through argv[11] (out.webm), so it needs 12 argv entries — guarding on 11
+    // let `argc==11` through and passed the terminating NULL to writeFile → fopen(NULL) segfault,
+    // after the whole encode had already run.
+    if(argc<12){ fprintf(stderr,"encodergbd <rgba.bin> <depth.u16> W H N fps near far kbps <out.webm>\n"); return 2; }
     auto rgb=readFile(argv[2]); auto dep=readFile(argv[3]);
-    int W=atoi(argv[4]),H=atoi(argv[5]),N=atoi(argv[6]),fps=atoi(argv[7]);
+    int W=posInt(argv[4],"W"),H=posInt(argv[5],"H"),N=posInt(argv[6],"N"),fps=posInt(argv[7],"fps");
     double near_=atof(argv[8]),far_=atof(argv[9]); int kbps=atoi(argv[10]);
     if(rgb.size()!=(size_t)W*H*N*4){ fprintf(stderr,"rgba size mismatch\n"); return 1; }
     if(dep.size()!=(size_t)W*H*N*2){ fprintf(stderr,"depth size mismatch\n"); return 1; }
     uint8_t* buf; size_t len;
     dc_signal_spec_t spec{"depth", (const uint16_t*)dep.data(), 1, near_, far_, 65536};
-    if(dc_encode_multi(rgb.data(), kbps, &spec, 1, W, H, N, fps, &buf, &len)){ fprintf(stderr,"encode failed\n"); return 1; }
+    if(int rc=dc_encode_multi(rgb.data(), kbps, &spec, 1, W, H, N, fps, &buf, &len)){ fprintf(stderr,"encode failed (%d)\n",rc); return 1; }
     writeFile(argv[11],buf,len); printf("encoded RGBD → %s (%.1f KiB)\n",argv[11],len/1024.0); dc_free(buf); return 0;
   }
 
@@ -96,9 +135,12 @@ int main(int argc, char** argv){
     if(argc<4){ fprintf(stderr,"decodergb <in.webm> <out.rgba>\n"); return 2; }
     auto webm=readFile(argv[2]); int W=0,H=0,N=0,fps=0,rgb=0,levels=0; double near_=0,far_=0;
     if(dc_probe(webm.data(),webm.size(),&W,&H,&N,&fps,&near_,&far_,&levels,&rgb)){ fprintf(stderr,"not a chromapakz file\n"); return 1; }
+    // Every decode below sizes its output buffer from these; a file reporting 0 would leave the
+    // buffer empty while the decoder still has frames to write.
+    if(W<=0||H<=0||N<=0){ fprintf(stderr,"file reports empty dimensions (%dx%d x%d)\n",W,H,N); return 1; }
     if(!rgb){ fprintf(stderr,"file has no RGB track\n"); return 1; }
     std::vector<uint8_t> out((size_t)W*H*N*4);
-    if(dc_decode_rgb(webm.data(),webm.size(),out.data(),out.size())){ fprintf(stderr,"rgb decode failed\n"); return 1; }
+    if(int rc=dc_decode_rgb(webm.data(),webm.size(),out.data(),out.size())){ fprintf(stderr,"rgb decode failed (%d)\n",rc); return 1; }
     writeFile(argv[3],out.data(),out.size()); printf("decoded RGB %dx%d x%d → %s\n",W,H,N,argv[3]); return 0;
   }
 
