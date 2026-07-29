@@ -26,6 +26,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Multimedia :: Video",
   "Topic :: Scientific/Engineering :: Image Processing",
 ]
@@ -66,8 +67,13 @@ show_missing = true
 exclude_also = ["if __name__ == .__main__.:"]
 
 [tool.cibuildwheel]
-build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
 skip = "*-musllinux* pp*"
+# 64-bit only, stated rather than inherited: cibuildwheel's `auto` has included 32-bit x86 on Linux
+# at times, and 0.2.0 shipped manylinux i686 wheels as a result. manylinux_2_28 (the modern default
+# base, replacing the EOL manylinux2014) has no i686 image at all, so pinning the intent here keeps
+# the matrix from shifting under a future cibuildwheel upgrade.
+archs = "auto64"
 build-frontend = "build"
 test-requires = "numpy pytest"
 # Whatever is in tests/ runs — no list to keep in sync. Tests that need tools absent from the

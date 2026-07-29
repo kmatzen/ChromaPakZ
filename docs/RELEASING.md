@@ -1,4 +1,4 @@
-# Releasing ChromaPakZ (CI + PyPI)
+# Releasing ChromaPakZ (CI + PyPI + npm)
 
 ## Continuous integration (`.github/workflows/ci.yml`)
 
@@ -40,20 +40,34 @@ emsdk itself requires Python ≥ 3.10), then `npm run build:wasm` and commit
 Suggested branch flow: protect `main`, do work on feature branches, open PRs, require the `ci` checks to
 pass before merge (Settings → Branches → branch protection → require status checks).
 
-## Publishing wheels to PyPI (`.github/workflows/release.yml`)
+## Publishing (`.github/workflows/release.yml`)
 
-Uses **cibuildwheel** to build self-contained wheels for CPython 3.9–3.13 (libvpx is linked
-*statically* into `_core`, so there is nothing for auditwheel/delocate to bundle), plus an sdist, then
-publishes via **Trusted Publishing** — OIDC, so there is **no API token to store**. Coverage:
+One tag publishes **both** artifacts, because they are one implementation of one format and a
+version present on one registry has to mean the same commit on the other:
+
+- **PyPI `chromapakz`** — wheels built by **cibuildwheel** for CPython 3.9–3.14 (libvpx is linked
+  *statically* into `_core`, so there is nothing for auditwheel/delocate to bundle), plus an sdist.
+  Published via **Trusted Publishing** — OIDC, so there is **no API token to store**.
+- **npm `chromapakz`** — the browser library. `src/` *is* the artifact (`exports` points straight at
+  it; there is no build step), and the committed `vp9-*.wasm` codecs ride along. Published with
+  `--provenance`, which attests the tarball to this workflow run.
 
 | Platform | Wheel tag | Runner |
 |---|---|---|
-| Linux `x86_64` | manylinux | `ubuntu-latest` |
-| Linux `aarch64` | manylinux | `ubuntu-24.04-arm` (native arm64 — no QEMU) |
+| Linux `x86_64` | `manylinux_2_28` | `ubuntu-latest` |
+| Linux `aarch64` | `manylinux_2_28` | `ubuntu-24.04-arm` (native arm64 — no QEMU) |
 | macOS `arm64`, 13.0+ | `macosx_13_0_arm64` | `macos-latest` |
 
-Not built: macOS `x86_64` (needs an Intel runner in the matrix), Windows, and musllinux — those fall
-back to a source build from the sdist.
+Not built: macOS `x86_64`, Windows, musllinux, and 32-bit Linux (`manylinux_2_28` has no i686
+image) — those fall back to a source build from the sdist. `archs = "auto64"` in `pyproject.toml`
+states the 64-bit-only intent rather than inheriting whatever cibuildwheel's `auto` means in a
+given release.
+
+**On Intel macOS**: `macos-13` was the last x86_64 image and GitHub retired it in December 2025.
+The label still *resolves*, so a job requesting it queues indefinitely instead of failing — worth
+knowing before adding it back. Building x86_64 now means cross-compiling from the arm64 runner:
+libvpx too (`install-libvpx.sh` configures for `uname -m`), and cibuildwheel cannot run its
+`test-command` against a wheel it cross-built, so those wheels would ship untested.
 
 ### One-time setup
 1. **Create the PyPI project + trusted publisher.** On https://pypi.org → your account → *Publishing*,
@@ -62,18 +76,46 @@ back to a source build from the sdist.
    - Owner: `kmatzen`  ·  Repository: `ChromaPakZ`
    - Workflow filename: `release.yml`
    - Environment name: `pypi`
-2. **Create the GitHub Environment** `pypi` (Settings → Environments → New environment). Optionally add
-   required reviewers so a human approves each publish.
-3. (Optional) Repeat with TestPyPI and a second job to dry-run first.
+2. **Create the GitHub Environments** `pypi` and `npm` (Settings → Environments → New environment).
+   Optionally add required reviewers so a human approves each publish.
+3. **Create an npm granular access token** and store it as the repository secret `NPM_TOKEN`
+   (npmjs.com → Access Tokens → Generate New Token → *Granular Access Token*). Legacy/"classic"
+   tokens, including the old *Automation* type, were removed in November 2025 — granular is the only
+   kind left. Three settings matter, and the defaults are wrong for all three:
+   - **Packages and scopes → Read and write**, applied to **All Packages**. Not *"Only select
+     packages and scopes"*: that list can only contain packages that already exist, and saving it
+     empty fails with `You must have at least one package added to this token`. Narrow it to
+     `chromapakz` after the first publish.
+   - **Bypass two-factor authentication** — check it. This replaced the Automation token type; left
+     unchecked (the default), a publish from CI is refused whenever 2FA is on.
+   - **Expiry** — granular tokens must have one. Note the date, or the next release fails at the
+     upload for a reason nothing in the log explains.
+4. **Switch to trusted publishing after the first release.** npm supports tokenless OIDC, but it is
+   configured per package and so cannot be set up before the package exists — which is the only
+   reason step 3 involves a token at all. Once `chromapakz` is on the registry: npmjs.com → the
+   package → *Settings* → *Trusted publisher*, with **Organization or user** `kmatzen`,
+   **Repository** `ChromaPakZ`, **Workflow filename** `release.yml`, **Environment** `npm` (all
+   fields are case-sensitive). Then delete the `NODE_AUTH_TOKEN` env from the `publish-npm` job and
+   revoke the secret. The `id-token: write` permission is already in place.
+5. (Optional) Repeat step 1 with TestPyPI and a second job to dry-run first.
 
 ### Cutting a release
-1. Bump `__version__` in `python/chromapakz/__init__.py` — the single source of truth; `pyproject.toml`
-   reads it via scikit-build-core's regex metadata provider. Then match it in `package.json` (npm can't
-   read it dynamically); `tests/version_consistency.mjs` fails CI if the two drift.
-2. Commit, tag, and push: `git tag v0.1.0 && git push --tags`.
-3. Create a **GitHub Release** for that tag. Publishing the release triggers `release.yml`:
-   wheels + sdist build, then the `publish` job uploads to PyPI via OIDC.
-   - `workflow_dispatch` builds the artifacts without publishing — handy for testing the wheel build.
+1. Bump `__version__` in `python/chromapakz/__init__.py` — the single source of truth;
+   `pyproject.toml` reads it via scikit-build-core's regex metadata provider. Then match it in
+   `package.json` (npm can't read it dynamically); `tests/js_version_consistency.test.mjs` fails CI
+   if the two drift. **Check the version is not already published** — PyPI and npm both refuse to
+   overwrite an existing version, and the guard below only compares the tag to the source, so a
+   re-used version gets through every job and fails at the upload.
+2. Add the release's section to `CHANGELOG.md`.
+3. **Dry-run the build**: `gh workflow run release.yml --ref <branch>`. `workflow_dispatch` builds
+   wheels and the sdist and skips both publish jobs, so the whole matrix can be proven on a branch
+   before any tag exists.
+4. Commit, tag, and push: `git tag v0.3.0 && git push --tags`.
+5. Create a **GitHub Release** for that tag. Publishing the release triggers `release.yml`:
+   the version guard, then wheels + sdist, then `publish` (PyPI, OIDC) and `publish-npm`.
+   - `publish-npm` runs the Node suite and re-checks the tarball manifest first. It has to: `ci.yml`
+     triggers on pushes to `main` and on pull requests, and a tag push matches neither, so nothing
+     else tests the JavaScript at release time.
 
 ### Notes / gotchas
 - **libvpx must be linked statically.** `_core` links `libvpx.a` and exports only its `dc_*` ABI, so it
@@ -81,15 +123,15 @@ back to a source build from the sdist.
   through the process-global scope in load order, and another extension that publishes its own libvpx
   globally then owns ours. `decord` does exactly this — it dlopens with `RTLD_GLOBAL` — so
   `import decord` before `import chromapakz` used to bind our encoder to decord's (older, ABI-incompatible)
-  libvpx. `tests/py_symbol_isolation.py` runs in `test-command` and fails the wheel if this ever regresses.
+  libvpx. `tests/test_symbol_isolation.py` runs in `test-command` and fails the wheel if this ever regresses.
 - **Linux** builds libvpx from source (pinned 1.14.1, `--enable-static --enable-pic`) via
   `scripts/install-libvpx.sh`, because EPEL's libvpx predates the VP9 encoder controls we use; a system
   libvpx is accepted only if it is ≥ 1.10 *and* ships a `libvpx.a`. Bump `VER` there to move libvpx. The
   script installs `nasm`/`yasm` (one is required to build libvpx).
 - **macOS** builds libvpx from source as well (static, PIC) and pins `MACOSX_DEPLOYMENT_TARGET` to 13.0.
   It used to use the Homebrew bottle, whose objects carry the runner's own macOS as their minimum
-  version and so forced every wheel to 15.0 — leaving macOS 13/14 users on a source build. Wheels still
-  build for the runner's arch only (arm64); add an Intel runner to the `wheels` matrix for `x86_64`.
+  version and so forced every wheel to 15.0 — leaving macOS 13/14 users on a source build. Both macOS arches are
+  built, each on its own runner (`macos-latest` for arm64, `macos-13` for x86_64).
 - **Linux aarch64** uses the native `ubuntu-24.04-arm` runner rather than QEMU — emulating a from-source
   libvpx build costs hours. If that runner label changes, update the `wheels` matrix in `release.yml`.
 - Windows wheels are not configured (libvpx on MSVC is fiddly); add a `[tool.cibuildwheel.windows]`
