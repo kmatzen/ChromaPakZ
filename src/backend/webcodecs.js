@@ -35,6 +35,7 @@ const readFnFor    = (kind) => kind==='rgba' ? readRGBA  : readLuma;
 
 export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, keyEvery=Infinity }){
   const makeFrame=makeFrameFor(kind);
+  const planeBytes=kind==='rgba' ? W*H*4 : W*H;
   // waitOut is a *queue*: a single slot would be overwritten by a second push() issued before the
   // first one's chunk arrives, leaving the first push()'s promise unresolved forever (a hang) and
   // handing the first chunk to the wrong caller.
@@ -48,6 +49,13 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
   enc.configure(cfg);
   return {
     async push(src){
+      // Mirrors the WASM backend's check so both report the same error: a short luma plane would
+      // otherwise silently encode zero-filled rows, and an oversized one would overwrite the
+      // chroma half of the I420 buffer. rgba reaches VideoFrame as raw bytes (any BufferSource);
+      // luma is copied element-wise into the I420 buffer, so there src.length is the bound.
+      const n=kind==='rgba' ? (src.byteLength ?? src.length) : src.length;
+      if(n!==planeBytes)
+        throw new Error(`webcodecs encode: ${kind} plane has ${n} bytes, expected ${planeBytes} (${W}x${H})`);
       const f=makeFrame(src, W, H, i*usPerFrame); const isKey=i===0 || i%keyEvery===0;
       enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); i++;
       if(outQ.length) return outQ.shift();
