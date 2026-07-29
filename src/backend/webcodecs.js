@@ -7,6 +7,8 @@
 //   kind:'luma' — an 8-bit Y plane (W*H), chroma filled 128. Lossless (QP=0) for signals.
 //   kind:'rgba' — RGBA (W*H*4). Lossy (bitrate) for the optional preview RGB track.
 
+import { encoderConfig, decoderConfig } from './codec-config.js';
+
 export const id = 'webcodecs';
 
 // ── frame in/out helpers ──
@@ -40,15 +42,21 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
   // first one's chunk arrives, leaving the first push()'s promise unresolved forever (a hang) and
   // handing the first chunk to the wrong caller.
   let i=0; const usPerFrame=1e6/fps; const outQ=[]; const waitOut=[];
+  let err=null, closed=false;
+  // Stash-and-reject, mirroring the decoder below. Throwing from the async error callback would
+  // surface as an unhandled exception and leave every pending push() promise unresolved — an
+  // encode that hangs rather than one that reports what went wrong.
+  const fail=e=>{ err ??= (e instanceof Error ? e : new Error(String(e)));
+    while(waitOut.length) waitOut.shift().rej(err); };
   const enc=new VideoEncoder({ output:(c)=>{ const data=new Uint8Array(c.byteLength); c.copyTo(data);
     const chunk={ key:c.type==='key', timeMs:Math.round(c.timestamp/1000), data };
-    if(waitOut.length) waitOut.shift()(chunk); else outQ.push(chunk);
-  }, error:e=>{ throw e; } });
-  const cfg={ codec:'vp09.00.10.08', width:W, height:H, framerate:fps };
-  if(lossless) cfg.bitrateMode='quantizer'; else cfg.bitrate=bitrate||2_000_000;
-  enc.configure(cfg);
+    if(waitOut.length) waitOut.shift().res(chunk); else outQ.push(chunk);
+  }, error:fail });
+  enc.configure(encoderConfig({ lossless, W, H, fps, bitrate }));
   return {
     async push(src){
+      if(err) throw err;
+      if(closed) throw new Error('track encoder closed');
       // Mirrors the WASM backend's check so both report the same error: a short luma plane would
       // otherwise silently encode zero-filled rows, and an oversized one would overwrite the
       // chroma half of the I420 buffer. rgba reaches VideoFrame as raw bytes (any BufferSource);
@@ -59,12 +67,25 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
       const f=makeFrame(src, W, H, i*usPerFrame); const isKey=i===0 || i%keyEvery===0;
       enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); i++;
       if(outQ.length) return outQ.shift();
-      return new Promise(res=>{ waitOut.push(res); });
+      let settled=false;
+      const p=new Promise((res,rej)=>{ waitOut.push({ res, rej }); })
+        .finally(()=>{ settled=true; });
+      // This interface is one chunk per frame (the WASM backend pins lag_in_frames=0 to match).
+      // An encoder that buffers instead — lag > 0 — would emit nothing until something drains it,
+      // so if the chunk hasn't arrived by the next turn, drain it. flush() is a no-op when the
+      // encoder is already caught up, and does not reset codec state or force a keyframe.
+      setTimeout(()=>{ if(!settled && !err && !closed) enc.flush().catch(fail); }, 0);
+      return p;
     },
     async close(){
-      await enc.flush(); enc.close();
+      if(closed) return [];
+      closed=true;
+      if(err) throw err;
+      try{ await enc.flush(); }catch(e){ fail(e); }
+      if(enc.state!=='closed') enc.close();
+      if(err) throw err;
       const rest=outQ.splice(0);
-      while(waitOut.length) waitOut.shift()(rest.length ? rest.shift() : null);
+      while(waitOut.length) waitOut.shift().res(rest.length ? rest.shift() : null);
       return rest;
     },
   };
@@ -80,7 +101,7 @@ export function createTrackDecoder({ kind='luma', W, H }){
     queue.push(await readFn(f,W,H));
     wake();
   } finally{ f.close(); } }, error:e=>{ err=e; wake(); } });
-  dec.configure({ codec:'vp09.00.10.08', codedWidth:W, codedHeight:H });
+  dec.configure(decoderConfig({ W, H }));
   return {
     push(fr){
       if(err) throw err;

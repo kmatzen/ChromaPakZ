@@ -61,6 +61,11 @@ not share one timeline (RGB-only frames, signal-only frames) decode identically 
 `setNearFar()` must be called before the first `addFrame()`: afterwards, already-quantized frames —
 and, when streaming, the header already sent — would no longer match the range.
 
+`push()` throws `WebMCorruptError` (exported from the package root) as soon as the bytes received so
+far cannot be valid WebM — a bad DocType, a malformed EBML descriptor, unparseable CHROMAPAKZ
+metadata. Bytes that are merely incomplete are not an error: the decoder keeps waiting. Catch it to
+tell "this stream is broken" from "this stream hasn't finished arriving".
+
 ### Track layout and `hasRgb`
 
 `createEncoder` freezes the track numbering on the first `addFrame`: RGB, when present, is track 1
