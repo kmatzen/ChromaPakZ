@@ -26,7 +26,7 @@ build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
 skip = "*-musllinux* pp*"
 build-frontend = "build"
 test-requires = "numpy"
-test-command = "python {project}/tests/roundtrip.py && python {project}/tests/cross_interop.py"
+test-command = "python {project}/tests/roundtrip.py && python {project}/tests/cross_interop.py && python {project}/tests/py_symbol_isolation.py"
 
 [tool.cibuildwheel.linux]
 before-all = "bash {project}/scripts/install-libvpx.sh"
@@ -34,7 +34,8 @@ environment = { PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkg
 
 [tool.cibuildwheel.macos]
 before-all = "brew install libvpx pkg-config ninja"
-# The Homebrew libvpx bottle is compiled for the runner's macOS, so the wheel's deployment target must
-# match it or delocate refuses to bundle the dylib. macos-latest is currently macOS 15 (arm64); bump this
-# if the runner image moves. delocate then bundles libvpx into the wheel automatically.
+# The build links Homebrew's libvpx.a statically into _core.dylib (nothing for delocate to bundle),
+# but the bottle's objects still carry the runner's macOS as their minimum version, so the wheel's
+# deployment target has to match or the link warns/fails. macos-latest is currently macOS 15
+# (arm64); bump this if the runner image moves.
 environment = { MACOSX_DEPLOYMENT_TARGET = "15.0" }
