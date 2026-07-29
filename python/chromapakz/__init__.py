@@ -81,8 +81,37 @@ def _check_inverse_depth(near, far, levels):
     """Validate an inverse-depth range (matches the JS planSignals guard) — fail loud, not NaN."""
     if not (near > 0 and far > near):
         raise ValueError(f"inverse-depth needs 0 < near < far (got near={near}, far={far})")
+    if not isinstance(levels, (int, np.integer)):
+        raise ValueError(f"levels must be an int (got {levels!r})")
     if levels < 3:
         raise ValueError(f"inverse-depth needs levels >= 3 (got {levels})")
+    # codes live in a uint16 buffer — more levels than that would silently wrap mod 65536
+    if levels > LEVELS_FULL:
+        raise ValueError(f"inverse-depth needs levels <= {LEVELS_FULL} (got {levels})")
+
+
+def _as_u16(arr, what):
+    """Contiguous uint16 view of ``arr`` — reject lossy casts instead of wrapping mod 65536."""
+    a = np.asarray(arr)
+    if a.dtype != np.uint16:
+        if not np.issubdtype(a.dtype, np.integer):
+            raise ValueError(f"{what} must hold integer uint16 codes (got dtype {a.dtype}) — "
+                             "quantize float depth with quantize_inverse() first")
+        if a.size and not (0 <= int(a.min()) and int(a.max()) <= 65535):
+            raise ValueError(f"{what} values must be in [0, 65535] (got [{a.min()}, {a.max()}])")
+    return np.ascontiguousarray(a, dtype=np.uint16)
+
+
+def _as_u8(arr, what):
+    """Contiguous uint8 view of ``arr`` — reject lossy casts instead of wrapping mod 256."""
+    a = np.asarray(arr)
+    if a.dtype != np.uint8:
+        if not np.issubdtype(a.dtype, np.integer):
+            raise ValueError(f"{what} must hold integer 0-255 samples (got dtype {a.dtype}) — "
+                             "scale float colour to uint8 first")
+        if a.size and not (0 <= int(a.min()) and int(a.max()) <= 255):
+            raise ValueError(f"{what} values must be in [0, 255] (got [{a.min()}, {a.max()}])")
+    return np.ascontiguousarray(a, dtype=np.uint8)
 
 
 def inverse_depth_spec(near, far, levels=LEVELS_FULL):
@@ -92,7 +121,11 @@ def inverse_depth_spec(near, far, levels=LEVELS_FULL):
 
 
 def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
-    """Encode lossless uint16 signals (+ optional RGB) to WebM bytes."""
+    """Encode lossless uint16 signals (+ optional RGB) to WebM bytes.
+
+    Signals must be integer codes in [0, 65535] and rgb uint8 RGBA — a lossy cast
+    (float depth, out-of-range ints) is an error, not a silent wraparound.
+    """
     signals = dict(signals or {})
     if not signals and rgb is None:
         raise ValueError("need at least one signal or rgb")
@@ -100,13 +133,10 @@ def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
     ids = list(signals.keys())
     arrays = []
     dims = None
-    if not ids:
-        if rgb is None:
-            raise ValueError("need at least one signal or rgb")
-        N, H, W = rgb.shape[:3]
-    else:
+    N = H = W = None
+    if ids:
         for sid in ids:
-            arr = np.ascontiguousarray(signals[sid], dtype=np.uint16)
+            arr = _as_u16(signals[sid], f"signal {sid!r}")
             if arr.ndim != 3:
                 raise ValueError(f"signal {sid!r} must be (N, H, W)")
             if dims is None:
@@ -118,7 +148,7 @@ def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
 
     rgb_p = u8p()
     if rgb is not None:
-        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        rgb = _as_u8(rgb, "rgb")
         if rgb.ndim != 4 or rgb.shape[3] != 4:
             raise ValueError("rgb must be (N, H, W, 4) RGBA")
         if ids and rgb.shape[:3] != (N, H, W):
@@ -230,7 +260,7 @@ def quantize_inverse(z, near=0.2, far=10.0, levels=LEVELS_FULL):
 def dequantize_inverse(d, near=0.2, far=10.0, levels=LEVELS_FULL):
     """uint16 inverse-depth codes -> float32 metric depth (invalid -> NaN)."""
     _check_inverse_depth(near, far, levels)
-    d = np.ascontiguousarray(d, dtype=np.uint16)
+    d = _as_u16(d, "codes")
     out = np.empty(d.shape, dtype=np.float32)
     _lib.dc_dequantize_inverse(d.ctypes.data_as(u16p), d.size, near, far, levels, out.ctypes.data_as(f32p))
     return out

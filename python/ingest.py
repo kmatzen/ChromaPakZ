@@ -132,17 +132,21 @@ def _load_video_rgba(path):
 def encode_clip(depth=None, rgb=None, near=None, far=None, fps=30, rgb_kbps=2000, levels=dc.LEVELS_FULL):
     """Encode depth (float or uint16, (N,H,W)) and/or rgb ((N,H,W,3|4) uint8) to webm bytes.
     Returns (data, stats). Float depth is inverse-depth quantized (auto near/far if None).
-    levels = inverse-depth quantization steps (default 65536 = full 16-bit; fewer = smaller files)."""
-    codes = None
+    levels = inverse-depth quantization steps (default 65536 = full 16-bit; fewer = smaller files).
+    Integer depth is carried as-is; it only gets an inverse-depth spec if you pass near *and*
+    far — we can't invent the range the codes were quantized with."""
+    codes = quant = None
     if depth is not None:
         depth = np.asarray(depth)
         if np.issubdtype(depth.dtype, np.floating):
             if near is None or far is None:
                 near, far = auto_near_far(depth)
             codes = to_codes(depth, near, far, levels)
+            quant = dc.inverse_depth_spec(near, far, levels)
         else:
-            codes = depth.astype(np.uint16)
-            near, far = near or 0.2, far or 10.0
+            codes = dc._as_u16(depth, "depth")
+            if near is not None and far is not None:
+                quant = dc.inverse_depth_spec(near, far, levels)
     rgba = None
     if rgb is not None:
         rgb = np.asarray(rgb, np.uint8)
@@ -154,7 +158,7 @@ def encode_clip(depth=None, rgb=None, near=None, far=None, fps=30, rgb_kbps=2000
 
     data = dc.encode(
         {"depth": codes} if codes is not None else {},
-        specs={"depth": dc.inverse_depth_spec(near or 0.2, far or 10.0, levels)} if codes is not None else None,
+        specs={"depth": quant} if quant is not None else None,
         rgb=rgba,
         fps=fps,
         rgb_kbps=rgb_kbps,
@@ -162,8 +166,10 @@ def encode_clip(depth=None, rgb=None, near=None, far=None, fps=30, rgb_kbps=2000
 
     shape = (codes if codes is not None else rgba).shape
     N, H, W = shape[0], shape[1], shape[2]
-    stats = {"bytes": len(data), "N": N, "W": W, "H": H, "near": near, "far": far, "levels": levels,
-             "fps": fps, "bpp_total": len(data) * 8 / (W * H * N)}
+    stats = {"bytes": len(data), "N": N, "W": W, "H": H, "fps": fps,
+             "near": near if quant else None, "far": far if quant else None,
+             "levels": levels if quant else None,
+             "bpp_total": len(data) * 8 / (W * H * N)}
     if codes is not None:
         stats["valid_pct"] = 100.0 * np.count_nonzero(codes) / codes.size
     stats["tracks"] = {}
@@ -176,9 +182,12 @@ def print_report(stats):
     print(f"  {stats['W']}×{stats['H']} × {stats['N']} frames @ {stats['fps']}fps   "
           f"file={stats['bytes']/1024:.1f} KiB   total={stats['bpp_total']:.3f} bpp")
     if "valid_pct" in stats:
-        bits = (stats["levels"]).bit_length() - 1
-        print(f"  near={stats['near']:.4g} far={stats['far']:.4g}   levels={stats['levels']} (~{bits}-bit)"
-              f"   valid depth={stats['valid_pct']:.1f}%")
+        if stats["levels"] is not None:
+            bits = (stats["levels"]).bit_length() - 1
+            quant = f"near={stats['near']:.4g} far={stats['far']:.4g}   levels={stats['levels']} (~{bits}-bit)"
+        else:
+            quant = "codes carried as-is (no quant spec — pass --near/--far to record one)"
+        print(f"  {quant}   valid depth={stats['valid_pct']:.1f}%")
     print("  track  name        frames    bytes      bpp")
     for num, t in stats["tracks"].items():
         print(f"  {num:<6} {t['name']:<11} {t['frames']:>4}   {t['bytes']:>9}   {t['bpp']:.3f}")
@@ -194,13 +203,16 @@ def _main(argv):
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--rgb-kbps", type=int, default=2000)
     ap.add_argument("--depth-bits", type=int, default=16,
-                    help="inverse-depth precision (default 16 = full); fewer = smaller files, matches sensor noise")
+                    help="inverse-depth precision, 2-16 (default 16 = full); fewer = smaller files, "
+                         "matches sensor noise")
     ap.add_argument("--raw-dtype", help="for raw depth: float32|uint16")
     ap.add_argument("--raw-shape", help="for raw depth: HxW e.g. 480x640")
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--verify", action="store_true", help="decode back and assert depth bit-exact")
     a = ap.parse_args(argv)
+    if not 2 <= a.depth_bits <= 16:
+        ap.error(f"--depth-bits must be 2-16 (got {a.depth_bits}); codes are stored in uint16")
 
     depth = rgb = None
     if a.depth:
@@ -216,7 +228,7 @@ def _main(argv):
     if a.report:
         print_report(stats)
     if a.verify and depth is not None:
-        codes = depth.astype(np.uint16) if not np.issubdtype(depth.dtype, np.floating) \
+        codes = dc._as_u16(depth, "depth") if not np.issubdtype(depth.dtype, np.floating) \
             else to_codes(depth, stats["near"], stats["far"], levels)
         back = dc.decode_signal(data, "depth")
         ok = np.array_equal(back, codes)

@@ -92,8 +92,12 @@ depth = cz.decode_signal(data, "depth")
 | `encode(signals, specs=, rgb=, …)` | Multi-signal encode |
 | `decode(data, signal_ids=)` | Decode signals + optional RGB |
 | `decode_signal(data, id)` | One `(N,H,W)` uint16 plane |
-| `inverse_depth_spec(near, far, levels)` | Spec dict for depth signal |
+| `inverse_depth_spec(near, far, levels)` | Spec dict for depth signal (`3 <= levels <= 65536`) |
 | `parse_metadata(data)` | Full v2 JSON |
+
+Signals must be integer arrays inside `[0, 65535]` and `rgb` uint8 RGBA. Lossy inputs — metric
+float depth, `int32` above 65535, float RGB — raise `ValueError` rather than wrapping silently;
+quantize float depth with `quantize_inverse()` first.
 
 ---
 
