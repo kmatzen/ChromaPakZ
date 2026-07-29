@@ -29,9 +29,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      # Stage only what the demo actually loads. Publishing the repo root put every file in the
+      # repository — tests, fixtures, experiment scratch — on a public URL to serve one page.
+      - name: Stage the demo
+        run: |
+          mkdir -p _site/demo _site/docs
+          cp -r src _site/src
+          cp -r demo/. _site/demo/
+          cp README.md LICENSE _site/
+          cp docs/API.md docs/FORMAT.md _site/docs/ 2>/dev/null || true
+          printf '<meta http-equiv="refresh" content="0; url=./demo/">\n' > _site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
-          # Serve the repo root so demo/ can reach ../src/ and ../docs/ assets.
-          path: .
+          path: _site
       - id: deployment
         uses: actions/deploy-pages@v4
