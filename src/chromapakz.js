@@ -52,35 +52,49 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
   const sigDec={}; // id → { hi, lo }
   const signals=meta.signals;
 
+  // readFrame() claims a slot, pushes into stateful VP9 decoders and awaits their output, so
+  // overlapping calls interleave pushes and returns against a decoder that must see frames in
+  // order. (Unlike the encoder's getSigEnc, the lazy decoder construction below is safe — it
+  // happens synchronously after the shared getBackend() await — but the push/next interleaving
+  // is not.) Serializing in call order also makes concurrent readFrame()s resolve in that order.
+  let opQueue=Promise.resolve();
+  function serialize(fn){
+    const run=opQueue.then(fn, fn);
+    opQueue=run.then(()=>{}, ()=>{});
+    return run;
+  }
+
+  async function readFrameImpl(){
+    if(shut) throw new Error('decoder closed');
+    if(i>=blocks.length) return null;
+    const slot=blocks[i++];
+    const out={ rgb: null, signals: {} };
+    const be=await getBackend();
+
+    if(slot.rgb){
+      if(!rgbDec.dec) rgbDec.dec=be.createTrackDecoder({ kind:'rgba', W, H });
+      rgbDec.dec.push(slot.rgb);
+      out.rgb=await rgbDec.dec.next();
+    }
+
+    for(const s of signals){
+      const hiKey=`${s.id}:hi`, loKey=`${s.id}:lo`;
+      if(!slot[hiKey]) continue;
+      if(!sigDec[s.id]) sigDec[s.id]={ hi: be.createTrackDecoder({ kind:'luma', W, H }), lo: be.createTrackDecoder({ kind:'luma', W, H }) };
+      sigDec[s.id].hi.push(slot[hiKey]);
+      sigDec[s.id].lo.push(slot[loKey]);
+      const hi=await sigDec[s.id].hi.next();
+      const lo=await sigDec[s.id].lo.next();
+      if(hi && lo) out.signals[s.id]=materializeSignal(triFoldUnpack(hi, lo), s);
+    }
+    return out;
+  }
+
   return {
     get frameCount(){ return blocks.length; },
     get meta(){ return meta; },
 
-    async readFrame(){
-      if(shut) throw new Error('decoder closed');
-      if(i>=blocks.length) return null;
-      const slot=blocks[i++];
-      const out={ rgb: null, signals: {} };
-      const be=await getBackend();
-
-      if(slot.rgb){
-        if(!rgbDec.dec) rgbDec.dec=be.createTrackDecoder({ kind:'rgba', W, H });
-        rgbDec.dec.push(slot.rgb);
-        out.rgb=await rgbDec.dec.next();
-      }
-
-      for(const s of signals){
-        const hiKey=`${s.id}:hi`, loKey=`${s.id}:lo`;
-        if(!slot[hiKey]) continue;
-        if(!sigDec[s.id]) sigDec[s.id]={ hi: be.createTrackDecoder({ kind:'luma', W, H }), lo: be.createTrackDecoder({ kind:'luma', W, H }) };
-        sigDec[s.id].hi.push(slot[hiKey]);
-        sigDec[s.id].lo.push(slot[loKey]);
-        const hi=await sigDec[s.id].hi.next();
-        const lo=await sigDec[s.id].lo.next();
-        if(hi && lo) out.signals[s.id]=materializeSignal(triFoldUnpack(hi, lo), s);
-      }
-      return out;
-    },
+    readFrame(){ return serialize(readFrameImpl); },
 
     async close(){
       if(shut) return;
@@ -110,8 +124,9 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   const specList=resolveSignalSpecs(signals);
   let n=0, hasRgb=false;
   let signalPlan=null;
-  let rgbEnc=null;
-  const sigEnc={}; // id → { hi, lo }
+  let rgbEnc=null, rgbEncP=null;
+  const sigEnc={};  // id → { hi, lo }          (resolved encoders; read synchronously by finish())
+  const sigEncP={}; // id → Promise<{ hi, lo }> (in-flight guard, so concurrent callers share one)
   let streamMux=null, byteParts=null;
   const muxFrames=[];
   const rgbKeyEvery=Math.max(1, Math.round(fps));
@@ -137,15 +152,38 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     if(onChunk) onChunk(streamMux.header);
   }
 
-  async function getSigEnc(id){
-    if(!sigEnc[id]){
+  // Memoize on the *promise*, not the resolved value: `if(!sigEnc[id]) { await … }` lets every
+  // concurrent caller past the guard before any of them assigns, so each would build its own pair
+  // of track encoders and encode its frame as that encoder's frame 0 — every block a keyframe at
+  // t=0, and all but the last encoder leaked unclosed.
+  function getSigEnc(id){
+    return sigEncP[id] ??= (async()=>{
       const be=await losslessBackend();
-      sigEnc[id]={
+      return sigEnc[id]={
         hi: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps }),
         lo: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps }),
       };
-    }
-    return sigEnc[id];
+    })();
+  }
+
+  function getRgbEnc(){
+    return rgbEncP ??= (async()=>{
+      const be=await lossyBackend();
+      return rgbEnc=be.createTrackEncoder({
+        kind:'rgba', lossless:false, W, H, fps, bitrate:rgbKbps, keyEvery:rgbKeyEvery });
+    })();
+  }
+
+  // addFrame()/finish() mutate encoder state across await points and drive stateful VP9 encoders
+  // that require frames in order, so they must never interleave. Callers that fan out — the
+  // natural `await Promise.all(frames.map(f => enc.addFrame(f)))` — are serialized here in call
+  // order instead of corrupting the stream. Video encoding is inherently sequential, so this
+  // costs no parallelism that was ever available.
+  let opQueue=Promise.resolve();
+  function serialize(fn){
+    const run=opQueue.then(fn, fn);      // run even if a previous call rejected
+    opQueue=run.then(()=>{}, ()=>{});    // a rejection must not poison later calls
+    return run;
   }
 
   function emitMuxFrames(writes){
@@ -174,61 +212,63 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
       signalPlan=null;
     },
 
-    async addFrame(frame){
-      const writes=[];
-      if(frame.rgb){
-        if(!rgbEnc){ const be=await lossyBackend();
-          rgbEnc=be.createTrackEncoder({ kind:'rgba', lossless:false, W, H, fps, bitrate:rgbKbps, keyEvery:rgbKeyEvery }); }
-        hasRgb=true;
-      }
-      ensurePlan();
-      const inputs=collectFrameInputs(frame, signalPlan);
-      let anySignal=false;
-      for(const s of signalPlan){
-        const u16=u16FromFramePayload(inputs[s.id], s);
-        if(!u16) continue;
-        anySignal=true;
-        const enc=await getSigEnc(s.id);
-        const { hi, lo }=triFoldPack(u16);
-        const chi=await enc.hi.push(hi), clo=await enc.lo.push(lo);
-        writes.push({ track:s.tracks.hi, ...chi }, { track:s.tracks.lo, ...clo });
-      }
-      if(!frame.rgb && !anySignal) throw new Error('addFrame: pass rgb and/or signals');
-      if(onChunk) ensureStreamMux();
-
-      if(frame.rgb){
-        const c=await rgbEnc.push(frame.rgb);
-        writes.push({ track:1, ...c });
-      }
-      if(onChunk) emitMuxFrames(writes);
-      else muxFrames.push(...writes);
-      n++;
-    },
-
-    async finish(){
-      if(!n) throw new Error('no frames encoded');
-      ensurePlan();
-      if(onChunk){
-        ensureStreamMux();
-        const tailWrites=[];
-        if(hasRgb) (await rgbEnc.close()).forEach(c=>tailWrites.push({ track:1, ...c }));
-        for(const s of signalPlan){
-          if(!sigEnc[s.id]) continue;
-          (await sigEnc[s.id].hi.close()).forEach(c=>tailWrites.push({ track:s.tracks.hi, ...c }));
-          (await sigEnc[s.id].lo.close()).forEach(c=>tailWrites.push({ track:s.tracks.lo, ...c }));
-        }
-        emitMuxFrames(tailWrites);
-        const tail=streamMux.finish(Math.round(n*1000/fps));
-        if(tail.length){ byteParts.push(tail); onChunk(tail); }
-        return concatChunks(byteParts);
-      }
-      if(hasRgb) await rgbEnc.close();
-      for(const s of signalPlan){ if(sigEnc[s.id]){ await sigEnc[s.id].hi.close(); await sigEnc[s.id].lo.close(); } }
-      const tracks=buildTracksFromPlan(W, H, hasRgb, signalPlan);
-      const metadata=buildFileMetadata({ W, H, fps, n, hasRgb, signals: signalPlan });
-      return mux({ tracks, frames:muxFrames, metadata, durationMs: Math.round(n*1000/fps) });
-    },
+    addFrame(frame){ return serialize(()=>addFrameImpl(frame)); },
+    finish(){ return serialize(()=>finishImpl()); },
   };
+
+  async function addFrameImpl(frame){
+    const writes=[];
+    if(frame.rgb){
+      await getRgbEnc();
+      hasRgb=true;
+    }
+    ensurePlan();
+    const inputs=collectFrameInputs(frame, signalPlan);
+    let anySignal=false;
+    for(const s of signalPlan){
+      const u16=u16FromFramePayload(inputs[s.id], s);
+      if(!u16) continue;
+      anySignal=true;
+      const enc=await getSigEnc(s.id);
+      const { hi, lo }=triFoldPack(u16);
+      const chi=await enc.hi.push(hi), clo=await enc.lo.push(lo);
+      writes.push({ track:s.tracks.hi, ...chi }, { track:s.tracks.lo, ...clo });
+    }
+    if(!frame.rgb && !anySignal) throw new Error('addFrame: pass rgb and/or signals');
+    if(onChunk) ensureStreamMux();
+
+    if(frame.rgb){
+      const c=await rgbEnc.push(frame.rgb);
+      writes.push({ track:1, ...c });
+    }
+    if(onChunk) emitMuxFrames(writes);
+    else muxFrames.push(...writes);
+    n++;
+  }
+
+  async function finishImpl(){
+    if(!n) throw new Error('no frames encoded');
+    ensurePlan();
+    if(onChunk){
+      ensureStreamMux();
+      const tailWrites=[];
+      if(hasRgb) (await rgbEnc.close()).forEach(c=>tailWrites.push({ track:1, ...c }));
+      for(const s of signalPlan){
+        if(!sigEnc[s.id]) continue;
+        (await sigEnc[s.id].hi.close()).forEach(c=>tailWrites.push({ track:s.tracks.hi, ...c }));
+        (await sigEnc[s.id].lo.close()).forEach(c=>tailWrites.push({ track:s.tracks.lo, ...c }));
+      }
+      emitMuxFrames(tailWrites);
+      const tailBytes=streamMux.finish(Math.round(n*1000/fps));
+      if(tailBytes.length){ byteParts.push(tailBytes); onChunk(tailBytes); }
+      return concatChunks(byteParts);
+    }
+    if(hasRgb) await rgbEnc.close();
+    for(const s of signalPlan){ if(sigEnc[s.id]){ await sigEnc[s.id].hi.close(); await sigEnc[s.id].lo.close(); } }
+    const tracks=buildTracksFromPlan(W, H, hasRgb, signalPlan);
+    const metadata=buildFileMetadata({ W, H, fps, n, hasRgb, signals: signalPlan });
+    return mux({ tracks, frames:muxFrames, metadata, durationMs: Math.round(n*1000/fps) });
+  }
 }
 
 export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000, onChunk=null }){
@@ -282,9 +322,10 @@ function createNetworkDecoder({ backend='auto' }={}){
   const slotPending=new Map();
   const blockQueue=[];
   let streamDone=false, shut=false;
-  let core=null, waitBlock=null;
+  let core=null;
+  const waitBlock=[];   // a queue, so overlapping readFrame()s can't strand each other's waiter
 
-  function notify(){ if(waitBlock){ const w=waitBlock; waitBlock=null; w(); } }
+  function notify(){ while(waitBlock.length) waitBlock.shift()(); }
 
   function onBlock(block){
     if(!meta) return;
@@ -340,7 +381,7 @@ function createNetworkDecoder({ backend='auto' }={}){
       if(!meta) throw new Error('waiting for metadata');
       while(!core && blockQueue.length===0){
         if(streamDone) return null;
-        await new Promise(res=>{ waitBlock=res; });
+        await new Promise(res=>{ waitBlock.push(res); });
       }
       if(!core && blockQueue.length) core=makeFrameReader({ meta, W, H, blocks:blockQueue, getBackend });
       if(!core) return null;

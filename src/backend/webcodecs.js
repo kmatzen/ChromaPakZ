@@ -35,10 +35,13 @@ const readFnFor    = (kind) => kind==='rgba' ? readRGBA  : readLuma;
 
 export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, keyEvery=Infinity }){
   const makeFrame=makeFrameFor(kind);
-  let i=0; const usPerFrame=1e6/fps; const outQ=[]; let waitOut=null;
+  // waitOut is a *queue*: a single slot would be overwritten by a second push() issued before the
+  // first one's chunk arrives, leaving the first push()'s promise unresolved forever (a hang) and
+  // handing the first chunk to the wrong caller.
+  let i=0; const usPerFrame=1e6/fps; const outQ=[]; const waitOut=[];
   const enc=new VideoEncoder({ output:(c)=>{ const data=new Uint8Array(c.byteLength); c.copyTo(data);
     const chunk={ key:c.type==='key', timeMs:Math.round(c.timestamp/1000), data };
-    if(waitOut){ const w=waitOut; waitOut=null; w(chunk); } else outQ.push(chunk);
+    if(waitOut.length) waitOut.shift()(chunk); else outQ.push(chunk);
   }, error:e=>{ throw e; } });
   const cfg={ codec:'vp09.00.10.08', width:W, height:H, framerate:fps };
   if(lossless) cfg.bitrateMode='quantizer'; else cfg.bitrate=bitrate||2_000_000;
@@ -48,12 +51,12 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
       const f=makeFrame(src, W, H, i*usPerFrame); const isKey=i===0 || i%keyEvery===0;
       enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); i++;
       if(outQ.length) return outQ.shift();
-      return new Promise(res=>{ waitOut=res; });
+      return new Promise(res=>{ waitOut.push(res); });
     },
     async close(){
       await enc.flush(); enc.close();
       const rest=outQ.splice(0);
-      if(waitOut){ const w=waitOut; waitOut=null; if(rest.length) w(rest.shift()); else w(null); }
+      while(waitOut.length) waitOut.shift()(rest.length ? rest.shift() : null);
       return rest;
     },
   };
@@ -61,11 +64,14 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
 
 export function createTrackDecoder({ kind='luma', W, H }){
   const readFn=readFnFor(kind);
-  const queue=[]; let wait=null, err=null, closed=false;
+  // `wait` is a queue for the same reason as the encoder's waitOut: a lone slot loses every
+  // waiter but the last when next() is called more than once before output arrives.
+  const queue=[]; const wait=[]; let err=null, closed=false;
+  const wake=()=>{ while(wait.length) wait.shift()(); };
   const dec=new VideoDecoder({ output:async f=>{ try{
     queue.push(await readFn(f,W,H));
-    if(wait){ const w=wait; wait=null; w(); }
-  } finally{ f.close(); } }, error:e=>{ err=e; if(wait){ const w=wait; wait=null; w(); } } });
+    wake();
+  } finally{ f.close(); } }, error:e=>{ err=e; wake(); } });
   dec.configure({ codec:'vp09.00.10.08', codedWidth:W, codedHeight:H });
   return {
     push(fr){
@@ -77,11 +83,10 @@ export function createTrackDecoder({ kind='luma', W, H }){
       if(err) throw err;
       if(queue.length) return queue.shift();
       if(closed) return null;
-      await new Promise(res=>{ wait=res; });
+      await new Promise(res=>{ wait.push(res); });
       if(err) throw err;
       return queue.length ? queue.shift() : null;
     },
-    async close(){ await dec.flush(); dec.close(); closed=true;
-      if(wait){ wait(); wait=null; } },
+    async close(){ await dec.flush(); dec.close(); closed=true; wake(); },
   };
 }

@@ -14,15 +14,20 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
   const kbps = Math.max(1, Math.round((bitrate||2_000_000)/1000));   // bitrate is bps; C wants kbps
   const keyEveryC = Number.isFinite(keyEvery) ? keyEvery : 0;        // 0 ⇒ keyframe on frame 0 only
   const planeBytes = cKind ? W*H*4 : W*H;
-  let mod=null, handle=0, inPtr=0, lenPtr=0, keyPtr=0, tsPtr=0, closed=false;
+  let mod=null, handle=0, inPtr=0, lenPtr=0, keyPtr=0, tsPtr=0, closed=false, readyP=null;
 
-  async function ensure(){
-    if(mod) return;
-    mod = await getModule();
-    handle = mod._dcvp9_enc_new(W, H, fps, cKind, kbps, keyEveryC);
-    if(!handle) throw new Error('dcvp9_enc_new failed');
-    inPtr = mod._malloc(planeBytes);
-    lenPtr = mod._malloc(4); keyPtr = mod._malloc(4); tsPtr = mod._malloc(4);
+  // Memoized on the promise: guarding with `if(mod) return` lets concurrent push()es all get past
+  // the check before any of them assigns, so each would allocate its own libvpx encoder and heap
+  // buffers and clobber `handle`/`inPtr`. close() frees only the survivor, leaking the rest.
+  function ensure(){
+    return readyP ??= (async()=>{
+      const m = await getModule();
+      const h = m._dcvp9_enc_new(W, H, fps, cKind, kbps, keyEveryC);
+      if(!h) throw new Error('dcvp9_enc_new failed');
+      mod = m; handle = h;
+      inPtr = m._malloc(planeBytes);
+      lenPtr = m._malloc(4); keyPtr = m._malloc(4); tsPtr = m._malloc(4);
+    })();
   }
   function pullOne(){
     const ptr = mod._dcvp9_enc_next(handle, lenPtr, keyPtr, tsPtr);
