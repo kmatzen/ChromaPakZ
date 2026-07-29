@@ -40,13 +40,15 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-24.04-arm is a native arm64 runner — manylinux aarch64 wheels without QEMU
-        # emulation (which would make the from-source libvpx build take hours).
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        # emulation (which would make the from-source libvpx build take hours). macos-13 is the
+        # Intel runner; macos-latest is arm64, and cross-building x86_64 from it would mean
+        # cross-building libvpx too, which scripts/install-libvpx.sh configures for `uname -m`.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v4.1
         # libvpx provisioning + test command come from [tool.cibuildwheel] in pyproject.toml
       - uses: actions/upload-artifact@v4
         with:
@@ -88,3 +90,43 @@ jobs:
           merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@release/v1
         # No password/token: PyPI Trusted Publishing authenticates via the OIDC token above.
+
+  # The browser library is the other half of a release: src/ *is* the shipped artifact (no build
+  # step — package.json points `exports` straight at it), and the committed vp9-*.wasm ride along.
+  # Nothing else validates it at tag time: ci.yml runs on pushes to main and on PRs, and a tag
+  # matches neither, so the suite runs here before anything reaches the registry.
+  publish-npm:
+    name: publish to npm
+    needs: [version-guard]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: npm                  # configure a GitHub Environment named "npm"
+    permissions:
+      contents: read
+      id-token: write                 # provenance attestation (links the tarball to this workflow)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Node suite
+        run: npm test
+      - name: The tarball carries what it claims
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const f = require("./pack.json")[0].files.map(x => x.path);
+            // The WASM codecs are committed binaries, not build outputs — a `files` entry that
+            // stopped matching them would ship a package that cannot decode on Firefox/Safari.
+            const need = ["src/chromapakz.js", "src/webm.js", "src/signals.js",
+                          "src/backend/wasm/vp9-decode.wasm", "src/backend/wasm/vp9-encode.wasm",
+                          "README.md", "LICENSE"];
+            const missing = need.filter(n => !f.includes(n));
+            if (missing.length) { console.error("missing from npm tarball:", missing); process.exit(1); }
+            console.log("npm tarball carries " + f.length + " files, all required entries present");
+          '
+      - name: npm publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
