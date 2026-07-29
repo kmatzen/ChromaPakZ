@@ -121,8 +121,7 @@ export function mux({ tracks, frames, metadata, durationMs=0, timestampScaleNs=1
 
 // ── incremental mux (network streaming) ──
 /** Emit header immediately, then cluster bytes per frame; Cues on finish(). */
-export function createStreamMux({ tracks, metadata, durationMs=0, timestampScaleNs=1_000_000, clusterSpanMs=30_000,
-  unknownSegmentSize=true }){
+export function createStreamMux({ tracks, metadata, durationMs=0, timestampScaleNs=1_000_000, clusterSpanMs=30_000 }){
   const cueTrack=cueTrackOf(tracks);
   const pre=buildPre({ tracks, metadata, durationMs, timestampScaleNs });
   let segOffset=pre.length;
@@ -137,9 +136,10 @@ export function createStreamMux({ tracks, metadata, durationMs=0, timestampScale
     return body;
   };
 
-  const header=unknownSegmentSize
-    ? cat([ebmlHeader(), cat([idBytes(ID.Segment), vintUnknown(8), pre])])
-    : cat([ebmlHeader(), el(ID.Segment, pre)]);   // fixed-size segment: caller must finish() before read
+  // The Segment size is always "unknown": clusters are appended after the header is handed to the
+  // caller, so no finite size written here could cover them — a fixed size would place every later
+  // cluster outside the Segment, where demuxers (ours included) never look.
+  const header=cat([ebmlHeader(), cat([idBytes(ID.Segment), vintUnknown(8), pre])]);
 
   return {
     /** File prefix: EBML + Segment header (Info, Tracks, Tags). */
@@ -215,17 +215,27 @@ function walkTags(buf, out, s, e){
       if(name==='CHROMAPAKZ') out.metadata=JSON.parse(val); }
 }
 
+// One SimpleBlock payload [s,e) → a frame. `base` is the enclosing cluster's timestamp.
+// Returns null for a payload too short to hold track vint + 2-byte offset + flags.
+function readSimpleBlock(buf, s, e, base){
+  if(e-s < 4) return null;
+  let p=s;
+  const tv=readSize(buf,p); const track=tv.size; p+=tv.len;
+  if(p+3 > e) return null;
+  const dv=new DataView(buf.buffer, buf.byteOffset+p, 2); const rel=dv.getInt16(0,false); p+=2;
+  const flags=buf[p]; p+=1;
+  return { track, key:!!(flags&0x80), timeMs:base+rel, data:new Uint8Array(buf.subarray(p,e)) };
+}
+
 function walkCluster(buf, tracks, outFrames, s, e){
   let base=0; const blocks=[];
   for(const c of children(buf,s,e)){
     if(c.id===ID.Timestamp) base=readUint(buf,c.dStart,c.dEnd);
-    else if(c.id===ID.SimpleBlock){ let p=c.dStart;
-      const tv=readSize(buf,p); const track=tv.size; p+=tv.len;
-      const dv=new DataView(buf.buffer, buf.byteOffset+p, 2); const rel=dv.getInt16(0,false); p+=2;
-      const flags=buf[p]; p+=1; const data=buf.subarray(p,c.dEnd);
-      const fr={track, key:!!(flags&0x80), timeMs:base+rel, data: new Uint8Array(data)};
+    else if(c.id===ID.SimpleBlock){
+      const fr=readSimpleBlock(buf, c.dStart, c.dEnd, base);
+      if(!fr) continue;
       blocks.push(fr); outFrames.push(fr);
-      if(tracks[track]) tracks[track].frames.push(fr); }
+      if(tracks[fr.track]) tracks[fr.track].frames.push(fr); }
   }
   return blocks;
 }
@@ -241,34 +251,112 @@ export function demux(buf){
 }
 
 // ── incremental demux (network streaming) ──
-/** Push byte chunks; metadata as soon as Tags parse; blocks on finish() (avoids partial-cluster VP9). */
-export function createStreamDemux(){
-  let buf=new Uint8Array(0);
-  let metaSent=false, lastBlocks=0, ended=false;
+const MORE=Symbol('need more bytes'), BAD=Symbol('malformed');
+const BlockGroup=0xA0;
+// Masters we parse child-by-child rather than as one buffered blob: everything else must be
+// complete before it is handled, so descending here is what bounds retention to one element.
+const DESCEND=new Set([ID.Segment, ID.Cluster]);
+// A Cluster written with unknown size ends at the first ID that cannot be one of its children.
+const CLUSTER_CHILD=new Set([ID.Timestamp, ID.SimpleBlock, BlockGroup]);
 
-  function tryDemux(){ try{ return demux(buf); }catch{ return null; } }
+/** Read one element header at `p` without requiring the payload; MORE/BAD when it can't be read. */
+function peekElement(buf, p, end){
+  if(p>=end) return MORE;
+  const first=buf[p];
+  let L=1, m=0x80; while(L<=4 && !(first&m)){ m>>=1; L++; }
+  if(L>4) return BAD;                                   // no valid EBML ID is longer than 4 bytes
+  if(p+L>end) return MORE;
+  let id=0; for(let k=0;k<L;k++) id=id*256+buf[p+k];
+  const q=p+L;
+  if(q>=end) return MORE;
+  const f2=buf[q];
+  let SL=1, m2=0x80; while(SL<=8 && !(f2&m2)){ m2>>=1; SL++; }
+  if(SL>8) return BAD;
+  if(q+SL>end) return MORE;
+  let v=f2&(m2-1); for(let k=1;k<SL;k++) v=v*256+buf[q+k];
+  const unknown=v===(2**(7*SL))-1;
+  return { id, hdrLen:L+SL, size:unknown?0:v, unknown };
+}
+
+/**
+ * Push byte chunks; each returns the events that just became parseable — 'metadata' as soon as the
+ * Tags element completes, then a 'block' per SimpleBlock, as it arrives. Only fully-buffered
+ * elements are handled, so a block event always carries a complete VP9 frame.
+ *
+ * Bytes are parsed once and released: the retained buffer never exceeds the largest element still
+ * being assembled, so a long stream costs neither quadratic CPU nor full-file memory.
+ *
+ * `tracks` carries the TrackEntry descriptions only — unlike demux(), per-track `frames` arrays are
+ * left empty, since accumulating every frame forever is exactly what streaming exists to avoid.
+ */
+export function createStreamDemux(){
+  let buf=new Uint8Array(0);   // unconsumed tail of the stream
+  let base=0;                  // stream offset of buf[0]
+  let pos=0;                   // stream offset of the parse cursor
+  const stack=[];              // masters we descended into: { id, end } (end=Infinity if unknown)
+  const tracks={};
+  const out={ metadata:null };
+  let clusterBase=0, metaSent=false, ended=false, bad=false;
+
+  function parse(events){
+    while(!bad){
+      while(stack.length && pos>=stack.at(-1).end) stack.pop();
+      const e=peekElement(buf, pos-base, buf.length);
+      if(e===MORE) break;
+      if(e===BAD){ bad=true; break; }
+
+      const top=stack.at(-1);
+      const inCluster=top?.id===ID.Cluster;
+      if(inCluster && top.end===Infinity && !CLUSTER_CHILD.has(e.id)){ stack.pop(); continue; }
+
+      const dStart=pos+e.hdrLen;
+      if(DESCEND.has(e.id)){
+        stack.push({ id:e.id, end: e.unknown ? Infinity : dStart+e.size });
+        if(e.id===ID.Cluster) clusterBase=0;
+        pos=dStart;
+        continue;
+      }
+      if(e.unknown){ bad=true; break; }     // unknown size on a leaf leaves nothing to resync on
+      const dEnd=dStart+e.size;
+      if(dEnd-base>buf.length) break;       // payload still in flight
+
+      const s=dStart-base, t=dEnd-base;
+      try{
+        if(e.id===ID.Tracks) walkTracks(buf, tracks, s, t);
+        else if(e.id===ID.Tags){
+          walkTags(buf, out, s, t);
+          if(out.metadata && !metaSent){ metaSent=true; events.push({ type:'metadata', metadata:out.metadata }); }
+        }
+        else if(inCluster && e.id===ID.Timestamp) clusterBase=readUint(buf, s, t);
+        else if(inCluster && e.id===ID.SimpleBlock){
+          const block=readSimpleBlock(buf, s, t, clusterBase);
+          if(block) events.push({ type:'block', block });
+        }
+      }catch{ bad=true; break; }            // corrupt element (bad JSON tag, short field, …)
+      pos=dEnd;
+    }
+    if(bad){ buf=new Uint8Array(0); base=pos; }             // unresyncable: stop retaining bytes
+    else if(pos>base){ buf=buf.subarray(pos-base); base=pos; }   // release everything already parsed
+  }
 
   return {
-    get metadata(){ const d=tryDemux(); return d?.metadata ?? null; },
-    get tracks(){ const d=tryDemux(); return d?.tracks ?? {}; },
+    get metadata(){ return out.metadata; },
+    get tracks(){ return tracks; },
     get done(){ return ended; },
 
     push(chunk){
+      if(bad) return [];                   // nothing after a malformed element can be trusted
       if(!(chunk instanceof Uint8Array)) chunk=new Uint8Array(chunk);
-      buf=cat([buf, chunk]);
+      buf=cat([buf, chunk]);               // copies, so a caller reusing its chunk can't corrupt us
       const events=[];
-      const d=tryDemux();
-      if(d?.metadata && !metaSent){ metaSent=true; events.push({ type:'metadata', metadata:d.metadata }); }
+      parse(events);
       return events;
     },
 
     finish(){
       ended=true;
       const events=[];
-      const d=tryDemux();
-      if(d?.metadata && !metaSent){ metaSent=true; events.push({ type:'metadata', metadata:d.metadata }); }
-      if(d) for(let i=lastBlocks;i<d.frames.length;i++) events.push({ type:'block', block:d.frames[i] });
-      if(d) lastBlocks=d.frames.length;
+      parse(events);          // a trailing element completed by the last push still counts
       events.push({ type:'end' });
       return events;
     },
