@@ -76,7 +76,14 @@ test-command = "python -m pytest {project}/tests"
 
 [tool.cibuildwheel.linux]
 before-all = "bash {project}/scripts/install-libvpx.sh"
-environment = { PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig" }
+# PIP_CONSTRAINT keeps numpy at a version that still ships a manylinux2014 wheel. It has to be a
+# constraint rather than a test-requires pin: cibuildwheel installs the built wheel *before*
+# test-requires, so it is the wheel's own numpy>=1.20 that resolves first, finds no compatible
+# wheel in this container, falls back to a source build and dies on "NumPy requires GCC >= 10.3".
+# A constraint applies to every pip invocation, including that one. Runtime requirements are
+# unchanged — see scripts/manylinux-test-constraints.txt for the detail and the alternative.
+# /project is where cibuildwheel mounts the source tree inside the container.
+environment = { PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig", PIP_CONSTRAINT = "/project/scripts/manylinux-test-constraints.txt" }
 
 [tool.cibuildwheel.macos]
 # libvpx is built from source (static, PIC) rather than taken from Homebrew. The build links it into
