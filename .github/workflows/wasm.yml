@@ -43,7 +43,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # >=22 for the test runner's built-in glob, matching the rest of the repo.
+          node-version: "22"
           cache: npm
       - run: npm ci
 
