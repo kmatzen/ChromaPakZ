@@ -1,0 +1,17 @@
+/* ELF export list for _core.so — the counterpart of native/exported_symbols.txt on Mach-O.
+ *
+ * -fvisibility=hidden is not sufficient on its own: libstdc++ declares
+ * `namespace std _GLIBCXX_VISIBILITY(default)`, and an explicit visibility attribute wins over
+ * the -fvisibility default, so std:: template instantiations (std::vector<...>::_M_realloc_insert
+ * and friends) would otherwise land in the dynamic symbol table. This restricts the exported ABI
+ * to exactly the dc_* entry points, matching the macOS link.
+ *
+ * The version node is anonymous on purpose: it localises everything else without stamping version
+ * tags onto the exported symbols, so dlsym/ctypes keep resolving them by plain name.
+ */
+{
+  global:
+    dc_*;
+  local:
+    *;
+};
