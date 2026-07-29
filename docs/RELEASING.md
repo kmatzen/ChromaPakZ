@@ -13,9 +13,10 @@ pass before merge (Settings → Branches → branch protection → require statu
 
 ## Publishing wheels to PyPI (`.github/workflows/release.yml`)
 
-Uses **cibuildwheel** to build self-contained wheels (libvpx is bundled into each wheel by
-auditwheel/delocate) for CPython 3.9–3.13 on Linux (manylinux x86_64) and macOS, plus an sdist, then
-publishes via **Trusted Publishing** — OIDC, so there is **no API token to store**.
+Uses **cibuildwheel** to build self-contained wheels (libvpx is linked *statically* into `_core`, so
+there is no libvpx for auditwheel/delocate to bundle) for CPython 3.9–3.13 on Linux (manylinux
+x86_64) and macOS, plus an sdist, then publishes via **Trusted Publishing** — OIDC, so there is **no
+API token to store**.
 
 ### One-time setup
 1. **Create the PyPI project + trusted publisher.** On https://pypi.org → your account → *Publishing*,
@@ -36,12 +37,19 @@ publishes via **Trusted Publishing** — OIDC, so there is **no API token to sto
    - `workflow_dispatch` builds the artifacts without publishing — handy for testing the wheel build.
 
 ### Notes / gotchas
-- **Linux** builds libvpx from source (pinned 1.14.1) via `scripts/install-libvpx.sh`, because EPEL's
-  libvpx predates the VP9 encoder controls we use; a system libvpx is accepted only if ≥ 1.10. Bump `VER`
-  there to move libvpx. The script installs `nasm`/`yasm` (one is required to build libvpx).
-- **macOS** uses the Homebrew libvpx bottle and pins `MACOSX_DEPLOYMENT_TARGET` to the runner's macOS (15.0
-  today) so delocate can bundle that bottle — see `[tool.cibuildwheel.macos]`. If `macos-latest` moves to a
-  newer macOS, bump this value to match. Wheels build for the runner's arch (arm64); add `archs` or an Intel
-  runner for `x86_64`/`universal2` coverage.
+- **libvpx must be linked statically.** `_core` links `libvpx.a` and exports only its `dc_*` ABI, so it
+  carries no undefined `vpx_*` symbols. Dynamic linking is not safe here: ELF resolves undefined symbols
+  through the process-global scope in load order, and another extension that publishes its own libvpx
+  globally then owns ours. `decord` does exactly this — it dlopens with `RTLD_GLOBAL` — so
+  `import decord` before `import chromapakz` used to bind our encoder to decord's (older, ABI-incompatible)
+  libvpx. `tests/py_symbol_isolation.py` runs in `test-command` and fails the wheel if this ever regresses.
+- **Linux** builds libvpx from source (pinned 1.14.1, `--enable-static --enable-pic`) via
+  `scripts/install-libvpx.sh`, because EPEL's libvpx predates the VP9 encoder controls we use; a system
+  libvpx is accepted only if it is ≥ 1.10 *and* ships a `libvpx.a`. Bump `VER` there to move libvpx. The
+  script installs `nasm`/`yasm` (one is required to build libvpx).
+- **macOS** uses the Homebrew libvpx bottle's `libvpx.a` and pins `MACOSX_DEPLOYMENT_TARGET` to the
+  runner's macOS (15.0 today), since the bottle's objects carry that as their minimum version — see
+  `[tool.cibuildwheel.macos]`. If `macos-latest` moves to a newer macOS, bump this value to match. Wheels
+  build for the runner's arch (arm64); add `archs` or an Intel runner for `x86_64`/`universal2` coverage.
 - Windows wheels are not configured (libvpx on MSVC is fiddly); add a `[tool.cibuildwheel.windows]`
   `before-all` (e.g. vcpkg) when needed.
