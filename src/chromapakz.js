@@ -19,6 +19,7 @@ import {
   blocksByTime,
   slotKeysForMetadata,
   isSlotComplete,
+  slotHasContent,
   collectFrameInputs,
   RGB_TRACK,
   SIGNAL_DEPTH,
@@ -80,7 +81,10 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
 
     for(const s of signals){
       const hiKey=`${s.id}:hi`, loKey=`${s.id}:lo`;
-      if(!slot[hiKey]) continue;
+      // A slot may legitimately carry no plane for this signal (rgb-only frames), and a truncated
+      // or corrupt file may carry hi without lo — both skip, rather than pushing undefined at a
+      // decoder that would then desync every later frame on the track.
+      if(!slot[hiKey] || !slot[loKey]) continue;
       if(!sigDec[s.id]) sigDec[s.id]={ hi: be.createTrackDecoder({ kind:'luma', W, H }), lo: be.createTrackDecoder({ kind:'luma', W, H }) };
       sigDec[s.id].hi.push(slot[hiKey]);
       sigDec[s.id].lo.push(slot[loKey]);
@@ -223,15 +227,26 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     }
   }
 
-  const depthSig=()=>signalPlan?.find(s=>s.id==='depth');
+  // near/far have to be readable before the first frame — right after setNearFar(), say — but
+  // planning is deliberately deferred until then, since undeclared rgb is only known once frame 0
+  // arrives. So read them off a throwaway plan instead of freezing the real one; only the quant
+  // range is wanted here, and that does not depend on the track numbering.
+  const depthQuant=()=>{
+    try{ return (signalPlan ?? planSignals(specList, declaredRgb ?? sawRgb)).find(s=>s.id==='depth')?.quant; }
+    catch{ return undefined; }
+  };
 
   return {
     get signalPlan(){ ensurePlan(); return signalPlan; },
-    get near(){ return depthSig()?.quant?.near; },
-    get far(){ return depthSig()?.quant?.far; },
+    get near(){ return depthQuant()?.near; },
+    get far(){ return depthQuant()?.far; },
     get frameCount(){ return n; },
 
     setNearFar(near_, far_){
+      // Frames already encoded were quantized against the old range, and in streaming mode the
+      // header carrying near/far has long since gone out over onChunk — either way the metadata
+      // would no longer describe the data it labels.
+      if(n) throw new Error('setNearFar: must be called before the first addFrame()');
       const d=specList.find(s=>(s.id ?? 'depth')==='depth');
       const qType=d?.quant?.type ?? (d?.near !== undefined ? 'inverse-depth' : null);
       if(!d || qType !== 'inverse-depth')
@@ -373,10 +388,28 @@ function createNetworkDecoder({ backend='auto' }={}){
   const slotPending=new Map();
   const blockQueue=[];
   let streamDone=false, shut=false;
-  let core=null;
+  let core=null, claimed=0;
   const waitBlock=[];   // a queue, so overlapping readFrame()s can't strand each other's waiter
 
   function notify(){ while(waitBlock.length) waitBlock.shift()(); }
+
+  function emitSlot(timeMs){
+    const slot=slotPending.get(timeMs);
+    slotPending.delete(timeMs);
+    if(slot && slotHasContent(slot, meta.signals)){ blockQueue.push(slot); return true; }
+    return false;
+  }
+
+  // Blocks arrive in ascending time, so once a newer timestamp shows up (or the stream ends) every
+  // older slot has all the blocks it will ever get. Without this, frames the encoder legitimately
+  // writes with only some of the declared keys — rgb-only, signal-only — never satisfy
+  // isSlotComplete() and are stranded in slotPending forever, which is why streaming decode used to
+  // disagree with the buffered path on the same file.
+  function flushBefore(timeMs){
+    let any=false;
+    for(const t of [...slotPending.keys()].filter(t=>t<timeMs).sort((a,b)=>a-b)) any=emitSlot(t)||any;
+    return any;
+  }
 
   function onBlock(block){
     if(!meta) return;
@@ -390,14 +423,12 @@ function createNetworkDecoder({ backend='auto' }={}){
       }
     }
     if(!key) return;
+    let ready=flushBefore(block.timeMs);   // drain older slots first, so blockQueue stays ordered
     let slot=slotPending.get(block.timeMs);
     if(!slot){ slot={ timeMs:block.timeMs }; slotPending.set(block.timeMs, slot); }
     slot[key]=block;
-    if(isSlotComplete(slot, keys)){
-      blockQueue.push(slot);
-      slotPending.delete(block.timeMs);
-      notify();
-    }
+    if(isSlotComplete(slot, keys)) ready=emitSlot(block.timeMs)||ready;
+    if(ready) notify();
   }
 
   function ingest(events){
@@ -407,7 +438,11 @@ function createNetworkDecoder({ backend='auto' }={}){
         W=meta.width; H=meta.height;
         keys=slotKeysForMetadata(meta);
       }else if(ev.type==='block') onBlock(ev.block);
-      else if(ev.type==='end'){ streamDone=true; notify(); }
+      else if(ev.type==='end'){
+        if(meta) flushBefore(Infinity);
+        streamDone=true;
+        notify();
+      }
     }
   }
 
@@ -427,15 +462,19 @@ function createNetworkDecoder({ backend='auto' }={}){
     push(chunk){ ingest(sdm.push(chunk)); },
     finish(){ ingest(sdm.finish()); streamDone=true; notify(); },
 
+    // Waits for the next slot to arrive rather than reporting end-of-stream early. `claimed` is
+    // bumped synchronously so overlapping readFrame()s each reserve a distinct slot before
+    // suspending; waitBlock is FIFO, so they claim in call order — the order makeFrameReader
+    // then resolves them in.
     async readFrame(){
-      if(shut) throw new Error('decoder closed');
-      if(!meta) throw new Error('waiting for metadata');
-      while(!core && blockQueue.length===0){
+      for(;;){
+        if(shut) throw new Error('decoder closed');
+        if(!meta) throw new Error('waiting for metadata');
+        if(claimed<blockQueue.length){ claimed++; break; }
         if(streamDone) return null;
-        await new Promise(res=>{ waitBlock.push(res); });
+        await new Promise(res=>{ waitBlock.push(res); });   // close() wakes this too — hence the shut recheck
       }
-      if(!core && blockQueue.length) core=makeFrameReader({ meta, W, H, blocks:blockQueue, getBackend });
-      if(!core) return null;
+      core ??= makeFrameReader({ meta, W, H, blocks:blockQueue, getBackend });
       return core.readFrame();
     },
 
