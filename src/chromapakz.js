@@ -517,5 +517,5 @@ export async function decode(bytes, opts={}){
     signalSeries: Object.keys(signalSeries).length ? signalSeries : null };
 }
 
-export { createStreamMux, createStreamDemux, concatChunks } from './webm.js';
+export { createStreamMux, createStreamDemux, concatChunks, WebMCorruptError } from './webm.js';
 export { normalizeMetadata, planSignals } from './signals.js';

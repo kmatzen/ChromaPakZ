@@ -1,6 +1,6 @@
 /** Node tests: WebM muxer/demuxer edge cases (vint boundaries, clustering, robustness).
  *  Run: node tests/js_webm_edge.mjs */
-import { mux, demux, createStreamMux, createStreamDemux, concatChunks } from '../src/webm.js';
+import { mux, demux, createStreamMux, createStreamDemux, concatChunks, WebMCorruptError } from '../src/webm.js';
 
 let failed = 0;
 function ok(c, m){ if(!c){ console.error('FAIL:', m); failed++; } }
@@ -161,15 +161,25 @@ for(const size of [0, 1, 126, 127, 128, 16382, 16383, 16384, 100000]){
   ok(blocks===40, `large multi-cluster stream fully demuxed (${blocks})`);
 }
 
-// ── garbage pushed at a stream demuxer: no throw, no hang, no unbounded buffering ──
+// ── garbage pushed at a stream demuxer: reported, not swallowed; no hang, no unbounded buffering ──
+// This used to be asserted as "does not throw". Silently going quiet is indistinguishable from
+// "the stream hasn't arrived yet", which left callers awaiting metadata forever, so corruption is
+// now surfaced. The rest of the original intent — terminates, retains nothing — still holds.
 {
   const sdm=createStreamDemux();
-  let threw=false;
+  let err=null;
   try{
     for(let i=0;i<8;i++) sdm.push(Uint8Array.from({length:32}, (_,k)=>(i*32+k)*37&0xff));
-    ok(sdm.finish().at(-1).type==='end', 'end delivered after garbage');
-  }catch{ threw=true; }
-  ok(!threw, 'garbage push handled without throwing');
+  }catch(e){ err=e; }
+  ok(err instanceof WebMCorruptError, `garbage push reports corruption (${err?.name ?? 'no throw'})`);
+  ok(sdm.error===err, 'the verdict is latched on the demuxer');
+  // The verdict is permanent, so later calls repeat it instead of re-parsing.
+  let again=null;
+  try{ sdm.push(Uint8Array.of(1,2,3)); }catch(e){ again=e; }
+  ok(again===err, 'later pushes repeat the latched error');
+  let onFinish=null;
+  try{ sdm.finish(); }catch(e){ onFinish=e; }
+  ok(onFinish===err, 'finish() reports it too');
 }
 
 // ── truncated stream: finish() on a half-file must not throw ──
