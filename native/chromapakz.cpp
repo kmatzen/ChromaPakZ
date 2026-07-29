@@ -302,11 +302,11 @@ std::vector<SignalMeta> planSignalTracks(const std::vector<SignalEncodeSpec>& sp
 }
 
 // ── triangle-fold 8+8 ──
-void pack(const uint16_t* d, int n, uint8_t* hi, uint8_t* lo){
-  for(int i=0;i<n;i++){ int h=d[i]>>8, l=d[i]&0xff; hi[i]=h; lo[i]=(h&1)?(255-l):l; }
+void pack(const uint16_t* d, size_t n, uint8_t* hi, uint8_t* lo){
+  for(size_t i=0;i<n;i++){ int h=d[i]>>8, l=d[i]&0xff; hi[i]=h; lo[i]=(h&1)?(255-l):l; }
 }
-void unpack(const uint8_t* hi, const uint8_t* lo, int n, uint16_t* d){
-  for(int i=0;i<n;i++){ int h=hi[i], l=(h&1)?(255-lo[i]):lo[i]; d[i]=(uint16_t)((h<<8)|l); }
+void unpack(const uint8_t* hi, const uint8_t* lo, size_t n, uint16_t* d){
+  for(size_t i=0;i<n;i++){ int h=hi[i], l=(h&1)?(255-lo[i]):lo[i]; d[i]=(uint16_t)((h<<8)|l); }
 }
 
 // ── libvpx VP9 lossless encode of an 8-bit luma-plane sequence (chroma const 128) ──
@@ -346,21 +346,53 @@ bool encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int
   return ok;
 }
 
-// Decode a VP9 track's packets (in order) → luma planes (W*H each).
-bool decodePlaneTrack(std::vector<Frame>& frs, int W, int H, std::vector<Bytes>& outPlanes){
+// ── decoding untrusted files ──
+// VP9's own maximum frame dimension, plus a pixel-count cap that keeps W*H*4 inside a 32-bit
+// size_t as well — 2^28 px is 16384x16384, already far past any real frame. Header dimensions
+// beyond either can never describe a decodable bitstream, and rejecting them before any
+// arithmetic means the byte counts below cannot wrap and quietly defeat the bounds they feed.
+const int kMaxDim = 65536;
+const uint64_t kMaxPixels = 1ull << 28;
+
+bool dimsUsable(int W, int H){
+  return W>0 && H>0 && W<=kMaxDim && H<=kMaxDim && (uint64_t)W*(uint64_t)H <= kMaxPixels;
+}
+
+// Why a decoded track can be a different shape from what the file's header says: the metadata
+// and the bitstream are independent, and nothing in the container ties them together. A crafted
+// header can declare a frame count far below what the clusters actually hold, one SimpleBlock
+// can carry a VP9 superframe that decodes to several images, and the coded frame size is a
+// property of the bitstream that no amount of header parsing can predict. So the decode loops
+// check every image and stop at the caller's capacity rather than trusting either source.
+enum DecStatus { DEC_OK=0, DEC_CODEC=1, DEC_GEOMETRY=2, DEC_CAPACITY=3 };
+
+// The copy loops below index planes[0] as 8-bit rows of W bytes and planes[1..2] at half
+// resolution, so an image is only safe to copy out if it is exactly 8-bit I420 at W*H.
+// libvpx will otherwise hand back e.g. a 16x16 frame, or 16-bit planes for a profile-2 stream.
+bool imageMatches(const vpx_image_t* img, int W, int H){
+  return img && img->fmt==VPX_IMG_FMT_I420 && (int)img->d_w==W && (int)img->d_h==H;
+}
+
+// Decode a VP9 track's packets (in order) → luma planes (W*H each), at most maxFrames of them.
+int decodePlaneTrack(std::vector<Frame>& frs, int W, int H, size_t maxFrames,
+                     std::vector<Bytes>& outPlanes){
   std::stable_sort(frs.begin(), frs.end(), [](const Frame&a,const Frame&b){ return a.timeMs<b.timeMs; });
-  vpx_codec_ctx_t c{}; if(vpx_codec_dec_init(&c, vpx_codec_vp9_dx(), nullptr, 0)) return false;
-  bool ok=true;
+  vpx_codec_ctx_t c{}; if(vpx_codec_dec_init(&c, vpx_codec_vp9_dx(), nullptr, 0)) return DEC_CODEC;
+  int st=DEC_OK;
   for(auto& f : frs){
-    if(vpx_codec_decode(&c, f.data, (unsigned)f.len, nullptr, 0)){ ok=false; break; }
+    if(vpx_codec_decode(&c, f.data, (unsigned)f.len, nullptr, 0)){ st=DEC_CODEC; break; }
     vpx_image_t* img; vpx_codec_iter_t it=nullptr;
     while((img=vpx_codec_get_frame(&c,&it))){
-      Bytes plane(W*H); for(int r=0;r<H;r++) memcpy(plane.data()+r*W, img->planes[0]+r*img->stride[0], W);
+      if(!imageMatches(img,W,H)){ st=DEC_GEOMETRY; break; }
+      if(outPlanes.size()>=maxFrames){ st=DEC_CAPACITY; break; }
+      Bytes plane((size_t)W*H);
+      for(int r=0;r<H;r++) memcpy(plane.data()+(size_t)r*W, img->planes[0]+(size_t)r*img->stride[0], W);
       outPlanes.push_back(std::move(plane));
     }
+    if(st) break;
   }
   vpx_codec_destroy(&c);
-  return ok;
+  return st;
 }
 
 // ── RGB ↔ I420, BT.709 full-range (signaled in the bitstream so players decode correctly) ──
@@ -411,14 +443,19 @@ bool encodeRGBSeq(const std::vector<const uint8_t*>& rgba, int W, int H, int fps
       outKey.push_back((pkt->data.frame.flags & VPX_FRAME_IS_KEY)!=0); } }
   vpx_img_free(&img); vpx_codec_destroy(&c); return ok;
 }
-bool decodeRGBTrack(std::vector<Frame>& frs, int W, int H, std::vector<Bytes>& out){
+// Same capacity/geometry contract as decodePlaneTrack.
+int decodeRGBTrack(std::vector<Frame>& frs, int W, int H, size_t maxFrames, std::vector<Bytes>& out){
   std::stable_sort(frs.begin(),frs.end(),[](const Frame&a,const Frame&b){return a.timeMs<b.timeMs;});
-  vpx_codec_ctx_t c{}; if(vpx_codec_dec_init(&c,vpx_codec_vp9_dx(),nullptr,0)) return false;
-  bool ok=true;
-  for(auto& f : frs){ if(vpx_codec_decode(&c,f.data,(unsigned)f.len,nullptr,0)){ ok=false; break; }
+  vpx_codec_ctx_t c{}; if(vpx_codec_dec_init(&c,vpx_codec_vp9_dx(),nullptr,0)) return DEC_CODEC;
+  int st=DEC_OK;
+  for(auto& f : frs){ if(vpx_codec_decode(&c,f.data,(unsigned)f.len,nullptr,0)){ st=DEC_CODEC; break; }
     vpx_image_t* img; vpx_codec_iter_t it=nullptr;
-    while((img=vpx_codec_get_frame(&c,&it))){ Bytes rgba((size_t)W*H*4); i420ToRGBA(img,W,H,rgba.data()); out.push_back(std::move(rgba)); } }
-  vpx_codec_destroy(&c); return ok;
+    while((img=vpx_codec_get_frame(&c,&it))){
+      if(!imageMatches(img,W,H)){ st=DEC_GEOMETRY; break; }
+      if(out.size()>=maxFrames){ st=DEC_CAPACITY; break; }
+      Bytes rgba((size_t)W*H*4); i420ToRGBA(img,W,H,rgba.data()); out.push_back(std::move(rgba)); }
+    if(st) break; }
+  vpx_codec_destroy(&c); return st;
 }
 
 // Build a full file from optional RGB and lossless signals.
@@ -480,15 +517,30 @@ static int finish(Bytes& file, uint8_t** out, size_t* out_len){
   memcpy(*out, file.data(), file.size()); *out_len=file.size(); return 0;
 }
 
-int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out){
+// Map a track-decode status onto this entry point's codes. `codecErr` is the historical
+// "decode failed" number each caller already documented (3 for RGB and the hi plane, 4 for lo).
+static int decStatusToRc(int st, int codecErr){
+  switch(st){
+    case DEC_OK:       return 0;
+    case DEC_CAPACITY: return DC_ERR_CAPACITY;
+    case DEC_GEOMETRY: return DC_ERR_GEOMETRY;
+    default:           return codecErr;
+  }
+}
+
+int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgba_cap){
+  if(!webm || !rgba_out) return 1;
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
   if(d.metadata.find("\"rgb\":null")!=std::string::npos) return 6;
   double v; int W=0,H=0; jnum(d.metadata,"width",v); W=(int)v; jnum(d.metadata,"height",v); H=(int)v;
-  if(W<=0||H<=0) return 2;
+  if(!dimsUsable(W,H)) return 2;
+  size_t frameBytes=(size_t)W*H*4;
   int rgbTrack=1; for(auto& t:d.tracks) if(t.name=="rgb") rgbTrack=t.number;
   std::vector<Frame> frs; for(auto& f:d.frames) if(f.track==rgbTrack) frs.push_back(f);
-  std::vector<Bytes> planes; if(!decodeRGBTrack(frs,W,H,planes)) return 3;
-  for(size_t i=0;i<planes.size();i++) memcpy(rgba_out+i*(size_t)W*H*4, planes[i].data(), (size_t)W*H*4);
+  std::vector<Bytes> planes;
+  int st=decodeRGBTrack(frs,W,H,rgba_cap/frameBytes,planes);
+  if(st) return decStatusToRc(st,3);
+  for(size_t i=0;i<planes.size();i++) memcpy(rgba_out+i*frameBytes, planes[i].data(), frameBytes);
   return 0;
 }
 
@@ -499,8 +551,10 @@ int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
   if(W) *W=meta.width;
   if(H) *H=meta.height;
   // Streaming files carry "frames":null (the count isn't known when the header is emitted),
-  // so fall back to counting actual blocks on the busiest track. Callers size decode buffers
-  // from this N, so it must match what dc_decode_* will write.
+  // so fall back to counting actual blocks on the busiest track. This is a hint, not a
+  // guarantee: metadata can lie and one block can hold a VP9 superframe of several images, so
+  // block counting can over- or under-shoot. Callers size decode buffers from this N and pass
+  // that size as the dc_decode_* capacity, which is what actually bounds the writes.
   int n = meta.frames;
   if(n <= 0){
     std::vector<int> seen;
@@ -521,23 +575,26 @@ int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
   return 0;
 }
 
-int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id, uint16_t* out){
+int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id,
+                     uint16_t* out, size_t out_cap){
   if(!webm || !signal_id || !out) return 1;
   Demuxed d = demux(webm,len); if(d.metadata.empty()) return 1;
   FileMeta meta = parseMetadata(d.metadata);
   const SignalMeta* sig = findSignal(meta, signal_id);
   if(!sig) return 8;
-  if(meta.width<=0 || meta.height<=0) return 2;
+  int W=meta.width, H=meta.height;
+  if(!dimsUsable(W,H)) return 2;
+  size_t px=(size_t)W*H;
+  size_t maxFrames=out_cap/px;
   std::vector<Frame> hi, lo;
   for(auto& f : d.frames){
     if(f.track==sig->track_hi) hi.push_back(f);
     else if(f.track==sig->track_lo) lo.push_back(f);
   }
   std::vector<Bytes> hiP, loP;
-  if(!decodePlaneTrack(hi,meta.width,meta.height,hiP)) return 3;
-  if(!decodePlaneTrack(lo,meta.width,meta.height,loP)) return 4;
+  int st=decodePlaneTrack(hi,W,H,maxFrames,hiP); if(st) return decStatusToRc(st,3);
+  st=decodePlaneTrack(lo,W,H,maxFrames,loP);     if(st) return decStatusToRc(st,4);
   if(hiP.size()!=loP.size()) return 5;
-  int px=meta.width*meta.height;
   for(size_t i=0;i<hiP.size();i++) unpack(hiP[i].data(), loP[i].data(), px, out+i*px);
   return 0;
 }
