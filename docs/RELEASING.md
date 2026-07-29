@@ -12,6 +12,30 @@ individual test files — adding `tests/test_*.py` or `tests/*.test.mjs` is enou
 - **native coverage** — an instrumented `-DCHROMAPAKZ_COVERAGE=ON` build reported through `gcovr`.
 - **browser** — `npm run test:coverage` (the full Node suite), Playwright probes
   (`single`, `streaming`, `network`, `multisignal`), and `smoke-demo.mjs`.
+- **wasm freshness** — `scripts/check-wasm-fresh.sh` verifies that the committed
+  `src/backend/wasm/vp9-*.{js,wasm}` were built from the current `native/wasm/` sources. Those are
+  committed *binaries* that only a manual `npm run build:wasm` regenerates, so without this a change
+  to `dc_vp9.cpp` does nothing until someone remembers — which is exactly how the #6 decoder bounds
+  fix sat unbuilt, shipping to npm, for six commits. `build-wasm.sh` records its input hashes in
+  `src/backend/wasm/BUILD_SOURCES.sha256`; the check re-verifies them. Content, not git history: a
+  rebase moves a rebuild commit after a source commit whose changes its binaries do not contain.
+
+## Rebuilding the WASM codecs (`.github/workflows/wasm.yml`)
+
+Rebuilds `vp9-*.{js,wasm}` from `native/wasm/dc_vp9.cpp` + libvpx with a **pinned emsdk** and re-runs
+the wasm round-trips against the fresh output. Expensive (libvpx is configured and built twice), so
+it runs only when `native/wasm/**` or `src/backend/wasm/**` changes, weekly, or on demand; the libvpx
+build is cached.
+
+With emsdk pinned and libvpx at a fixed tag the rebuild is bit-reproducible — a Linux CI run
+reproduced macOS-built binaries byte for byte — so the job also **fails if the committed binaries
+differ from what the sources compile to**. That is the one thing `check-wasm-fresh.sh` cannot see:
+its manifest records build *inputs*, so binaries that were hand-edited or built from a different
+toolchain would still pass. If it fires, commit what the job rebuilt (uploaded as an artifact).
+
+To rebuild locally you need emsdk on `PATH` (`emsdk install 3.1.64 && emsdk activate 3.1.64`; note
+emsdk itself requires Python ≥ 3.10), then `npm run build:wasm` and commit
+`src/backend/wasm/` plus `src/backend/decode-ref.js`.
 
 Suggested branch flow: protect `main`, do work on feature branches, open PRs, require the `ci` checks to
 pass before merge (Settings → Branches → branch protection → require status checks).

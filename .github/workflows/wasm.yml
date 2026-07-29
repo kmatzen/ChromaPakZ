@@ -1,0 +1,104 @@
+name: wasm
+
+# The committed src/backend/wasm/vp9-*.{js,wasm} are build *outputs* that no push-triggered job
+# reproduces, because reproducing them needs emscripten and a from-source libvpx. scripts/
+# check-wasm-fresh.sh (in ci.yml) catches "you edited the source and forgot to rebuild" for free;
+# this workflow is the other half — it actually rebuilds with emcc and re-runs the round-trips
+# against the fresh output, so a change to dc_vp9.cpp that does not compile, or an emsdk/libvpx
+# upgrade that breaks the codec, surfaces here instead of at the next manual rebuild.
+#
+# Expensive (libvpx is configured and built twice), so it runs only when the WASM sources change,
+# weekly to catch upstream drift, and on demand.
+
+on:
+  pull_request:
+    paths:
+      - 'native/wasm/**'
+      - 'src/backend/wasm/**'
+      - '.github/workflows/wasm.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'native/wasm/**'
+      - 'src/backend/wasm/**'
+  schedule:
+    - cron: '0 5 * * 1'          # Mondays 05:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so a rebuild is reproducible for a given pin; bump deliberately, and commit the
+  # resulting binaries in the same change.
+  EMSDK_VERSION: "3.1.64"
+
+jobs:
+  rebuild:
+    name: rebuild vp9-*.wasm from source
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+
+      - name: Cache emsdk
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}
+
+      - name: Install + activate emsdk
+        run: |
+          [ -d ~/emsdk ] || git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          ~/emsdk/emsdk install "$EMSDK_VERSION"
+          ~/emsdk/emsdk activate "$EMSDK_VERSION"
+
+      # build-wasm.sh skips a libvpx target whose libvpx.a already exists, so a warm cache turns
+      # the ~40 min part of this job into a no-op.
+      - name: Cache the libvpx WASM builds
+        uses: actions/cache@v4
+        with:
+          path: build/wasm
+          key: libvpx-wasm-${{ env.EMSDK_VERSION }}-${{ hashFiles('native/wasm/build-wasm.sh') }}
+
+      - name: npm run build:wasm
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          npm run build:wasm
+
+      # The wasm-backed tests, run against the freshly built binaries. Named by glob rather than
+      # individually so a new tests/js_wasm_*.test.mjs is picked up without touching this file.
+      - name: The freshly built codecs must pass the same round-trips as the committed ones
+        run: node --test 'tests/js_wasm_*.test.mjs'
+
+      # With emsdk pinned and libvpx cloned at a fixed tag, this rebuild is bit-reproducible: the
+      # first run of this job on Linux produced binaries byte-identical to ones built on macOS.
+      # So a diff here is not noise — it means the committed binaries are not what these sources
+      # compile to, which is precisely the failure check-wasm-fresh.sh's hash manifest cannot see
+      # (the manifest records inputs, not outputs, so hand-edited or wrongly-built binaries pass).
+      # If this fires, commit what the job rebuilt (it is uploaded as an artifact below).
+      - name: Committed binaries must match what these sources compile to
+        run: |
+          ls -la src/backend/wasm/vp9-*.wasm
+          if ! git diff --quiet -- src/backend/wasm src/backend/decode-ref.js; then
+            echo "::error::rebuilt WASM differs from the committed binaries"
+            git diff --stat -- src/backend/wasm src/backend/decode-ref.js
+            exit 1
+          fi
+          echo "rebuilt output is byte-identical to the committed binaries"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vp9-wasm-rebuilt
+          path: |
+            src/backend/wasm/vp9-*.js
+            src/backend/wasm/vp9-*.wasm
+            src/backend/decode-ref.js
+          retention-days: 14

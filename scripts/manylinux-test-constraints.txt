@@ -1,0 +1,11 @@
+# pip constraints for the cibuildwheel Linux *test* environment (see PIP_CONSTRAINT in
+# [tool.cibuildwheel.linux] in pyproject.toml). Not a runtime requirement — the package still
+# declares numpy>=1.20 and users resolve that normally.
+#
+# numpy dropped manylinux2014 wheels at 2.3.0, and cibuildwheel installs the freshly built wheel
+# inside the manylinux2014 build container. Without a constraint, pip resolves the wheel's own
+# numpy>=1.20 to a version with no compatible wheel there, falls back to a source build, and fails
+# with "NumPy requires GCC >= 10.3" on cp310-cp313. test-requires alone cannot fix this: it is
+# installed *after* the wheel, so the wheel's install has already failed. A constraint applies to
+# every pip invocation in the environment, including that one.
+numpy<2.3
