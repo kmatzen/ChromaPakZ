@@ -37,16 +37,21 @@ ok(nearFrom(dBatch.metadata) === nearFrom(dStream.metadata), 'metadata round-tri
 
 const sdm = createStreamDemux();
 const chunkSize = 97;
-let gotMeta = false, blocks = 0;
+let gotMeta = false, blocks = 0, blocksBeforeFinish = 0;
 for (let o = 0; o < streamed.length; o += chunkSize) {
   const ev = sdm.push(streamed.subarray(o, Math.min(o + chunkSize, streamed.length)));
-  for (const e of ev) if (e.type === 'metadata') gotMeta = true;
+  for (const e of ev) {
+    if (e.type === 'metadata') gotMeta = true;
+    if (e.type === 'block') { blocks++; blocksBeforeFinish++; }
+  }
 }
 for (const e of sdm.finish()) if (e.type === 'block') blocks++;
 ok(gotMeta, 'incremental demux got metadata');
 ok(blocks === dStream.frames.length, `incremental blocks ${blocks}`);
+// Blocks must surface during push() — decoding may not wait for the end of a network stream.
+ok(blocksBeforeFinish > 0, 'blocks delivered progressively, before finish()');
 
-const sm2 = createStreamMux({ tracks, metadata, durationMs: 0, unknownSegmentSize: true });
+const sm2 = createStreamMux({ tracks, metadata, durationMs: 0 });
 const early = createStreamDemux();
 early.push(sm2.header);
 ok(!!early.metadata, 'metadata after full header push');

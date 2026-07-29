@@ -35,7 +35,31 @@ await encode({
 const { signalSeries } = await decode(bytes);
 ```
 
-Network: `onChunk` on encode; `createDecoder()` + `push()` + `finish()` on decode.
+### Network streaming
+
+`onChunk` on encode; `createDecoder()` with no bytes, then `push()` / `finish()`, on decode:
+
+```javascript
+const dec = createDecoder();                       // no bytes ⇒ network decoder
+for await (const chunk of response.body) dec.push(chunk);   // frames decode as chunks arrive
+dec.finish();                                       // no more bytes are coming
+
+for await (const frame of dec) { … }                // may run concurrently with the pushes above
+```
+
+Decoding is progressive: each block is delivered as soon as its bytes are complete, so `readFrame()`
+resolves without waiting for the end of the stream, and the demuxer retains only the element
+currently in flight rather than the whole file. A `readFrame()` with nothing left to read waits for
+the next chunk; it returns `null` only after `finish()`, and rejects with `decoder closed` if
+`close()` comes first. Encoding emits an unknown-size Segment, so the header is valid the moment it
+is written and clusters appended later are still inside the Segment.
+
+Streaming and buffered decode return the same frames for the same file. A frame is delivered when it
+has anything decodable — RGB, or a complete hi/lo plane pair for a signal — so clips whose tracks do
+not share one timeline (RGB-only frames, signal-only frames) decode identically either way.
+
+`setNearFar()` must be called before the first `addFrame()`: afterwards, already-quantized frames —
+and, when streaming, the header already sent — would no longer match the range.
 
 ### Track layout and `hasRgb`
 

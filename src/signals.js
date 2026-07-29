@@ -129,6 +129,17 @@ export function materializeSignal(u16, signal){
   return out;
 }
 
+/**
+ * Is there anything in this slot a reader can decode — rgb, or a complete hi/lo pair?
+ * Tracks need not share timestamps (rgb-only frames, per-track offsets, truncated files), so a slot
+ * can end up holding nothing usable. Both decode paths drop those slots by this one rule, which is
+ * what keeps buffered and streaming decode agreeing on frame counts for the same file.
+ */
+export function slotHasContent(slot, signals){
+  if(slot.rgb) return true;
+  return signals.some(s=>slot[`${s.id}:hi`] && slot[`${s.id}:lo`]);
+}
+
 export function blocksByTime(tracks, metadata){
   const meta=normalizeMetadata(metadata);
   const rgbT=meta.rgb?.track;
@@ -142,7 +153,8 @@ export function blocksByTime(tracks, metadata){
     if(tracks[s.tracks.hi]) for(const f of tracks[s.tracks.hi].frames) add(`${s.id}:hi`, f);
     if(tracks[s.tracks.lo]) for(const f of tracks[s.tracks.lo].frames) add(`${s.id}:lo`, f);
   }
-  return [...map.keys()].sort((a,b)=>a-b).map(t=>map.get(t));
+  return [...map.keys()].sort((a,b)=>a-b).map(t=>map.get(t))
+    .filter(slot=>slotHasContent(slot, meta.signals));
 }
 
 export function slotKeysForMetadata(metadata){
