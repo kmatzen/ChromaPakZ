@@ -19,7 +19,7 @@ import numpy as np
 
 # Single source of truth for the version: pyproject.toml reads it from here (scikit-build-core's
 # regex metadata provider) and tests/version_consistency.mjs asserts package.json matches.
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 LEVELS_FULL = 65536
 
 # dc_decode_* return codes worth naming: both mean the file's bitstream contradicts its own
