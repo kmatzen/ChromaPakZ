@@ -1,6 +1,6 @@
 # ChromaPakZ
 
-<p align="center"><img src="docs/logo.png" alt="ChromaPakZ — lossless RGBD video encoder" width="680"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/kmatzen/ChromaPakZ/main/docs/logo.png" alt="ChromaPakZ — lossless RGBD video encoder" width="680"></p>
 
 **A lossless RGBD video codec** (クロマパックZ): a single ordinary `.webm` that carries an 8-bit **RGB**
 track alongside **bit-exact 16-bit auxiliary signals** — depth, object IDs, packed normals, or any other
@@ -82,7 +82,7 @@ WebCodecs has no "lossless" switch, so every claim here is a measurement from
 - **8+8 beats high-bit-depth.** 10-bit VP9 encode *is* available in browsers, but a 10+6 split is ~4%
   *worse* than 8+8 and narrows browser reach, so 8+8 wins on both counts.
 
-[`docs/EVALUATION.md`](docs/EVALUATION.md) is the full due-diligence record: every codec/container/packing
+[`docs/EVALUATION.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/EVALUATION.md) is the full due-diligence record: every codec/container/packing
 alternative considered, the constraint that eliminates each, a head-to-head benchmark (ChromaPakZ beats
 FFV1, PNG-16 and x264 on the same 16-bit depth, beats x265/HEVC at matched 11-bit precision, and lands
 within 1–2% of LZMA), cited licensing/browser
@@ -127,7 +127,7 @@ reduced-precision files reconstruct identically everywhere. Set it with `chromap
 This is a separate axis from precision: how faithfully the *codec* carries whatever quantized depth you
 give it. PSNR here is the encode→decode path measured against the source codes.
 
-![ChromaPakZ codec rate-distortion](docs/rate-distortion.svg)
+![ChromaPakZ codec rate-distortion](https://raw.githubusercontent.com/kmatzen/ChromaPakZ/main/docs/rate-distortion.svg)
 
 The lossless codecs all sit on the **∞-dB band** — they reproduce depth exactly and differ only in size,
 where ChromaPakZ (VP9) is smallest, just under FFV1, with PNG-16 well behind. The blue curve is ChromaPakZ's
@@ -145,7 +145,7 @@ All three read and write the identical `.webm`, verified bit-exact in every dire
 Python), and produce standard files — `ffprobe` reports `matroska,webm` with one RGB stream plus two VP9
 streams per lossless signal, and ffmpeg decodes track 0 as plain RGB when present.
 
-Format schema: [`docs/FORMAT.md`](docs/FORMAT.md). API: [`docs/API.md`](docs/API.md).
+Format schema: [`docs/FORMAT.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/FORMAT.md). API: [`docs/API.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/API.md).
 
 | Surface | Codec | Build |
 |---|---|---|
@@ -216,20 +216,20 @@ tests/        test_*.py (pytest) + *.test.mjs (node --test), both glob-discovere
 
 CI builds and tests on Linux + macOS and runs the in-browser VP9-lossless probe in headless Chromium;
 `docs/RELEASING.md` covers wheels and PyPI publishing. The full design rationale and benchmarks are in
-[`docs/EVALUATION.md`](docs/EVALUATION.md).
+[`docs/EVALUATION.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/EVALUATION.md).
 
 ## Status & limitations
 
 Working end-to-end and verified across all three implementations. Honest caveats:
 
-- **Browser support is engine-specific** (measured, [`EVALUATION.md` §11](docs/EVALUATION.md)): native
+- **Browser support is engine-specific** (measured, [`EVALUATION.md` §11](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/EVALUATION.md)): native
   WebCodecs lossless *encode* is Chromium-only today (WebKit lacks WebCodecs' quantizer mode; Firefox's
   QP 0 isn't lossless); native lossless *decode* works on Chromium and WebKit/Safari, while Firefox
   decodes VP9 to color-converted BGRX. Where native can't be trusted, the library transparently falls
   back to a bundled **libvpx-WASM** codec, chosen *per operation* by a cached runtime probe — so a
   decode-only browser (e.g. Safari) downloads only `vp9-decode.wasm` and never the larger encoder, and
-  vice-versa. Force it with `backend: 'webcodecs' | 'wasm'` (default `'auto'`); see [`docs/API.md`](docs/API.md).
+  vice-versa. Force it with `backend: 'webcodecs' | 'wasm'` (default `'auto'`); see [`docs/API.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/API.md).
   These are Playwright engine builds — reconfirm on shipping browsers before hard claims.
 - **"Royalty-free"** reflects the AOMedia/Google position on VP9; Sisvel operates pools that dispute it.
 - An **auto precision picker** (estimate the sensor noise floor to choose `--depth-bits`) is future work.
-- **Network byte streaming** is supported via `onChunk` on encode and `createDecoder()` + `push()`/`finish()` on decode. See [`docs/API.md`](docs/API.md).
+- **Network byte streaming** is supported via `onChunk` on encode and `createDecoder()` + `push()`/`finish()` on decode. See [`docs/API.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/API.md).
