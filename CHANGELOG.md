@@ -4,6 +4,28 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.3.1 — 2026-08-05
+
+A documentation release. No code changed: the wheels, the npm tarball and the file format are
+functionally identical to 0.3.0. It exists because a registry's project page is frozen at upload
+time — neither PyPI nor npm can edit a published description — so the only way to correct one is to
+publish a version.
+
+### Fixed
+
+- **The README's images and doc links were dead on PyPI.** The README is the PyPI long description,
+  and its asset paths were repo-relative, so on the project page they resolved against
+  `pypi.org/project/chromapakz/` — both images rendered broken and the six `docs/*.md` links went
+  nowhere. They are now absolute GitHub URLs (`raw.githubusercontent.com` for the images, which
+  serves the SVG as `image/svg+xml` so PyPI's camo proxy accepts it), which resolve on every
+  registry as well as on GitHub.
+
+### Internal
+
+- A release whose changelog section still says "unreleased", or carries no date, now fails
+  `version-guard` rather than shipping — the tag freezes the tree and the sdist carries
+  `CHANGELOG.md` to PyPI permanently, which is how 0.3.0 shipped an undated section.
+
 ## 0.3.0 — 2026-07-29
 
 First release of the browser library to npm, and the first with a breaking change to the native C
