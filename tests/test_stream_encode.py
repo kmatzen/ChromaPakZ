@@ -372,5 +372,59 @@ class StreamEncodeValidation(unittest.TestCase):
                 signals={"raw": {"float": self.depth.astype(np.float32)}})
 
 
+class StreamEncodeRgbOnly(unittest.TestCase):
+    """An RGB-only take — video plus wrapper metadata, no auxiliary planes.
+
+    The batch encoder always allowed this (``encode({}, rgb=…)``) and the native stream
+    ABI accepts ``num_signals == 0`` with ``has_rgb``; the Python wrapper used to refuse
+    it. A pose-only wrapper format (worldline) records RGB + camera poses with no depth.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(23)
+        cls.rgb = rng.integers(0, 256, (N, H, W, 4)).astype(np.uint8)
+        cls.chunks = []
+        enc = cz.create_encoder(W, H, fps=FPS, has_rgb=True, on_chunk=cls.chunks.append)
+        for i in range(N):
+            enc.add_frame(rgb=cls.rgb[i])
+        enc.finish()
+        cls.data = b"".join(cls.chunks)
+
+    def test_round_trips_with_no_signal_tracks(self):
+        out = cz.decode(self.data)
+        self.assertEqual(out["signals"], {}, "an rgb-only file declares no signals")
+        self.assertEqual(out["rgb"].shape, (N, H, W, 4))
+
+    def test_probe_and_metadata_describe_an_rgb_only_file(self):
+        info = cz.probe(self.data)
+        self.assertTrue(info["has_rgb"])
+        self.assertEqual(info["signals"], [])
+        self.assertEqual(info["frames"], N)
+        streamed = cz.parse_metadata(self.data)
+        batch = cz.parse_metadata(cz.encode({}, rgb=self.rgb, fps=FPS))
+        self.assertEqual(streamed["signals"], batch["signals"],
+                         "streamed and batch rgb-only files must describe the same (no) tracks")
+        self.assertEqual(streamed["rgb"], batch["rgb"])
+
+    def test_none_empty_list_and_empty_dict_signals_are_equivalent(self):
+        for signals in (None, [], {}):
+            with self.subTest(signals=signals):
+                chunks = []
+                enc = cz.create_encoder(W, H, signals=signals, fps=FPS, has_rgb=True,
+                                        on_chunk=chunks.append)
+                enc.add_frame(rgb=self.rgb[0])
+                enc.finish()
+                out = cz.decode(b"".join(chunks))
+                self.assertEqual(out["signals"], {})
+                self.assertEqual(out["rgb"].shape, (1, H, W, 4))
+
+    def test_a_stream_with_no_tracks_at_all_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "rgb or at least one"):
+            cz.create_encoder(W, H, fps=FPS)
+        with self.assertRaisesRegex(ValueError, "rgb or at least one"):
+            cz.create_encoder(W, H, signals=[], fps=FPS, has_rgb=False)
+
+
 if __name__ == "__main__":
     unittest.main()
