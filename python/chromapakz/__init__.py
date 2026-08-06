@@ -280,8 +280,6 @@ def _normalize_stream_signals(signals):
             if not isinstance(sid, str) or not sid:
                 raise ValueError(f"each signal needs a string 'id' (got {raw!r})")
             items.append((sid, sp))
-    if not items:
-        raise ValueError("create_encoder: need at least one signal")
     seen = set()
     for sid, sp in items:
         if sid in seen:
@@ -313,6 +311,11 @@ class StreamEncoder:
         if on_chunk is not None and not callable(on_chunk):
             raise ValueError("on_chunk must be callable (e.g. a file object's .write)")
         self._specs = _normalize_stream_signals(signals)
+        # RGB-only takes (video + wrapper metadata, no aux planes) are valid — the native
+        # ABI already accepts num_signals == 0 with has_rgb. A stream with no tracks at
+        # all is not. Mirrors the batch encoder's "need at least one signal or rgb".
+        if not self._specs and not has_rgb:
+            raise ValueError("create_encoder: need rgb or at least one signal")
         self.width, self.height, self.fps = int(width), int(height), int(fps)
         self.has_rgb = bool(has_rgb)
         self._on_chunk = on_chunk
@@ -471,9 +474,10 @@ def create_encoder(width, height, signals=None, fps=30, has_rgb=False, rgb_kbps=
         enc.finish()
 
     `signals` is a list of specs (each with an `id`, plus `near`/`far`/`levels` for an
-    inverse-depth signal), or a `{id: spec}` dict; the order fixes the track numbering. RGB
-    presence is declared here rather than inferred, because the header — including the track
-    plan — is written before the first frame arrives.
+    inverse-depth signal), or a `{id: spec}` dict; the order fixes the track numbering. It may
+    be empty or None for an RGB-only take (`has_rgb=True`) — video plus wrapper metadata, no
+    auxiliary planes. RGB presence is declared here rather than inferred, because the header —
+    including the track plan — is written before the first frame arrives.
 
     Each frame's signal payload is `(H, W)` uint16 codes, `{"u16": codes}`, or `{"float": z}` for
     a signal with an inverse-depth range (quantized for you, as the browser encoder does). Every
