@@ -4,6 +4,38 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## Unreleased
+
+### Added
+
+- **Streaming encode from Python: `cz.create_encoder()`.** The Python API was batch-only —
+  `encode()` needs every frame up front — so live capture from a robot, rig or simulator had no
+  path, and an interrupted take lost everything rather than its tail. The new encoder writes the
+  file as it is captured, mirroring the browser encoder's `onChunk`: the header goes out before the
+  first frame, whole Cluster elements follow as they close, and nothing it retains grows with the
+  take. Because the Segment carries an unknown size, what is on disk is a valid, decodable WebM at
+  every point.
+
+  ```python
+  enc = cz.create_encoder(W, H, fps=30, has_rgb=True, on_chunk=f.write,
+                          signals=[{"id": "depth", "near": 0.4, "far": 12.0}])
+  enc.add_frame(rgb=rgba, signals={"depth": {"float": z}})
+  enc.finish()
+  ```
+
+  The chunks are element-aligned, so a wrapper format can interleave its own Matroska elements
+  between them without re-parsing byte boundaries — pass `cues=False` when it does, since injected
+  bytes invalidate the cue offsets. See [docs/API.md](docs/API.md#streaming-encode-live-recording).
+- **C ABI: `dc_stream_create` / `_header` / `_add_frame` / `_finish` / `_destroy`**, the entry
+  points behind it. Additive — no existing declaration changed, and a batch encode produces
+  byte-identical output to 0.3.1.
+
+### Internal
+
+- The two batch encode paths and the streaming one now share one `TrackEncoder`, and the batch and
+  streaming muxers share their EBML header, track and Cues builders, rather than each carrying its
+  own copy of the libvpx configuration.
+
 ## 0.3.1 — 2026-08-05
 
 A documentation release. No code changed: the wheels, the npm tarball and the file format are

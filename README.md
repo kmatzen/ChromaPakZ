@@ -151,7 +151,7 @@ Format schema: [`docs/FORMAT.md`](https://github.com/kmatzen/ChromaPakZ/blob/mai
 |---|---|---|
 | **Browser** | WebCodecs VP9 | none — `src/chromapakz.js`, `src/signals.js`, `src/webm.js`. Multi-signal streaming API. |
 | **C++** | libvpx VP9 | CMake → `build/_core` + `dccli` (`dc_encode_multi`, `dc_decode_signal`) |
-| **Python** | ctypes → C++ | `pip install .` — `encode()`, `decode()`, `parse_metadata()` |
+| **Python** | ctypes → C++ | `pip install .` — `encode()`, `create_encoder()`, `decode()`, `parse_metadata()` |
 
 ```sh
 ./build/dccli encodergbd rgb.rgba depth.u16 W H N fps near far kbps out.webm
@@ -232,4 +232,4 @@ Working end-to-end and verified across all three implementations. Honest caveats
   These are Playwright engine builds — reconfirm on shipping browsers before hard claims.
 - **"Royalty-free"** reflects the AOMedia/Google position on VP9; Sisvel operates pools that dispute it.
 - An **auto precision picker** (estimate the sensor noise floor to choose `--depth-bits`) is future work.
-- **Network byte streaming** is supported via `onChunk` on encode and `createDecoder()` + `push()`/`finish()` on decode. See [`docs/API.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/API.md).
+- **Network byte streaming** is supported via `onChunk` on encode and `createDecoder()` + `push()`/`finish()` on decode; Python has the same streaming encoder as `create_encoder()`, for live recording. See [`docs/API.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/API.md).
