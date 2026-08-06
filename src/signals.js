@@ -48,7 +48,12 @@ export function normalizeMetadata(meta){
 }
 
 export function planSignals(specs, hasRgb){
-  if(!specs?.length) throw new Error('planSignals: need at least one signal spec');
+  // An RGB-only take (video + wrapper metadata, no aux planes) is a valid plan; a file
+  // with no tracks at all is not.
+  if(!specs?.length){
+    if(!hasRgb) throw new Error('planSignals: need rgb or at least one signal spec');
+    return [];
+  }
   const signals=[];
   // Numbering is frozen here, so `hasRgb` must be final: a track reserved for RGB that never
   // arrives (or an RGB track claimed after the fact) collides with signals[0].tracks.hi.
