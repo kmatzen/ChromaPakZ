@@ -89,6 +89,71 @@ DC_API int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
                            int W, int H, int N, int fps,
                            uint8_t** out, size_t* out_len);
 
+// ── streaming (live-recording) encode ──
+// dc_encode_multi needs the whole take up front. These entry points encode it frame by frame and
+// hand back the bytes as they become final, so a recorder can write (or transmit) a growing file
+// and lose at most the tail if it crashes. What is retained is the encoder state, the cluster
+// currently open (at most a second of media) and — only when one was asked for — the cue index,
+// about a dozen bytes per second. Never the frames already written.
+//
+// The chunks are *element-aligned*: dc_stream_header returns the whole file prefix (EBML header,
+// an unknown-size Segment, Info/Tracks/Tags), and every later chunk is a whole number of complete
+// Cluster elements. A wrapper format can therefore interleave its own Matroska elements between
+// chunks without re-parsing byte boundaries. The Segment size is written "unknown", so the file is
+// valid WebM — playable and decodable — from the first chunk onward, and stays valid if the
+// recording is cut short. The metadata carries "frames":null; readers recover the count by
+// counting blocks, exactly as they do for a browser-streamed file.
+//
+// Concatenating header + every chunk + the finish() bytes yields a file byte-identical to what a
+// reader would have received over the wire, and one the dc_decode_* entry points read normally.
+typedef struct dc_stream_encoder dc_stream_encoder_t;
+
+// Open a streaming encoder for a W*H, `fps` recording of `num_signals` lossless uint16 signals
+// plus, when has_rgb is nonzero, a lossy RGB track. The specs' `data` fields are ignored — planes
+// arrive per frame — but their ids and quantization are recorded in the header, so they must be
+// final here. Track numbering matches dc_encode_multi: RGB is 1 when present, then hi/lo per
+// signal in the order given. Release the handle with dc_stream_destroy(), always: a failed
+// add_frame does not free it.
+//
+// `emit_cues` decides up front whether the recording is given a seek index at finish(). Say no
+// when something else will insert bytes between the chunks: cue positions are byte offsets into
+// the Segment, and injected elements move every cluster out from under them. Declining also means
+// no index is accumulated, which is what leaves memory flat over a long take.
+// Errors: 1 = invalid argument: NULL out/handle, no inputs at all, a spec with a NULL id, N/A
+//             dimensions (same bound as dc_encode_multi) or fps <= 0;
+//         2 = the RGB encoder could not be opened; 3 = a signal encoder could not be opened;
+//         11 = internal failure; 12 = this libvpx cannot do lossless VP9.
+DC_API int dc_stream_create(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_cues,
+                            const dc_signal_spec_t* signals, int num_signals,
+                            dc_stream_encoder_t** out);
+
+// Copy out the file prefix. Valid — and worth writing to disk — before any frame is encoded.
+// Errors: 1 = NULL argument; 5 = allocation failed.
+DC_API int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len);
+
+// Encode one frame. `rgba` is W*H*4 bytes and required exactly when the stream declared RGB;
+// `signal_planes` is an array of num_signals pointers to W*H uint16 samples, in the order given
+// at create time. Every declared stream must be present on every frame — a track that stops and
+// resumes cannot be realigned, since each carries its own frame counter.
+// *out receives whatever became final (zero or more whole Cluster elements) and may come back
+// NULL with *out_len 0, which is normal: most frames only extend the open cluster. Release a
+// non-NULL *out with dc_free().
+// Errors: 1 = NULL argument or a missing plane; 2 = RGB encode failed; 3 = a signal encode
+//         failed; 5 = allocation failed; 6 = the stream is already finished.
+DC_API int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,
+                               const uint16_t* const* signal_planes,
+                               uint8_t** out, size_t* out_len);
+
+// Flush the codecs, close the last cluster and append the Cues index if one was asked for at
+// create time. The handle is spent afterwards — destroy it. Same out-param contract as
+// dc_stream_add_frame.
+// Errors: 1 = NULL argument; 2/3 = a codec flush failed; 5 = allocation failed;
+//         6 = already finished.
+DC_API int dc_stream_finish(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len);
+
+// Release the handle and its codec state. NULL is a no-op; a finished stream still needs this.
+DC_API void dc_stream_destroy(dc_stream_encoder_t* enc);
+
 // Copy the raw metadata JSON out as a NUL-terminated malloc'd string (*json_len excludes the NUL).
 // Release with dc_free(). Errors: 1 = NULL argument or no metadata; 5 = allocation failed.
 DC_API int dc_get_metadata(const uint8_t* webm, size_t len, char** json_out, size_t* json_len);

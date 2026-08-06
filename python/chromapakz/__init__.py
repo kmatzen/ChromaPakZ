@@ -9,6 +9,15 @@
     )
     out = cz.decode(data)
     out["signals"]["depth"]
+
+Live recording, one frame at a time, is `create_encoder()`:
+
+    with open("take.webm", "wb") as f:
+        enc = cz.create_encoder(W, H, signals=[{"id": "depth", "near": 0.4, "far": 12}],
+                                has_rgb=True, on_chunk=f.write)
+        for rgba, z in frames:
+            enc.add_frame(rgb=rgba, signals={"depth": {"float": z}})
+        enc.finish()
 """
 import ctypes
 import glob
@@ -34,6 +43,7 @@ _DECODE_ERRORS = {
 u16p, u8p, f32p = (ctypes.POINTER(t) for t in (ctypes.c_uint16, ctypes.c_uint8, ctypes.c_float))
 intp, dblp = ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_double)
 _I, _D, _Z = ctypes.c_int, ctypes.c_double, ctypes.c_size_t
+_P = ctypes.c_void_p   # opaque dc_stream_encoder_t*
 
 
 class _SignalSpec(ctypes.Structure):
@@ -86,6 +96,39 @@ def _load():
     lib.dc_free.argtypes = [u8p]
     _lib = lib
     return _lib
+
+
+# The streaming entry points are bound separately, and only when a stream is actually opened: a
+# core built before they existed still loads, and every batch call keeps working, rather than
+# every use of the package failing at bind time on one missing symbol.
+_stream_bound = False
+
+
+def _load_stream():
+    """Load the core and bind dc_stream_*. Raises OSError if this core predates them."""
+    global _stream_bound
+    lib = _load()
+    if _stream_bound:
+        return lib
+    try:
+        create, header, add, fin, destroy = (
+            lib.dc_stream_create, lib.dc_stream_header, lib.dc_stream_add_frame,
+            lib.dc_stream_finish, lib.dc_stream_destroy)
+    except AttributeError as e:
+        raise OSError(
+            f"this ChromaPakZ native core has no streaming encoder ({e}) — it was built before "
+            "create_encoder() existed; rebuild it with `pip install .` or `cmake --build build`."
+        ) from e
+    create.argtypes = [_I, _I, _I, _I, _I, _I, ctypes.POINTER(_SignalSpec), _I, ctypes.POINTER(_P)]
+    header.argtypes = [_P, ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
+    add.argtypes = [_P, u8p, ctypes.POINTER(u16p), ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
+    fin.argtypes = [_P, ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
+    destroy.argtypes = [_P]
+    destroy.restype = None
+    for fn in (create, header, add, fin):
+        fn.restype = ctypes.c_int
+    _stream_bound = True
+    return lib
 
 
 def _take(out, out_len):
@@ -204,6 +247,249 @@ def encode(signals=None, specs=None, rgb=None, fps=30, rgb_kbps=2000):
     if rc:
         raise RuntimeError(f"encode failed ({rc})")
     return _take(out, out_len)
+
+
+# ── streaming (live-recording) encode ──
+# encode() needs the whole take in memory before it writes a byte. This path writes the file as it
+# is captured: the header goes out before the first frame, whole Cluster elements follow as they
+# close, and what is on disk is a valid, decodable WebM at every point — so a crashed capture
+# loses the tail rather than the take.
+
+_STREAM_ERRORS = {
+    1: "invalid argument",
+    2: "the RGB encoder failed",
+    3: "a signal encoder failed",
+    5: "allocation failed",
+    6: "the stream is already finished",
+}
+
+
+def _stream_error(op, rc):
+    return RuntimeError(f"{op} failed ({_STREAM_ERRORS.get(rc, rc)})")
+
+
+def _normalize_stream_signals(signals):
+    """[{'id': 'depth', 'near':…, 'far':…}, …] (or {id: spec}) → [(id, spec)] in track order."""
+    if isinstance(signals, dict):
+        items = [(sid, dict(sp or {})) for sid, sp in signals.items()]
+    else:
+        items = []
+        for raw in signals or []:
+            sp = dict(raw)
+            sid = sp.pop("id", None)
+            if not isinstance(sid, str) or not sid:
+                raise ValueError(f"each signal needs a string 'id' (got {raw!r})")
+            items.append((sid, sp))
+    if not items:
+        raise ValueError("create_encoder: need at least one signal")
+    seen = set()
+    for sid, sp in items:
+        if sid in seen:
+            raise ValueError(f"duplicate signal id {sid!r}")
+        seen.add(sid)
+        # Matching planSignals() in the JS encoder: a spec carrying `near` is inverse-depth,
+        # whether or not it says so.
+        if sp.get("inverse_depth") or "near" in sp:
+            if "near" not in sp or "far" not in sp:
+                raise ValueError(f"signal {sid!r}: inverse_depth requires near and far")
+            _check_inverse_depth(sp["near"], sp["far"], sp.get("levels", LEVELS_FULL))
+            sp["inverse_depth"] = True
+    return items
+
+
+class StreamEncoder:
+    """Incremental encoder — see :func:`create_encoder`. Not thread-safe."""
+
+    def __init__(self, width, height, signals, fps=30, has_rgb=False, rgb_kbps=2000,
+                 on_chunk=None, cues=True):
+        # First, so __del__ finds them however early construction fails.
+        self._h = self._destroy = None
+        self._finished = False
+        if not isinstance(fps, (int, np.integer)) or fps <= 0:
+            raise ValueError(f"fps must be a positive integer (got {fps!r})")
+        for name, v in (("width", width), ("height", height)):
+            if not isinstance(v, (int, np.integer)) or v <= 0:
+                raise ValueError(f"{name} must be a positive integer (got {v!r})")
+        if on_chunk is not None and not callable(on_chunk):
+            raise ValueError("on_chunk must be callable (e.g. a file object's .write)")
+        self._specs = _normalize_stream_signals(signals)
+        self.width, self.height, self.fps = int(width), int(height), int(fps)
+        self.has_rgb = bool(has_rgb)
+        self._on_chunk = on_chunk
+        self._cues = bool(cues)
+        self._n = 0
+
+        lib = self._lib = _load_stream()
+        c_specs = (_SignalSpec * len(self._specs))()
+        for i, (sid, sp) in enumerate(self._specs):
+            c_specs[i].id = sid.encode("utf-8")
+            c_specs[i].data = None
+            c_specs[i].inverse_depth = 1 if sp.get("inverse_depth") else 0
+            c_specs[i].near_ = sp.get("near", 0.0)
+            c_specs[i].far_ = sp.get("far", 0.0)
+            c_specs[i].levels = sp.get("levels", LEVELS_FULL)
+        h = _P()
+        rc = lib.dc_stream_create(self.width, self.height, self.fps, int(rgb_kbps),
+                                  1 if self.has_rgb else 0, 1 if self._cues else 0,
+                                  c_specs, len(c_specs), ctypes.byref(h))
+        if rc:
+            raise _stream_error("create_encoder", rc)
+        self._h = h
+        # Bound to the instance so close() needs nothing from module state, which may already be
+        # torn down when __del__ runs at interpreter exit.
+        self._destroy, self._free = lib.dc_stream_destroy, lib.dc_free
+        self.header = self._emit(self._take_chunk(lib.dc_stream_header, "header"))
+
+    # ── plumbing ──
+    def _take_chunk(self, fn, op, *args):
+        out, out_len = u8p(), _Z()
+        rc = fn(self._h, *args, ctypes.byref(out), ctypes.byref(out_len))
+        if rc:
+            raise _stream_error(op, rc)
+        if not out_len.value:
+            return b""     # the usual case: this frame only extended the open cluster
+        try:
+            return ctypes.string_at(out, out_len.value)
+        finally:
+            self._free(out)
+
+    def _emit(self, chunk):
+        if chunk and self._on_chunk is not None:
+            self._on_chunk(chunk)
+        return chunk
+
+    def _plane(self, sid, spec, payload):
+        """One signal's frame payload → contiguous (H, W) uint16 codes."""
+        if isinstance(payload, dict):
+            if "u16" in payload:
+                arr = _as_u16(payload["u16"], f"signal {sid!r}")
+            elif "float" in payload:
+                if not spec.get("inverse_depth"):
+                    raise ValueError(f"signal {sid!r}: {{'float': …}} needs an inverse-depth "
+                                     "range — declare near/far for it in create_encoder()")
+                arr = quantize_inverse(payload["float"], spec["near"], spec["far"],
+                                       spec.get("levels", LEVELS_FULL))
+            else:
+                raise ValueError(f"signal {sid!r}: pass an array, {{'u16': …}} or {{'float': …}}")
+        else:
+            arr = _as_u16(payload, f"signal {sid!r}")
+        if arr.shape != (self.height, self.width):
+            raise ValueError(f"signal {sid!r} has shape {arr.shape}, "
+                             f"expected {(self.height, self.width)}")
+        return arr
+
+    # ── the API ──
+    @property
+    def frame_count(self):
+        """Frames accepted so far. A rejected frame is not counted."""
+        return self._n
+
+    def add_frame(self, rgb=None, signals=None):
+        """Encode one frame; returns the bytes that just became final (often ``b""``).
+
+        Every stream the encoder declared must be present on every frame: each track carries its
+        own frame counter, so one that stops and resumes cannot be realigned.
+        """
+        if self._h is None:
+            raise RuntimeError("encoder is closed")
+        if self._finished:
+            raise RuntimeError("add_frame after finish()")
+        signals = dict(signals or {})
+        extra = set(signals) - {sid for sid, _ in self._specs}
+        if extra:
+            raise ValueError(f"unknown signal(s) {sorted(extra)} — this encoder declared "
+                             f"{[sid for sid, _ in self._specs]}")
+        # Validate and quantize everything before the native call: a rejected frame must leave the
+        # stateful VP9 encoders untouched, so the caller can fix it and carry on.
+        planes = []
+        for sid, spec in self._specs:
+            if sid not in signals or signals[sid] is None:
+                raise ValueError(f"frame {self._n} is missing signal {sid!r}; every declared "
+                                 "signal must be written on every frame")
+            planes.append(self._plane(sid, spec, signals[sid]))
+        rgb_p = u8p()
+        if self.has_rgb:
+            if rgb is None:
+                raise ValueError(f"frame {self._n} carries no rgb, but this encoder was created "
+                                 "with has_rgb=True")
+            rgba = _as_u8(rgb, "rgb")
+            if rgba.shape != (self.height, self.width, 4):
+                raise ValueError(f"rgb has shape {rgba.shape}, "
+                                 f"expected {(self.height, self.width, 4)} RGBA")
+            rgb_p = rgba.ctypes.data_as(u8p)
+        elif rgb is not None:
+            raise ValueError("this encoder was created with has_rgb=False, so it has no rgb "
+                             "track to write this frame to")
+
+        c_planes = (u16p * len(planes))(*(p.ctypes.data_as(u16p) for p in planes))
+        chunk = self._take_chunk(self._lib.dc_stream_add_frame, "add_frame", rgb_p, c_planes)
+        self._n += 1
+        return self._emit(chunk)
+
+    def finish(self):
+        """Flush the codecs and close the file; returns the tail bytes (last cluster + Cues).
+
+        ``header`` + every ``add_frame()`` chunk + this is the complete WebM.
+        """
+        if self._h is None:
+            raise RuntimeError("encoder is closed")
+        if self._finished:
+            raise RuntimeError("finish() called twice")
+        tail = self._take_chunk(self._lib.dc_stream_finish, "finish")
+        self._finished = True
+        return self._emit(tail)
+
+    def close(self):
+        """Release the native encoder state. Idempotent; does *not* write the tail."""
+        if self._h is not None:
+            self._destroy(self._h)
+            self._h = None
+
+    __del__ = close
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # A take abandoned by an exception keeps whatever chunks already went out — that is the
+        # point of streaming — but writing a tail for it would claim a clean ending it never had.
+        try:
+            if exc_type is None and not self._finished:
+                self.finish()
+        finally:
+            self.close()
+        return False
+
+
+def create_encoder(width, height, signals=None, fps=30, has_rgb=False, rgb_kbps=2000,
+                   on_chunk=None, cues=True):
+    """Open a streaming encoder for a live W*H capture.
+
+        enc = cz.create_encoder(W, H, fps=30, has_rgb=True, on_chunk=f.write,
+                                signals=[{"id": "depth", "near": 0.4, "far": 12.0}])
+        enc.add_frame(rgb=rgba, signals={"depth": {"float": z}})
+        enc.finish()
+
+    `signals` is a list of specs (each with an `id`, plus `near`/`far`/`levels` for an
+    inverse-depth signal), or a `{id: spec}` dict; the order fixes the track numbering. RGB
+    presence is declared here rather than inferred, because the header — including the track
+    plan — is written before the first frame arrives.
+
+    Each frame's signal payload is `(H, W)` uint16 codes, `{"u16": codes}`, or `{"float": z}` for
+    a signal with an inverse-depth range (quantized for you, as the browser encoder does). Every
+    declared signal, and `rgb` when `has_rgb`, must be present on every frame.
+
+    Chunks are element-aligned — `header` is the whole file prefix, each later chunk a whole
+    number of Cluster elements — so a wrapper format can interleave its own Matroska elements
+    between them. Pass `cues=False` when it does: cue positions are byte offsets into the Segment,
+    which injected bytes invalidate.
+
+    `on_chunk` is called with each chunk as it is produced (`header` at construction). It is also
+    returned, so a pull-style writer can ignore the callback entirely. Nothing retained here grows
+    with the take: the encoder state, the open cluster, and the cue index if one was asked for.
+    """
+    return StreamEncoder(width, height, signals, fps=fps, has_rgb=has_rgb, rgb_kbps=rgb_kbps,
+                         on_chunk=on_chunk, cues=cues)
 
 
 def parse_metadata(data):
