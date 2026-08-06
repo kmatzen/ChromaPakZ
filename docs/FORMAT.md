@@ -39,4 +39,22 @@ Track names: `rgb`, `signal-{id}-hi`, `signal-{id}-lo`.
 
 Depth is a **signal id**, not a separate metadata schema. Use `quant: { type: "inverse-depth", … }` for float depth; `quant: null` for raw uint16.
 
+## Streaming profile
+
+A file written incrementally — by the browser encoder's `onChunk`, by Python's `create_encoder()`,
+or by anything wrapping them — differs from a batch-written one in three ways, all of them
+consequences of the header having to be final before the take exists:
+
+- the **Segment size is unknown** (the reserved all-ones EBML vint) rather than a byte count, so
+  clusters appended later are still inside it and the file is valid from the first chunk;
+- **`"frames": null`** and **`"streaming": true`** in the metadata — the count is not known when
+  the tag is written. Readers recover it by counting blocks on the busiest track;
+- **`Duration`** is omitted from `Info`, for the same reason. Seeking relies on `Cues`, which is
+  written at the end and may legitimately be absent if the recording was cut short — or suppressed
+  deliberately, when a wrapper inserts its own elements between clusters and moves the offsets the
+  cue points hold.
+
+Everything else — track layout, names, block timestamps, the packing scheme — is identical, and
+both writers produce files the other's reader decodes bit-exactly.
+
 See [`docs/API.md`](API.md) for encode/decode APIs.
