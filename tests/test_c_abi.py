@@ -99,6 +99,63 @@ for label, w, h in [
 ]:
     check(enc(w=w, h=h) == 1, f"{label} -> 1")
 
+print("dc_stream_* argument validation and lifecycle")
+cz._load_stream()   # binds the streaming entry points' argtypes
+h = ctypes.c_void_p()
+cout, clen = u8p(), ctypes.c_size_t()
+stream_spec = (cz._SignalSpec * 1)(cz._SignalSpec())
+stream_spec[0].id, stream_spec[0].levels = b"depth", cz.LEVELS_FULL
+
+
+def screate(w=W, h_=H, fps=30, nsig=1, sigs=stream_spec, rgb=0, cues=1, o=True):
+    return lib.dc_stream_create(w, h_, fps, 2000, rgb, cues, sigs, nsig,
+                                ctypes.byref(h) if o else None)
+
+
+check(screate(o=False) == 1, "dc_stream_create(NULL out) -> 1")
+check(screate(fps=0) == 1, "dc_stream_create(fps=0) -> 1")
+check(screate(w=0) == 1, "dc_stream_create(W=0) -> 1")
+check(screate(w=65536, h_=65536) == 1, "dc_stream_create with wrapping W*H -> 1")
+check(screate(nsig=1, sigs=None) == 1, "dc_stream_create(num_signals>0, NULL array) -> 1")
+check(screate(nsig=0, sigs=None) == 1, "dc_stream_create with no signals and no rgb -> 1")
+check(screate(nsig=1, sigs=(cz._SignalSpec * 1)(cz._SignalSpec())) == 1,
+      "dc_stream_create with a NULL spec id -> 1")
+
+# NULL handles must be refused, not dereferenced — and dc_stream_destroy(NULL) must be a no-op.
+check(lib.dc_stream_header(None, ctypes.byref(cout), ctypes.byref(clen)) == 1,
+      "dc_stream_header(NULL handle) -> 1")
+check(lib.dc_stream_add_frame(None, None, None, ctypes.byref(cout), ctypes.byref(clen)) == 1,
+      "dc_stream_add_frame(NULL handle) -> 1")
+check(lib.dc_stream_finish(None, ctypes.byref(cout), ctypes.byref(clen)) == 1,
+      "dc_stream_finish(NULL handle) -> 1")
+lib.dc_stream_destroy(None)
+check(True, "dc_stream_destroy(NULL) is a no-op")
+
+check(screate() == 0, "dc_stream_create with usable arguments -> 0")
+plane = np.zeros(H * W, dtype=np.uint16)
+planes1 = (u16p * 1)(plane.ctypes.data_as(u16p))
+nullplanes = (u16p * 1)(u16p())
+check(lib.dc_stream_header(h, None, ctypes.byref(clen)) == 1, "dc_stream_header(NULL out) -> 1")
+check(lib.dc_stream_add_frame(h, None, None, ctypes.byref(cout), ctypes.byref(clen)) == 1,
+      "add_frame with a NULL plane array -> 1")
+check(lib.dc_stream_add_frame(h, None, nullplanes, ctypes.byref(cout), ctypes.byref(clen)) == 1,
+      "add_frame with a NULL plane pointer -> 1")
+# The stream declared no RGB track, so a frame carrying RGB has nowhere to put it.
+check(lib.dc_stream_add_frame(h, wb, planes1, ctypes.byref(cout), ctypes.byref(clen)) == 1,
+      "add_frame with unexpected rgb -> 1")
+check(lib.dc_stream_add_frame(h, None, planes1, ctypes.byref(cout), ctypes.byref(clen)) == 0,
+      "add_frame with a valid plane -> 0")
+check(lib.dc_stream_finish(h, ctypes.byref(cout), ctypes.byref(clen)) == 0,
+      "dc_stream_finish -> 0")
+if clen.value:
+    lib.dc_free(cout)
+check(lib.dc_stream_finish(h, ctypes.byref(cout), ctypes.byref(clen)) == 6,
+      "dc_stream_finish twice -> 6")
+check(lib.dc_stream_add_frame(h, None, planes1, ctypes.byref(cout), ctypes.byref(clen)) == 6,
+      "add_frame after finish -> 6")
+lib.dc_stream_destroy(h)
+check(True, "dc_stream_destroy on a finished stream does not crash")
+
 print("garbage input returns an error instead of crashing")
 mj, mlen = ctypes.c_char_p(), ctypes.c_size_t()
 for name, junk, must_fail in [

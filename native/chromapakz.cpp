@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <algorithm>
+#include <memory>
 #include <new>
 
 #include <vpx/vpx_encoder.h>
@@ -84,30 +85,55 @@ Bytes simpleBlock(int track, int relTime, bool key, const uint8_t* data, size_t 
   return el(ID_SimpleBlock, p);
 }
 
-Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
-          const std::string& metadata, int durationMs, int clusterSpanMs=30000){
+Bytes ebmlHeader(){
   Bytes hdr;
   append(hdr, elU(ID_EBMLVersion,1)); append(hdr, elU(ID_EBMLReadVersion,1));
   append(hdr, elU(ID_EBMLMaxIDLength,4)); append(hdr, elU(ID_EBMLMaxSizeLength,8));
   append(hdr, elS(ID_DocType,"webm")); append(hdr, elU(ID_DocTypeVersion,2)); append(hdr, elU(ID_DocTypeReadVersion,2));
-  Bytes header = el(ID_EBML, hdr);
+  return el(ID_EBML, hdr);
+}
 
+// The Segment's leading elements — Info, Tracks and the CHROMAPAKZ tag. Everything a reader needs
+// before the first block, which is exactly what the streaming muxer emits up front.
+Bytes buildPre(const std::vector<Track>& tracks, const std::string& metadata, int durationMs){
   Bytes info; append(info, elU(ID_TimestampScale,1000000));
   if(durationMs>0) append(info, el(ID_Duration, f8((double)durationMs)));
   append(info, elS(ID_MuxingApp,"chromapakz")); append(info, elS(ID_WritingApp,"chromapakz"));
-  Bytes seg; append(seg, el(ID_Info, info));
+  Bytes pre; append(pre, el(ID_Info, info));
 
-  Bytes te; for(auto& t : tracks) append(te, trackEntry(t)); append(seg, el(ID_Tracks, te));
+  Bytes te; for(auto& t : tracks) append(te, trackEntry(t)); append(pre, el(ID_Tracks, te));
 
   if(!metadata.empty()){
     Bytes st; append(st, elS(ID_TagName,"CHROMAPAKZ")); append(st, elS(ID_TagString, metadata));
     Bytes tag; append(tag, el(ID_Targets, Bytes{})); append(tag, el(ID_SimpleTag, st));
-    append(seg, el(ID_Tags, el(ID_Tag, tag)));
+    append(pre, el(ID_Tags, el(ID_Tag, tag)));
   }
+  return pre;
+}
 
-  // Cue track = the RGB track if present, else the first track. Clusters start on its keyframes.
+// Cue track = the RGB track if present, else the first track. Clusters start on its keyframes.
+int cueTrackOf(const std::vector<Track>& tracks){
   int cueTrack = tracks.empty()?1:tracks[0].number;
   for(auto& t : tracks) if(t.name=="rgb") cueTrack=t.number;
+  return cueTrack;
+}
+
+// cues: (cue time ms, byte offset of the Cluster from the start of the Segment's data).
+Bytes cuesElement(const std::vector<std::pair<int,size_t>>& cues, int cueTrack){
+  Bytes cb;
+  for(auto& c : cues){
+    Bytes tp; append(tp, elU(ID_CueTrack, cueTrack)); append(tp, elU(ID_CueClusterPosition, c.second));
+    Bytes pt; append(pt, elU(ID_CueTime, c.first)); append(pt, el(ID_CueTrackPositions, tp));
+    append(cb, el(ID_CuePoint, pt));
+  }
+  return el(ID_Cues, cb);
+}
+
+Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
+          const std::string& metadata, int durationMs, int clusterSpanMs=30000){
+  Bytes header = ebmlHeader();
+  Bytes seg = buildPre(tracks, metadata, durationMs);
+  int cueTrack = cueTrackOf(tracks);
 
   std::stable_sort(frames.begin(), frames.end(), [](const Frame&a, const Frame&b){ return a.timeMs<b.timeMs; });
   std::vector<std::pair<int,size_t>> cues;   // (cue time ms, Segment-relative byte offset of cluster)
@@ -127,18 +153,67 @@ Bytes mux(const std::vector<Track>& tracks, std::vector<Frame> frames,
   }
   flush();
 
-  if(!cues.empty()){
-    Bytes cb;
-    for(auto& c : cues){
-      Bytes tp; append(tp, elU(ID_CueTrack, cueTrack)); append(tp, elU(ID_CueClusterPosition, c.second));
-      Bytes pt; append(pt, elU(ID_CueTime, c.first)); append(pt, el(ID_CueTrackPositions, tp));
-      append(cb, el(ID_CuePoint, pt));
-    }
-    append(seg, el(ID_Cues, cb));
-  }
+  if(!cues.empty()) append(seg, cuesElement(cues, cueTrack));
   Bytes out = header; append(out, el(ID_Segment, seg));
   return out;
 }
+
+// ── incremental mux (live recording) ──
+// The counterpart of createStreamMux() in src/webm.js, and byte-compatible with it: the header
+// goes out before a single frame has been encoded, then each Cluster is handed back as one whole
+// element as it closes. Bytes already handed out are not retained — only the open cluster, and
+// the cue index when one was asked for.
+//
+// The Segment size is written "unknown" (the reserved all-ones vint): clusters are appended after
+// the header has already gone out over the wire, so no finite size written here could cover them,
+// and a truncated recording is still a valid WebM whose blocks all sit inside the Segment.
+Bytes vintUnknown(){ return Bytes{0x01,0xff,0xff,0xff,0xff,0xff,0xff,0xff}; }
+
+struct StreamMux {
+  Bytes header;                              // EBML + Segment id/unknown-size + Info/Tracks/Tags
+  int cueTrack=1, clusterSpanMs=30000;
+  size_t segOffset=0;                        // where the next Cluster starts within the Segment
+  Bytes blocks; int base=0; bool open=false, hasCue=false;
+  // Declining the index is what keeps a long recording's memory flat: nothing accumulates here
+  // either, so only the encoder state and the open cluster are ever held.
+  bool emitCues=true;
+  std::vector<std::pair<int,size_t>> cues;
+
+  void start(const std::vector<Track>& tracks, const std::string& metadata){
+    Bytes pre = buildPre(tracks, metadata, 0);
+    cueTrack = cueTrackOf(tracks);
+    segOffset = pre.size();
+    header = ebmlHeader();
+    append(header, idBytes(ID_Segment)); append(header, vintUnknown()); append(header, pre);
+  }
+
+  Bytes closeCluster(){
+    if(!open) return Bytes{};
+    Bytes cl; append(cl, elU(ID_Timestamp, base)); append(cl, blocks);
+    Bytes e = el(ID_Cluster, cl);
+    if(hasCue && emitCues) cues.push_back({base, segOffset});
+    segOffset += e.size(); blocks.clear(); open=false; hasCue=false;
+    return e;
+  }
+
+  /** Append one SimpleBlock; returns the previous Cluster's bytes when this frame closes it. */
+  Bytes writeFrame(const Frame& f){
+    Bytes out;
+    bool cueKey = f.track==cueTrack && f.key;
+    if(open && (cueKey || f.timeMs-base>=clusterSpanMs)) out = closeCluster();
+    if(!open){ base=f.timeMs; open=true; hasCue=false; }
+    if(cueKey) hasCue=true;
+    append(blocks, simpleBlock(f.track, f.timeMs-base, f.key, f.data, f.len));
+    return out;
+  }
+
+  /** Flush the open cluster and append the Cues index, if one was being kept. */
+  Bytes finish(){
+    Bytes out = closeCluster();
+    if(!cues.empty()) append(out, cuesElement(cues, cueTrack));
+    return out;
+  }
+};
 
 // ── demux ──
 // Everything below parses untrusted bytes. The invariant the readers maintain is that a
@@ -586,7 +661,11 @@ std::string quantJson(const SignalQuantMeta& q){
   return buf;
 }
 
-std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::vector<SignalMeta>& signals){
+// `streaming` writes "frames":null,"streaming":true in place of a count, matching what the JS
+// stream muxer emits: when the header goes out the take has not happened yet, and a reader
+// recovers the count by counting blocks (see the note in dc_probe).
+std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::vector<SignalMeta>& signals,
+                              bool streaming=false){
   // Built with std::string throughout — the document grows with signal count and id length,
   // so a fixed stack buffer would silently truncate (and emit invalid JSON) past some size.
   std::string sigs="[";
@@ -601,8 +680,12 @@ std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::v
   }
   sigs+="]";
   std::string rgb = hasRgb ? "{\"track\":1,\"codec\":\"vp09.00.10.08\"}" : "null";
-  char head[160];
-  snprintf(head,sizeof head,"{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":",W,H,fps,N);
+  char head[192];
+  if(streaming)
+    snprintf(head,sizeof head,
+             "{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":null,\"streaming\":true,\"rgb\":",W,H,fps);
+  else
+    snprintf(head,sizeof head,"{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":",W,H,fps,N);
   std::string out=head; out+=rgb; out+=",\"signals\":"; out+=sigs; out+="}";
   return out;
 }
@@ -612,6 +695,18 @@ struct SignalEncodeSpec {
   const uint16_t* data=nullptr;
   SignalQuantMeta quant;
 };
+
+// Container track descriptors for a plan. Shared by the batch and streaming builders, so both
+// name and number their tracks identically.
+std::vector<Track> tracksForPlan(const std::vector<SignalMeta>& sigMeta, bool hasRgb, int W, int H){
+  std::vector<Track> tracks;
+  if(hasRgb) tracks.push_back({1,"V_VP9","rgb",W,H});
+  for(auto& sm : sigMeta){
+    tracks.push_back({sm.track_hi,"V_VP9","signal-"+sm.id+"-hi",W,H});
+    tracks.push_back({sm.track_lo,"V_VP9","signal-"+sm.id+"-lo",W,H});
+  }
+  return tracks;
+}
 
 std::vector<SignalMeta> planSignalTracks(const std::vector<SignalEncodeSpec>& specs, bool hasRgb){
   std::vector<SignalMeta> out;
@@ -631,52 +726,9 @@ void unpack(const uint8_t* hi, const uint8_t* lo, size_t n, uint16_t* d){
   for(size_t i=0;i<n;i++){ int h=hi[i], l=(h&1)?(255-lo[i]):lo[i]; d[i]=(uint16_t)((h<<8)|l); }
 }
 
-// ── libvpx VP9 lossless encode of an 8-bit luma-plane sequence (chroma const 128) ──
 // NO_LOSSLESS is separate from FAIL because it is the one failure a caller can act on: the
 // libvpx build cannot do what the metadata would claim.
 enum EncStatus { ENC_OK=0, ENC_FAIL=1, ENC_NO_LOSSLESS=2 };
-
-EncStatus encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int fps,
-                         std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
-  vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
-  vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return ENC_FAIL;
-  cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps;
-  cfg.g_profile=0; cfg.g_lag_in_frames=0; cfg.rc_min_quantizer=0; cfg.rc_max_quantizer=0;
-  cfg.kf_mode=VPX_KF_DISABLED; cfg.g_pass=VPX_RC_ONE_PASS; cfg.g_error_resilient=0;
-  vpx_codec_ctx_t c{}; if(vpx_codec_enc_init(&c,iface,&cfg,0)) return ENC_FAIL;
-  // Gate on the lossless control: an old or misbuilt libvpx that rejects it would encode the
-  // packed depth planes LOSSY while the metadata still advertises "lossless":true. Silent data
-  // corruption is worse than a failed encode, so refuse rather than proceed.
-  if(vpx_codec_control(&c, VP9E_SET_LOSSLESS, 1)){ vpx_codec_destroy(&c); return ENC_NO_LOSSLESS; }
-  vpx_codec_control(&c, VP8E_SET_CPUUSED, 1);   // speed knob only — costs time, not fidelity
-  vpx_codec_control(&c, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);   // signal full-range in the bitstream
-  // On failure vpx_img_alloc returns NULL and leaves img.planes unset — the copy loop below
-  // would then memcpy through wild pointers.
-  vpx_image_t img;
-  if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)){ vpx_codec_destroy(&c); return ENC_FAIL; }
-  // Signal FULL range: depth is packed full-range 0..255 in luma. Without this the stream
-  // defaults to limited ("tv") range and any decoder that honours it (e.g. ffmpeg) rescales/
-  // clips the luma, corrupting depth. Full-range makes every conformant decoder reproduce Y exactly.
-  img.cs = VPX_CS_BT_709; img.range = VPX_CR_FULL_RANGE;
-  bool ok=true;
-  for(size_t i=0;i<=planes.size() && ok;i++){
-    vpx_image_t* in=nullptr;
-    if(i<planes.size()){
-      for(int r=0;r<H;r++) memcpy(img.planes[0]+r*img.stride[0], planes[i]+r*W, W);
-      for(int p=1;p<3;p++) for(int r=0;r<(H+1)/2;r++) memset(img.planes[p]+r*img.stride[p],128,(W+1)/2);
-      in=&img;
-    }
-    vpx_enc_frame_flags_t fl = (i==0)?VPX_EFLAG_FORCE_KF:0;
-    if(vpx_codec_encode(&c,in,(vpx_codec_pts_t)i,1,fl,VPX_DL_GOOD_QUALITY)){ ok=false; break; }
-    const vpx_codec_cx_pkt_t* pkt; vpx_codec_iter_t it=nullptr;
-    while((pkt=vpx_codec_get_cx_data(&c,&it))) if(pkt->kind==VPX_CODEC_CX_FRAME_PKT){
-      outFrames.emplace_back((uint8_t*)pkt->data.frame.buf, (uint8_t*)pkt->data.frame.buf+pkt->data.frame.sz);
-      outKey.push_back((pkt->data.frame.flags & VPX_FRAME_IS_KEY)!=0);
-    }
-  }
-  vpx_img_free(&img); vpx_codec_destroy(&c);
-  return ok ? ENC_OK : ENC_FAIL;
-}
 
 // ── decoding untrusted files ──
 // VP9's own maximum frame dimension, plus a pixel-count cap that keeps W*H*4 inside a 32-bit
@@ -751,30 +803,107 @@ void i420ToRGBA(const vpx_image_t* img, int W, int H, uint8_t* rgba){
     p[0]=clamp8(Y+1.5748*Cr); p[1]=clamp8(Y-0.1873*Cb-0.4681*Cr); p[2]=clamp8(Y+1.8556*Cb); p[3]=255; }
 }
 
-// Lossy VP9 RGB track (one forced keyframe + P-frames, matching the browser path).
+// ── one VP9 track encoder, held open across frames ──
+// Both the batch helpers below and the streaming ABI drive this; the difference is only how long
+// it lives. Kept open for the length of a recording, it is what lets a frame's blocks be emitted
+// as the frame is captured instead of at the end of the take.
+//
+// 'luma' tracks carry a packed signal plane in Y with constant 128 chroma and are encoded
+// losslessly; the 'rgba' track is the lossy preview. FULL colour range is signalled in the
+// bitstream either way: depth is packed full-range 0..255 in luma, and a decoder that honoured
+// the default limited ("tv") range would rescale and clip it.
+struct TrackEncoder {
+  vpx_codec_ctx_t ctx{};
+  vpx_image_t img{};
+  bool haveCtx=false, haveImg=false, rgba=false;
+  int W=0, H=0;
+  int keyEvery=0;      // force a keyframe every N frames; 0 = only the first frame
+  int64_t pushed=0;    // frames handed to libvpx, including the terminating flush
+
+  TrackEncoder()=default;
+  TrackEncoder(const TrackEncoder&)=delete;
+  TrackEncoder& operator=(const TrackEncoder&)=delete;
+  ~TrackEncoder(){ if(haveImg) vpx_img_free(&img); if(haveCtx) vpx_codec_destroy(&ctx); }
+
+  EncStatus init(int W_, int H_, int fps, bool lossless, int kbps, int keyEvery_){
+    W=W_; H=H_; rgba=!lossless; keyEvery=keyEvery_;
+    vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
+    vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return ENC_FAIL;
+    cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps;
+    cfg.g_profile=0; cfg.g_lag_in_frames=0; cfg.kf_mode=VPX_KF_DISABLED;
+    if(lossless){
+      cfg.rc_min_quantizer=0; cfg.rc_max_quantizer=0;
+      cfg.g_pass=VPX_RC_ONE_PASS; cfg.g_error_resilient=0;
+    }else{
+      cfg.rc_end_usage=VPX_VBR; cfg.rc_target_bitrate=kbps;
+    }
+    if(vpx_codec_enc_init(&ctx,iface,&cfg,0)) return ENC_FAIL;
+    haveCtx=true;
+    if(lossless){
+      // Gate on the lossless control: an old or misbuilt libvpx that rejects it would encode the
+      // packed depth planes LOSSY while the metadata still advertises "lossless":true. Silent
+      // data corruption is worse than a failed encode, so refuse rather than proceed.
+      if(vpx_codec_control(&ctx, VP9E_SET_LOSSLESS, 1)) return ENC_NO_LOSSLESS;
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 1);   // speed knob only — costs time, not fidelity
+    }else{
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 2);
+      vpx_codec_control(&ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
+    }
+    vpx_codec_control(&ctx, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
+    // On failure vpx_img_alloc returns NULL and leaves img.planes unset — the copy below would
+    // then memcpy through wild pointers.
+    if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)) return ENC_FAIL;
+    haveImg=true;
+    img.cs = VPX_CS_BT_709; img.range = VPX_CR_FULL_RANGE;
+    return ENC_OK;
+  }
+
+  /**
+   * Encode one frame, or flush the encoder when `src` is NULL. Appends whatever packets libvpx
+   * hands back — with g_lag_in_frames=0 that is exactly one per frame, which is what keeps every
+   * track of a streamed recording in lockstep.
+   */
+  bool encode(const uint8_t* src, std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
+    vpx_image_t* in=nullptr;
+    if(src){
+      if(rgba) rgbaToI420(src, W, H, &img);
+      else{
+        for(int r=0;r<H;r++) memcpy(img.planes[0]+r*img.stride[0], src+(size_t)r*W, W);
+        for(int p=1;p<3;p++) for(int r=0;r<(H+1)/2;r++) memset(img.planes[p]+r*img.stride[p],128,(W+1)/2);
+      }
+      in=&img;
+    }
+    vpx_enc_frame_flags_t fl = (pushed==0 || (keyEvery>0 && pushed%keyEvery==0)) ? VPX_EFLAG_FORCE_KF : 0;
+    vpx_codec_pts_t pts=(vpx_codec_pts_t)pushed;
+    pushed++;
+    if(vpx_codec_encode(&ctx,in,pts,1,fl,VPX_DL_GOOD_QUALITY)) return false;
+    const vpx_codec_cx_pkt_t* pkt; vpx_codec_iter_t it=nullptr;
+    while((pkt=vpx_codec_get_cx_data(&ctx,&it))) if(pkt->kind==VPX_CODEC_CX_FRAME_PKT){
+      outFrames.emplace_back((uint8_t*)pkt->data.frame.buf, (uint8_t*)pkt->data.frame.buf+pkt->data.frame.sz);
+      outKey.push_back((pkt->data.frame.flags & VPX_FRAME_IS_KEY)!=0);
+    }
+    return true;
+  }
+};
+
+// VP9 lossless encode of an 8-bit luma-plane sequence, start to finish.
+EncStatus encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int fps,
+                         std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
+  TrackEncoder te;
+  if(EncStatus st=te.init(W,H,fps,/*lossless=*/true,0,/*keyEvery=*/0)) return st;
+  for(size_t i=0;i<=planes.size();i++)
+    if(!te.encode(i<planes.size()?planes[i]:nullptr, outFrames, outKey)) return ENC_FAIL;
+  return ENC_OK;
+}
+
+// Lossy VP9 RGB track (~1s keyframe interval → seekable RGB via Cues, matching the browser path).
 bool encodeRGBSeq(const std::vector<const uint8_t*>& rgba, int W, int H, int fps, int kbps,
                   std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
-  vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
-  vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return false;
-  cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps; cfg.g_profile=0;
-  cfg.g_lag_in_frames=0; cfg.rc_end_usage=VPX_VBR; cfg.rc_target_bitrate=kbps; cfg.kf_mode=VPX_KF_DISABLED;
-  vpx_codec_ctx_t c{}; if(vpx_codec_enc_init(&c,iface,&cfg,0)) return false;
-  vpx_codec_control(&c, VP8E_SET_CPUUSED, 2);
-  vpx_codec_control(&c, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
-  vpx_codec_control(&c, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
-  vpx_image_t img;
-  if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)){ vpx_codec_destroy(&c); return false; }
-  img.cs=VPX_CS_BT_709; img.range=VPX_CR_FULL_RANGE;
-  bool ok=true; int keyEvery = fps>0?fps:30;          // ~1s keyframe interval → seekable RGB (Cues)
-  for(size_t i=0;i<=rgba.size() && ok;i++){ vpx_image_t* in=nullptr;
-    if(i<rgba.size()){ rgbaToI420(rgba[i],W,H,&img); in=&img; }
-    vpx_enc_frame_flags_t fl=(i%keyEvery==0)?VPX_EFLAG_FORCE_KF:0;
-    if(vpx_codec_encode(&c,in,(vpx_codec_pts_t)i,1,fl,VPX_DL_GOOD_QUALITY)){ ok=false; break; }
-    const vpx_codec_cx_pkt_t* pkt; vpx_codec_iter_t it=nullptr;
-    while((pkt=vpx_codec_get_cx_data(&c,&it))) if(pkt->kind==VPX_CODEC_CX_FRAME_PKT){
-      outFrames.emplace_back((uint8_t*)pkt->data.frame.buf,(uint8_t*)pkt->data.frame.buf+pkt->data.frame.sz);
-      outKey.push_back((pkt->data.frame.flags & VPX_FRAME_IS_KEY)!=0); } }
-  vpx_img_free(&img); vpx_codec_destroy(&c); return ok;
+  TrackEncoder te;
+  if(te.init(W,H,fps,/*lossless=*/false,kbps,/*keyEvery=*/fps>0?fps:30)) return false;
+  for(size_t i=0;i<=rgba.size();i++)
+    if(!te.encode(i<rgba.size()?rgba[i]:nullptr, outFrames, outKey)) return false;
+  return true;
 }
 // Same capacity/geometry contract as decodePlaneTrack.
 int decodeRGBTrack(std::vector<Frame>& frs, int W, int H, size_t maxFrames, std::vector<Bytes>& out){
@@ -799,7 +928,7 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
   if(!dimsUsable(W,H) || N<=0 || fps<=0) return 1;
   // Guard the per-frame strides used below ((size_t)i*W*H*4) against wrapping.
   if((size_t)N > SIZE_MAX/((size_t)W*(size_t)H*4)) return 1;
-  std::vector<Track> tracks; std::vector<Frame> frames;
+  std::vector<Frame> frames;
   bool hasRgb=rgba!=nullptr;
   auto sigMeta=planSignalTracks(specs, hasRgb);
   std::vector<Bytes> rgbF; std::vector<bool> rgbK;
@@ -807,13 +936,12 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
     std::vector<const uint8_t*> p(N); for(int i=0;i<N;i++) p[i]=rgba+(size_t)i*W*H*4;
     if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbF,rgbK)) return 2;
     if((int)rgbF.size()!=N) return 6;
-    tracks.push_back({1,"V_VP9","rgb",W,H});
   }
   size_t px=(size_t)W*(size_t)H;
   struct SigEnc { std::vector<Bytes> hiF, loF, hiP, loP; std::vector<bool> hiK, loK; };
   std::vector<SigEnc> enc(specs.size());
   for(size_t si=0; si<specs.size(); si++){
-    auto& sp=specs[si]; auto& se=enc[si]; auto& sm=sigMeta[si];
+    auto& sp=specs[si]; auto& se=enc[si];
     if(!sp.data) return 1;
     se.hiP.resize(N); se.loP.resize(N);
     std::vector<const uint8_t*> hp(N), lp(N);
@@ -825,11 +953,6 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
     if(EncStatus st=encodePlaneSeq(hp,W,H,fps,se.hiF,se.hiK)) return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
     if(EncStatus st=encodePlaneSeq(lp,W,H,fps,se.loF,se.loK)) return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:4;
     if((int)se.hiF.size()!=N || (int)se.loF.size()!=N) return 7;
-    char hiName[128], loName[128];
-    snprintf(hiName,sizeof hiName,"signal-%s-hi", sm.id.c_str());
-    snprintf(loName,sizeof loName,"signal-%s-lo", sm.id.c_str());
-    tracks.push_back({sm.track_hi,"V_VP9",hiName,W,H});
-    tracks.push_back({sm.track_lo,"V_VP9",loName,W,H});
   }
   for(int i=0;i<N;i++){ int t=(int)(1000.0*i/fps);
     if(rgba) frames.push_back({1,(bool)rgbK[i],t,rgbF[i].data(),rgbF[i].size()});
@@ -840,7 +963,8 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
     }
   }
   int durationMs = (int)llround(N * 1000.0 / (fps>0?fps:30));
-  file = mux(tracks, frames, buildMetadataJson(W,H,N,fps,hasRgb,sigMeta), durationMs);
+  file = mux(tracksForPlan(sigMeta, hasRgb, W, H), frames,
+             buildMetadataJson(W,H,N,fps,hasRgb,sigMeta), durationMs);
   return 0;
 }
 // Every dc_* entry point allocates (std::vector/std::string sized from file or caller-supplied
@@ -855,12 +979,88 @@ int guard(F&& body) noexcept {
 }
 } // namespace
 
+// ── streaming encoder state (the opaque handle behind dc_stream_*) ──
+// One VP9 encoder per track, held open for the length of the recording, feeding an incremental
+// muxer. Slots are ordered RGB (when present) then hi/lo per signal — ascending track number, so
+// a frame's blocks reach the mux in the order the cluster rule expects.
+//
+// Each slot timestamps from its own output counter rather than a shared frame index. With
+// g_lag_in_frames=0 every push yields exactly one packet, so the counters stay in lockstep and a
+// frame's blocks all land on the same timestamp; deriving the time per track rather than assuming
+// it keeps that an observation instead of a requirement.
+struct dc_stream_encoder {
+  struct Slot {
+    int track=0;
+    std::unique_ptr<TrackEncoder> enc;
+    int emitted=0;              // packets already muxed from this track
+  };
+  int W=0, H=0, fps=30;
+  bool hasRgb=false, finished=false;
+  std::vector<SignalMeta> sigMeta;
+  std::vector<Slot> slots;
+  StreamMux mux;
+  Bytes hiPlane, loPlane;       // per-frame packing scratch, reused across the take
+
+  /**
+   * Drive every track through one round — a frame when `rgba`/`planes` are given, a flush when
+   * both are NULL — and mux whatever packets come back, appending any finished Cluster bytes to
+   * `chunk`. Returns 0, or the error code named by whichever track failed.
+   */
+  int round(const uint8_t* rgba, const uint16_t* const* planes, Bytes& chunk){
+    std::vector<Bytes> pkts; std::vector<bool> keys;
+    std::vector<int> trackOf, timeOf;
+    auto run=[&](Slot& sl, const uint8_t* src, int errCode)->int{
+      size_t before=pkts.size();
+      if(!sl.enc->encode(src, pkts, keys)) return errCode;
+      for(size_t k=before;k<pkts.size();k++){
+        trackOf.push_back(sl.track);
+        timeOf.push_back((int)(1000.0*sl.emitted/fps));
+        sl.emitted++;
+      }
+      return 0;
+    };
+    size_t idx=0;
+    if(hasRgb){ if(int rc=run(slots[idx++], rgba, 2)) return rc; }
+    size_t px=(size_t)W*(size_t)H;
+    for(size_t i=0;i<sigMeta.size();i++){
+      const uint8_t *hi=nullptr, *lo=nullptr;
+      if(planes){
+        hiPlane.resize(px); loPlane.resize(px);
+        pack(planes[i], px, hiPlane.data(), loPlane.data());
+        hi=hiPlane.data(); lo=loPlane.data();
+      }
+      if(int rc=run(slots[idx++], hi, 3)) return rc;
+      if(int rc=run(slots[idx++], lo, 3)) return rc;
+    }
+    // Blocks must reach the mux in (time, track) order: the cluster boundary is decided by the cue
+    // track's keyframe, and a block sorted ahead of it would land in the closing cluster instead of
+    // the one it belongs to.
+    std::vector<size_t> order(pkts.size());
+    for(size_t k=0;k<order.size();k++) order[k]=k;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b){
+      return timeOf[a]!=timeOf[b] ? timeOf[a]<timeOf[b] : trackOf[a]<trackOf[b]; });
+    for(size_t k : order){
+      Frame f{trackOf[k], (bool)keys[k], timeOf[k], pkts[k].data(), pkts[k].size()};
+      append(chunk, mux.writeFrame(f));
+    }
+    return 0;
+  }
+};
+
 // ── C ABI ──
 extern "C" {
 
 static int finish(Bytes& file, uint8_t** out, size_t* out_len){
   *out=(uint8_t*)malloc(file.size()); if(!*out) return 5;
   memcpy(*out, file.data(), file.size()); *out_len=file.size(); return 0;
+}
+
+// As finish(), but an empty chunk is handed back as NULL/0 rather than a zero-byte allocation —
+// most frames only extend the open cluster and produce no bytes at all.
+static int emitChunk(const Bytes& b, uint8_t** out, size_t* out_len){
+  if(b.empty()){ *out=nullptr; *out_len=0; return 0; }
+  *out=(uint8_t*)malloc(b.size()); if(!*out) return 5;
+  memcpy(*out, b.data(), b.size()); *out_len=b.size(); return 0;
 }
 
 // Map a track-decode status onto this entry point's codes. `codecErr` is the historical
@@ -997,6 +1197,90 @@ int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
   return finish(file, out, out_len);
   });
 }
+
+int dc_stream_create(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_cues,
+                     const dc_signal_spec_t* signals, int num_signals,
+                     dc_stream_encoder_t** out){
+  if(!out || num_signals<0 || fps<=0 || !dimsUsable(W,H)) return 1;
+  if(num_signals>0 && !signals) return 1;
+  if(num_signals<=0 && !has_rgb) return 1;
+  return guard([&]() -> int {
+  std::vector<SignalEncodeSpec> specs;
+  for(int i=0;i<num_signals;i++){
+    const dc_signal_spec_t& in=signals[i];
+    if(!in.id) return 1;
+    SignalEncodeSpec s; s.id=in.id;   // .data is unused here: planes arrive per frame
+    if(in.inverse_depth){
+      s.quant.inverse_depth=true;
+      s.quant.near_=in.near_; s.quant.far_=in.far_;
+      s.quant.levels = in.levels<=0 ? 65536 : in.levels;
+    }
+    specs.push_back(s);
+  }
+  std::unique_ptr<dc_stream_encoder> h(new dc_stream_encoder());
+  h->W=W; h->H=H; h->fps=fps; h->hasRgb=has_rgb!=0;
+  h->sigMeta=planSignalTracks(specs, h->hasRgb);
+  if(h->hasRgb){
+    auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
+    if(enc->init(W,H,fps,/*lossless=*/false,rgb_kbps?rgb_kbps:2000,/*keyEvery=*/fps)) return 2;
+    h->slots.push_back({1, std::move(enc), 0});
+  }
+  for(auto& sm : h->sigMeta){
+    for(int track : {sm.track_hi, sm.track_lo}){
+      auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
+      if(EncStatus st=enc->init(W,H,fps,/*lossless=*/true,0,/*keyEvery=*/0))
+        return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
+      h->slots.push_back({track, std::move(enc), 0});
+    }
+  }
+  // One cluster per second of media, rather than the batch muxer's 30s cap. Clusters normally
+  // close on an RGB keyframe (also ~1s apart), but a recording with no RGB track has keyframes
+  // only on frame 0 — and a live writer that emitted nothing for 30 seconds, while holding those
+  // 30 seconds of blocks open, would defeat the point of streaming.
+  h->mux.clusterSpanMs=1000;
+  h->mux.emitCues=emit_cues!=0;
+  h->mux.start(tracksForPlan(h->sigMeta, h->hasRgb, W, H),
+               buildMetadataJson(W,H,0,fps,h->hasRgb,h->sigMeta,/*streaming=*/true));
+  *out=h.release();
+  return 0;
+  });
+}
+
+int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len){
+  if(!enc || !out || !out_len) return 1;
+  return guard([&]{ return emitChunk(enc->mux.header, out, out_len); });
+}
+
+int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,
+                        const uint16_t* const* signal_planes,
+                        uint8_t** out, size_t* out_len){
+  if(!enc || !out || !out_len) return 1;
+  if(enc->finished) return 6;
+  // RGB presence is frozen by the track plan in the header that has already gone out, so a frame
+  // that disagrees with it cannot be written to any track this file declares.
+  if(enc->hasRgb != (rgba!=nullptr)) return 1;
+  if(!enc->sigMeta.empty() && !signal_planes) return 1;
+  return guard([&]() -> int {
+  for(size_t i=0;i<enc->sigMeta.size();i++) if(!signal_planes[i]) return 1;
+  Bytes chunk;
+  if(int rc=enc->round(rgba, signal_planes, chunk)) return rc;
+  return emitChunk(chunk, out, out_len);
+  });
+}
+
+int dc_stream_finish(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len){
+  if(!enc || !out || !out_len) return 1;
+  if(enc->finished) return 6;
+  return guard([&]() -> int {
+  Bytes chunk;
+  if(int rc=enc->round(nullptr, nullptr, chunk)) return rc;   // NULL everywhere = flush the codecs
+  append(chunk, enc->mux.finish());
+  enc->finished=true;
+  return emitChunk(chunk, out, out_len);
+  });
+}
+
+void dc_stream_destroy(dc_stream_encoder_t* enc){ delete enc; }
 
 // The Python/JS wrappers reject an unusable inverse-depth range before they get here, but the ABI
 // is callable directly, so re-check: near_/far_ of 0 make 1/near_ infinite, near_==far_ makes the

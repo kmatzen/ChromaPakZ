@@ -144,6 +144,7 @@ depth = cz.decode_signal(data, "depth")
 | Function | Purpose |
 |---|---|
 | `encode(signals, specs=, rgb=, fps=30, rgb_kbps=2000)` | Multi-signal encode → WebM bytes |
+| `create_encoder(width, height, signals=, fps=, has_rgb=, on_chunk=, cues=)` | Streaming encoder for live recording |
 | `decode(data, signal_ids=)` | Decode signals + optional RGB |
 | `decode_signal(data, id)` | One `(N,H,W)` uint16 plane |
 | `decode_rgb(data)` | RGB track → `(N,H,W,4)` uint8 RGBA |
@@ -158,6 +159,55 @@ for the *lossy* RGB track (signals are always lossless, and unaffected by `rgb_k
 
 The native core is loaded on first use, not at import — so `inverse_depth_spec`, the validation
 helpers and `chromapakz.webm_inspect` are usable (and unit-testable) without a compiled `_core`.
+
+### Streaming encode (live recording)
+
+`encode()` needs the whole take in memory before it writes a byte. `create_encoder()` writes the
+file as it is captured — the Python counterpart of the browser encoder's `onChunk`:
+
+```python
+with open("take.webm", "wb") as f:
+    enc = cz.create_encoder(W, H, fps=30, has_rgb=True, on_chunk=f.write,
+                            signals=[{"id": "depth", "near": 0.4, "far": 12.0}, {"id": "objectId"}])
+    for rgba, z, ids in capture():
+        enc.add_frame(rgb=rgba, signals={"depth": {"float": z}, "objectId": ids})
+    enc.finish()
+```
+
+| Member | Purpose |
+|---|---|
+| `header` | The file prefix, available before the first frame |
+| `add_frame(rgb=, signals=)` | Encode one frame → the bytes that just became final (often `b""`) |
+| `finish()` | Flush the codecs and close the file → the tail bytes |
+| `close()` / `with` | Release the native state; the context manager finishes a clean take |
+| `frame_count` | Frames accepted so far (a rejected frame is not counted) |
+
+`header` + every `add_frame()` chunk + `finish()` is the complete WebM. Each is also passed to
+`on_chunk` as it is produced, so `on_chunk=f.write` and collecting the return values are
+interchangeable; the callback is not required.
+
+Three properties make this usable as a *recording* format rather than just an incremental encode:
+
+- **The header is valid immediately.** The Segment carries an unknown size, so what is on disk is
+  a decodable WebM from the first chunk — an interrupted capture loses its tail, not the take.
+  The metadata carries `"frames": null`; `probe()` recovers the count by counting blocks.
+- **Chunks are element-aligned.** `header` is the whole prefix (EBML header, Segment header,
+  Info/Tracks/Tags) and every later chunk is a whole number of complete Cluster elements, so a
+  wrapper format can interleave its own Matroska elements between chunks without re-parsing byte
+  boundaries. Pass `cues=False` when it does: cue positions are byte offsets into the Segment, and
+  injected bytes move every cluster out from under them.
+- **Memory does not grow with the take.** What is retained is the encoder state, the open cluster
+  (at most one second of media) and, when `cues=True`, the seek index — about a dozen bytes per
+  second. Never the frames already written.
+
+RGB presence is declared with `has_rgb` rather than inferred, because the track plan is frozen in
+the header before frame 0 arrives. Signal order fixes the track numbering, the same way
+`planSignals` does in the browser encoder. Every declared stream must be written on every frame:
+each track carries its own frame counter, so one that stops and resumes cannot be realigned.
+
+A signal payload is `(H, W)` uint16 codes, `{"u16": codes}`, or `{"float": z}` for a signal that
+declared `near`/`far` (quantized for you). A bare float array is still refused — as in `encode()`,
+a lossy cast has to be asked for.
 
 ### Ingestion (`chromapakz.ingest`, `chromapakz.webm_inspect`)
 
@@ -190,6 +240,7 @@ quantize float depth with `quantize_inverse()` first.
 | Function | Purpose |
 |---|---|
 | `dc_encode_multi` | RGB + N signals |
+| `dc_stream_create` / `_header` / `_add_frame` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording |
 | `dc_decode_signal` | Decode by id |
 | `dc_get_metadata` | CHROMAPAKZ JSON |
 | `dc_probe` / `dc_decode_rgb` | Header + RGB |
@@ -266,6 +317,11 @@ Python tests assert through `unittest`'s `assert*` methods rather than bare `ass
 | File | Regenerate with | Checked by |
 | --- | --- | --- |
 | `tests/fixtures/stream.webm`, `stream_depth.u16` | `node tests/fixtures/regen_stream.mjs` | `tests/js_fixture_stream.test.mjs` (staleness + JS decode), `tests/test_stream_interop.py` (native decode) |
+
+The streaming *encoder* is covered in the other direction, without a fixture:
+`tests/test_stream_encode.py` writes a stream from Python and reads it back through the native
+decoder, and `tests/test_stream_encode_js_interop.py` hands the same bytes to both browser
+decoders through `node` (skipped when node is not on PATH).
 | `tests/fixtures/quant_golden.csv` | `node tests/fixtures/regen_quant_golden.mjs` | `tests/js_quant_golden.test.mjs`, `tests/test_quant_golden.py`, `dccli goldencheck` |
 
 Native coverage is off by default; build it separately so nothing shipped is instrumented:
