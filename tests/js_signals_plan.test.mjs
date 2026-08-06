@@ -15,14 +15,19 @@ import {
 } from '../src/signals.js';
 
 test('planSignals rejects malformed specs', () => {
-  assert.throws(() => planSignals([], true), /at least one/, 'empty specs');
-  assert.throws(() => planSignals(null, true), /at least one/, 'null specs');
+  assert.throws(() => planSignals([], false), /rgb or at least one/, 'no tracks at all');
+  assert.throws(() => planSignals(null, false), /rgb or at least one/, 'no tracks at all (null)');
   assert.throws(() => planSignals([{}], true), /needs an id/, 'spec without id');
   assert.throws(() => planSignals([{ id: 'x', scheme: 'delta-16' }], true), /unsupported scheme/);
   assert.throws(() => planSignals([{ id: 'depth', near: 0.5 }], true), /near and far/);
   assert.throws(() => planSignals([{ id: 'depth', near: 0, far: 5 }], true), /0 < near < far/);
   assert.throws(() => planSignals([{ id: 'depth', near: 5, far: 5 }], true), /0 < near < far/);
   assert.throws(() => planSignals([{ id: 'depth', near: -1, far: 5 }], true), /0 < near < far/);
+});
+
+test('planSignals allows an RGB-only plan', () => {
+  assert.deepEqual(planSignals([], true), [], 'empty specs with rgb: empty plan');
+  assert.deepEqual(planSignals(null, true), [], 'null specs with rgb: empty plan');
 });
 
 test('planSignals numbers tracks around the optional RGB track', () => {
