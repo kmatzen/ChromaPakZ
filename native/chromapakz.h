@@ -129,6 +129,21 @@ DC_API int dc_stream_create(int W, int H, int fps, int rgb_kbps, int has_rgb, in
 
 // Copy out the file prefix. Valid — and worth writing to disk — before any frame is encoded.
 // Errors: 1 = NULL argument; 5 = allocation failed.
+// As dc_stream_create, plus an optional timed-text track named `text_track_name`
+// (NULL or empty for none), carrying S_TEXT/WEBVTT cues written with
+// dc_stream_add_text. The header is emitted at create time, so the track cannot be
+// declared later. Track numbering of the video/signal tracks is unchanged.
+DC_API int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_cues,
+                               const dc_signal_spec_t* signals, int num_signals,
+                               const char* text_track_name,
+                               dc_stream_encoder_t** out);
+
+// Append one timed-text cue to the metadata track. Cues ride inside the cluster the
+// surrounding frames are already filling and never drive cluster boundaries, so this
+// usually returns an empty chunk. Fails if no text track was declared.
+DC_API int dc_stream_add_text(dc_stream_encoder_t* enc, int timestamp_ms, int duration_ms,
+                              const uint8_t* utf8, size_t len, uint8_t** out, size_t* out_len);
+
 DC_API int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len);
 
 // Encode one frame. `rgba` is W*H*4 bytes and required exactly when the stream declared RGB;
