@@ -4,7 +4,23 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
-## Unreleased
+## 0.4.0 — 2026-08-06
+
+### Added
+
+- **RGB-only streaming encode.** `create_encoder(W, H, has_rgb=True)` with no `signals` was
+  refused by both wrapper layers even though the native ABI accepts it and the batch encoder always
+  allowed `encode({}, rgb=…)`. A pose-only wrapper recording (worldline: RGB + camera poses, no
+  depth) needs exactly this. `None`, `[]` and `{}` are equivalent; a stream with no tracks at all
+  is still refused ("need rgb or at least one signal"). (#44)
+
+### Changed
+
+- **Signal tracks keyframe at the RGB cadence** (every `fps` frames, matching the muxer's cluster
+  flush), so every Cluster starts with keyframes on all tracks and `[header + Cluster k]` decodes
+  that cluster's frames bit-exactly in isolation — Cues-based random access now works for depth/ID
+  planes, not just RGB. Measured cost: +1.0% file size on a 90-frame 480×360 RGBD clip.
+  Bit-exactness and old-decoder compatibility are unaffected. (#45)
 
 ### Added
 
