@@ -142,5 +142,39 @@ class MetadataTrack(unittest.TestCase):
                                    ctypes.byref(out), ctypes.byref(olen)), 0)
 
 
+class PythonApi(unittest.TestCase):
+    """The ctypes surface above is the contract; this is how callers actually reach it."""
+
+    @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not on PATH")
+    def test_create_encoder_text_track_round_trips(self):
+        chunks = []
+        enc = cz.create_encoder(64, 48, fps=30, has_rgb=True, on_chunk=chunks.append,
+                                text_track="poses")
+        for i in range(6):
+            rgb = np.random.default_rng(i).integers(0, 255, (48, 64, 4), dtype=np.uint8)
+            enc.add_frame(rgb=rgb)
+            enc.add_text(f"i={i}", timestamp=i / 30)
+        enc.finish()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.webm")
+            with open(path, "wb") as f:
+                f.write(b"".join(chunks))     # on_chunk already carries the header
+            out = os.path.join(d, "a.vtt")
+            subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:s:0",
+                            "-c", "copy", "-y", out], check=True)
+            with open(out) as f:
+                body = f.read()
+        for i in range(6):
+            self.assertIn(f"i={i}", body)
+
+    def test_add_text_without_a_track_raises(self):
+        enc = cz.create_encoder(64, 48, fps=30, has_rgb=True)
+        try:
+            with self.assertRaises(RuntimeError):
+                enc.add_text("nope", timestamp=0.0)
+        finally:
+            enc.close()
+
+
 if __name__ == "__main__":
     unittest.main()

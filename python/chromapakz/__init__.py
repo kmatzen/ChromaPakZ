@@ -119,6 +119,16 @@ def _load_stream():
             f"this ChromaPakZ native core has no streaming encoder ({e}) — it was built before "
             "create_encoder() existed; rebuild it with `pip install .` or `cmake --build build`."
         ) from e
+    # Additive in 0.5.0: an older core still streams, just without a metadata track.
+    create_ex = getattr(lib, "dc_stream_create_ex", None)
+    add_text = getattr(lib, "dc_stream_add_text", None)
+    if create_ex is not None and add_text is not None:
+        create_ex.argtypes = [_I, _I, _I, _I, _I, _I, ctypes.POINTER(_SignalSpec), _I,
+                              ctypes.c_char_p, ctypes.POINTER(_P)]
+        create_ex.restype = ctypes.c_int
+        add_text.argtypes = [_P, _I, _I, u8p, _Z, ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
+        add_text.restype = ctypes.c_int
+
     create.argtypes = [_I, _I, _I, _I, _I, _I, ctypes.POINTER(_SignalSpec), _I, ctypes.POINTER(_P)]
     header.argtypes = [_P, ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
     add.argtypes = [_P, u8p, ctypes.POINTER(u16p), ctypes.POINTER(u8p), ctypes.POINTER(_Z)]
@@ -299,7 +309,7 @@ class StreamEncoder:
     """Incremental encoder — see :func:`create_encoder`. Not thread-safe."""
 
     def __init__(self, width, height, signals, fps=30, has_rgb=False, rgb_kbps=2000,
-                 on_chunk=None, cues=True):
+                 on_chunk=None, cues=True, text_track=None):
         # First, so __del__ finds them however early construction fails.
         self._h = self._destroy = None
         self._finished = False
@@ -332,9 +342,20 @@ class StreamEncoder:
             c_specs[i].far_ = sp.get("far", 0.0)
             c_specs[i].levels = sp.get("levels", LEVELS_FULL)
         h = _P()
-        rc = lib.dc_stream_create(self.width, self.height, self.fps, int(rgb_kbps),
-                                  1 if self.has_rgb else 0, 1 if self._cues else 0,
-                                  c_specs, len(c_specs), ctypes.byref(h))
+        self._text_track = text_track
+        if text_track:
+            if not hasattr(lib, "dc_stream_create_ex"):
+                raise OSError(
+                    "this ChromaPakZ native core has no metadata track (added in 0.5.0) — "
+                    "rebuild it with `pip install .` or drop text_track=")
+            rc = lib.dc_stream_create_ex(self.width, self.height, self.fps, int(rgb_kbps),
+                                         1 if self.has_rgb else 0, 1 if self._cues else 0,
+                                         c_specs, len(c_specs),
+                                         str(text_track).encode("utf-8"), ctypes.byref(h))
+        else:
+            rc = lib.dc_stream_create(self.width, self.height, self.fps, int(rgb_kbps),
+                                      1 if self.has_rgb else 0, 1 if self._cues else 0,
+                                      c_specs, len(c_specs), ctypes.byref(h))
         if rc:
             raise _stream_error("create_encoder", rc)
         self._h = h
@@ -429,6 +450,27 @@ class StreamEncoder:
         self._n += 1
         return self._emit(chunk)
 
+    def add_text(self, text, timestamp, duration=None):
+        """Append one timed-text cue to the metadata track.
+
+        ``timestamp`` and ``duration`` are seconds. Cues ride inside the cluster the
+        surrounding frames are already filling, so this usually returns ``b""``.
+        Requires ``text_track=`` at construction.
+        """
+        if not self._text_track:
+            raise RuntimeError("no metadata track: pass text_track= to create_encoder()")
+        if self._h is None:
+            raise RuntimeError("encoder is closed")
+        if self._finished:
+            raise RuntimeError("encoder is finished")
+        payload = text.encode("utf-8") if isinstance(text, str) else bytes(text)
+        buf = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+        dur_ms = int(round((duration if duration is not None else 1.0 / self.fps) * 1000))
+        chunk = self._take_chunk(self._lib.dc_stream_add_text, "add_text",
+                                 _I(int(round(timestamp * 1000))), _I(max(0, dur_ms)),
+                                 buf, _Z(len(payload)))
+        return self._emit(chunk)
+
     def finish(self):
         """Flush the codecs and close the file; returns the tail bytes (last cluster + Cues).
 
@@ -465,7 +507,7 @@ class StreamEncoder:
 
 
 def create_encoder(width, height, signals=None, fps=30, has_rgb=False, rgb_kbps=2000,
-                   on_chunk=None, cues=True):
+                   on_chunk=None, cues=True, text_track=None):
     """Open a streaming encoder for a live W*H capture.
 
         enc = cz.create_encoder(W, H, fps=30, has_rgb=True, on_chunk=f.write,
@@ -493,7 +535,7 @@ def create_encoder(width, height, signals=None, fps=30, has_rgb=False, rgb_kbps=
     with the take: the encoder state, the open cluster, and the cue index if one was asked for.
     """
     return StreamEncoder(width, height, signals, fps=fps, has_rgb=has_rgb, rgb_kbps=rgb_kbps,
-                         on_chunk=on_chunk, cues=cues)
+                         on_chunk=on_chunk, cues=cues, text_track=text_track)
 
 
 def parse_metadata(data):
