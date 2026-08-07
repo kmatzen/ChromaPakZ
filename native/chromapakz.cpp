@@ -890,7 +890,7 @@ struct TrackEncoder {
 EncStatus encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H, int fps,
                          std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
   TrackEncoder te;
-  if(EncStatus st=te.init(W,H,fps,/*lossless=*/true,0,/*keyEvery=*/0)) return st;
+  if(EncStatus st=te.init(W,H,fps,/*lossless=*/true,0,/*keyEvery=*/fps>0?fps:30)) return st;
   for(size_t i=0;i<=planes.size();i++)
     if(!te.encode(i<planes.size()?planes[i]:nullptr, outFrames, outKey)) return ENC_FAIL;
   return ENC_OK;
@@ -1228,7 +1228,7 @@ int dc_stream_create(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_
   for(auto& sm : h->sigMeta){
     for(int track : {sm.track_hi, sm.track_lo}){
       auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
-      if(EncStatus st=enc->init(W,H,fps,/*lossless=*/true,0,/*keyEvery=*/0))
+      if(EncStatus st=enc->init(W,H,fps,/*lossless=*/true,0,/*keyEvery=*/fps>0?fps:30))
         return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
       h->slots.push_back({track, std::move(enc), 0});
     }

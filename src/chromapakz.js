@@ -173,8 +173,8 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     return sigEncP[id] ??= (async()=>{
       const be=await losslessBackend();
       return sigEnc[id]={
-        hi: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps }),
-        lo: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps }),
+        hi: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps, keyEvery:rgbKeyEvery }),
+        lo: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps, keyEvery:rgbKeyEvery }),
       };
     })();
   }
