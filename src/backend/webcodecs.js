@@ -65,7 +65,7 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
       if(n!==planeBytes)
         throw new Error(`webcodecs encode: ${kind} plane has ${n} bytes, expected ${planeBytes} (${W}x${H})`);
       const f=makeFrame(src, W, H, i*usPerFrame); const isKey=i===0 || i%keyEvery===0;
-      enc.encode(f, lossless ? { keyFrame:i===0, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); i++;
+      enc.encode(f, lossless ? { keyFrame:isKey, vp9:{ quantizer:0 } } : { keyFrame:isKey }); f.close(); i++;
       if(outQ.length) return outQ.shift();
       let settled=false;
       const p=new Promise((res,rej)=>{ waitOut.push({ res, rej }); })
