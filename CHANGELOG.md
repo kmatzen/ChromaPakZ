@@ -4,6 +4,37 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.5.0 — 2026-08-07
+
+### Added
+
+- **Timed-text metadata track.** `create_encoder(..., text_track="name")` declares a WebVTT
+  track alongside the video and signal tracks, and `add_text(text, timestamp, duration=None)`
+  appends cues into the cluster the surrounding frames are already filling. In JavaScript:
+  `createEncoder({ textTrack })` and `addText()`. In C: `dc_stream_create_ex` and
+  `dc_stream_add_text`.
+
+  This exists so per-frame metadata is reachable by tools nobody here controls. Container tags
+  are for file-level data, and ffmpeg's Matroska demuxer maps `TagString` into metadata while
+  skipping `TagBinary` entirely — so binary per-frame tables are invisible to it. A track is
+  what GoPro (GPMF), MISB KLV and Apple's `mebx` all use for the same reason.
+
+  Two container details are easy to get wrong and are covered by tests in both implementations:
+  WebM defines its own WebVTT CodecIDs, so Matroska's `S_TEXT/WEBVTT` demuxes as a subtitle
+  stream with an unknown codec; and a WebVTT block is framed
+  `identifier \n settings \n payload`, so omitting the newlines makes a reader take the whole
+  block as the identifier and every cue extracts empty from a file that otherwise parses fine.
+
+  Text never drives cluster boundaries — those stay with the cue track — so it only forces a new
+  cluster when the relative timestamp would overflow the `int16` in a Block header. Cues carry a
+  duration, which `SimpleBlock` cannot express, so they are written as `BlockGroup`.
+
+### Compatibility
+
+- Additive. `dc_stream_create` forwards to `dc_stream_create_ex` with no track, so 0.4.0 callers
+  are unaffected, and the Python layer binds the new entry points only when the loaded core
+  exposes them — a stale native build still streams, just without a metadata track.
+
 ## 0.4.0 — 2026-08-06
 
 ### Added

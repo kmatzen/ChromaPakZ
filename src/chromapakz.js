@@ -128,7 +128,7 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
  *   first frame; a clip whose RGB starts later than frame 0 must declare `hasRgb:true`, because
  *   track numbers are frozen with the plan (see planSignals).
  */
-export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null }){
+export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, textTrack=null }){
   const specList=resolveSignalSpecs(signals);
   if(hasRgb!==null && typeof hasRgb!=='boolean')
     throw new Error('createEncoder: hasRgb must be true, false, or omitted');
@@ -141,6 +141,7 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   let streamMux=null, byteParts=null;
   const muxFrames=[];
   const rgbKeyEvery=Math.max(1, Math.round(fps));
+  let textTrackNumber=0;   // 0 when no metadata track was declared
   const pixels=W*H;   // samples per signal plane; rgb is pixels*4 bytes (RGBA)
 
   // Backends are picked once per encoder, lazily, on first frame. Lossless (signals) and
@@ -159,6 +160,14 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     if(streamMux) return;
     ensurePlan();
     const tracks=buildTracksFromPlan(W, H, plannedRgb, signalPlan);
+    if(textTrack){
+      // Appended last so the video/signal track numbers are unchanged. WebM defines its
+      // own WebVTT CodecIDs — Matroska's S_TEXT/WEBVTT demuxes as an unknown codec — and
+      // D_WEBVTT/METADATA, though the better semantic fit, is given a metadata disposition
+      // by ffmpeg which then reads no packets from it at all.
+      textTrackNumber=tracks.reduce((m,t)=>Math.max(m, t.number), 0)+1;
+      tracks.push({ number:textTrackNumber, codecID:'D_WEBVTT/SUBTITLES', name:String(textTrack), type:17 });
+    }
     const metadata=buildFileMetadata({ W, H, fps, n:0, hasRgb:plannedRgb, signals: signalPlan, streaming:true });
     streamMux=createStreamMux({ tracks, metadata, durationMs:0 });
     byteParts=[streamMux.header];
@@ -258,6 +267,18 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     },
 
     addFrame(frame){ return serialize(()=>addFrameImpl(frame)); },
+
+    /** Append one timed-text cue to the metadata track. `timestamp`/`duration` in seconds. */
+    addText(text, timestamp, duration=null){
+      return serialize(async ()=>{
+        if(!textTrack) throw new Error('addText: createEncoder was not given a textTrack');
+        ensureStreamMux();
+        const durMs=Math.max(0, Math.round((duration ?? 1/fps)*1000));
+        const chunk=streamMux.writeText(textTrackNumber, Math.round(timestamp*1000), durMs, String(text));
+        if(chunk){ byteParts.push(chunk); if(onChunk) onChunk(chunk); }
+        return chunk ?? new Uint8Array(0);
+      });
+    },
     finish(){ return serialize(()=>finishImpl()); },
   };
 
@@ -337,6 +358,14 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     if(sawRgb) await rgbEnc.close();
     for(const s of signalPlan){ if(sigEnc[s.id]){ await sigEnc[s.id].hi.close(); await sigEnc[s.id].lo.close(); } }
     const tracks=buildTracksFromPlan(W, H, plannedRgb, signalPlan);
+    if(textTrack){
+      // Appended last so the video/signal track numbers are unchanged. WebM defines its
+      // own WebVTT CodecIDs — Matroska's S_TEXT/WEBVTT demuxes as an unknown codec — and
+      // D_WEBVTT/METADATA, though the better semantic fit, is given a metadata disposition
+      // by ffmpeg which then reads no packets from it at all.
+      textTrackNumber=tracks.reduce((m,t)=>Math.max(m, t.number), 0)+1;
+      tracks.push({ number:textTrackNumber, codecID:'D_WEBVTT/SUBTITLES', name:String(textTrack), type:17 });
+    }
     const metadata=buildFileMetadata({ W, H, fps, n, hasRgb:plannedRgb, signals: signalPlan });
     return mux({ tracks, frames:muxFrames, metadata, durationMs: Math.round(n*1000/fps) });
   }

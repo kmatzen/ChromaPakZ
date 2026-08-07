@@ -11,6 +11,7 @@ const ID = {
   FlagLacing:0x9C, CodecID:0x86, Name:0x536E, Video:0xE0, PixelWidth:0xB0, PixelHeight:0xBA,
   Tags:0x1254C367, Tag:0x7373, Targets:0x63C0, SimpleTag:0x67C8, TagName:0x45A3, TagString:0x4487,
   Cluster:0x1F43B675, Timestamp:0xE7, SimpleBlock:0xA3, Duration:0x4489,
+  BlockGroup:0xA0, Block:0xA1, BlockDuration:0x9B,
   Cues:0x1C53BB6B, CuePoint:0xBB, CueTime:0xB3, CueTrackPositions:0xB7, CueTrack:0xF7, CueClusterPosition:0xF1,
 };
 
@@ -45,11 +46,11 @@ function el(id, payload){ const i=idBytes(id); return cat([i, vint(payload.lengt
 const elU = (id,n) => el(id, uintBytes(n));
 const elS = (id,s) => el(id, strBytes(s));
 
-function trackEntry({number, codecID, name, width, height}){
-  const parts=[ elU(ID.TrackNumber,number), elU(ID.TrackUID,number), elU(ID.TrackType,1),
+function trackEntry({number, codecID, name, width, height, type=1}){
+  const parts=[ elU(ID.TrackNumber,number), elU(ID.TrackUID,number), elU(ID.TrackType,type),
     elU(ID.FlagLacing,0), elS(ID.CodecID,codecID) ];
   if(name) parts.push(elS(ID.Name,name));
-  if(width&&height) parts.push(el(ID.Video, cat([elU(ID.PixelWidth,width), elU(ID.PixelHeight,height)])));
+  if(type===1 && width&&height) parts.push(el(ID.Video, cat([elU(ID.PixelWidth,width), elU(ID.PixelHeight,height)])));
   return el(ID.TrackEntry, cat(parts));
 }
 function simpleBlock(track, relTime, key, data){
@@ -121,6 +122,17 @@ export function mux({ tracks, frames, metadata, durationMs=0, timestampScaleNs=1
 
 // ── incremental mux (network streaming) ──
 /** Emit header immediately, then cluster bytes per frame; Cues on finish(). */
+// Timed text needs a duration, which SimpleBlock has nowhere to put, so cues go in a
+// BlockGroup. WebM frames a WebVTT block as `identifier \n settings \n payload`; drop
+// the newlines and a reader takes the whole block as the identifier, so every cue
+// extracts empty while the file still parses.
+function textBlockGroup(track, relTime, durMs, text){
+  const tc=new Uint8Array(2); new DataView(tc.buffer).setInt16(0, relTime, false);
+  const payload=new TextEncoder().encode('\n\n'+text);
+  const block=el(ID.Block, cat([vint(track), tc, Uint8Array.of(0x00), payload]));
+  return el(ID.BlockGroup, durMs>0 ? cat([block, elU(ID.BlockDuration, durMs)]) : block);
+}
+
 export function createStreamMux({ tracks, metadata, durationMs=0, timestampScaleNs=1_000_000, clusterSpanMs=30_000 }){
   const cueTrack=cueTrackOf(tracks);
   const pre=buildPre({ tracks, metadata, durationMs, timestampScaleNs });
@@ -155,6 +167,17 @@ export function createStreamMux({ tracks, metadata, durationMs=0, timestampScale
       if(!cur){ cur=[]; base=frame.timeMs; hasCue=false; }
       if(cueKey) hasCue=true;
       cur.push(simpleBlock(frame.track, frame.timeMs-base, frame.key, frame.data));
+      return out.length ? cat(out) : null;
+    },
+
+    /** Append one timed-text cue. Text never drives cluster boundaries — those belong to
+        the cue track — so this only forces a new cluster when the relative timestamp would
+        not fit the int16 a Block header allows. */
+    writeText(track, timeMs, durMs, text){
+      const out=[];
+      if(cur){ const rel=timeMs-base; if(rel<-32768 || rel>32767){ const c=flushCluster(); if(c) out.push(c); } }
+      if(!cur){ cur=[]; base=timeMs; hasCue=false; }
+      cur.push(textBlockGroup(track, timeMs-base, durMs, text));
       return out.length ? cat(out) : null;
     },
 
