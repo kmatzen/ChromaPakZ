@@ -3,7 +3,7 @@
 Three properties carry the whole feature, and each has a test here:
 
   * the chunks are **element-aligned** — the header is the whole file prefix, every later chunk a
-    whole number of Cluster elements — so a wrapper format (worldline weaves camera poses in as
+    whole number of Cluster elements — so a wrapper format (wurld weaves camera poses in as
     Matroska tags) can inject its own elements between them without re-parsing byte boundaries;
   * the header is **valid immediately**, because the Segment carries an unknown size, so a
     recording is a decodable WebM from the first chunk and stays one if the capture is cut short;
@@ -140,7 +140,7 @@ class StreamEncode(unittest.TestCase):
                         "the frames that did arrive must still be bit-exact")
 
     def test_foreign_elements_can_be_injected_between_chunks(self):
-        """worldline's use: weave its own tag elements between clusters as the take is recorded."""
+        """wurld's use: weave its own tag elements between clusters as the take is recorded."""
         chunks, _ = record(self.depth, rgb=self.rgb, cues=False)
         woven = [chunks[0]]
         for i, chunk in enumerate(chunks[1:]):
@@ -377,7 +377,7 @@ class StreamEncodeRgbOnly(unittest.TestCase):
 
     The batch encoder always allowed this (``encode({}, rgb=…)``) and the native stream
     ABI accepts ``num_signals == 0`` with ``has_rgb``; the Python wrapper used to refuse
-    it. A pose-only wrapper format (worldline) records RGB + camera poses with no depth.
+    it. A pose-only wrapper format (wurld) records RGB + camera poses with no depth.
     """
 
     @classmethod

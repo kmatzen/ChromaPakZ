@@ -10,7 +10,7 @@ registry means the same commit on the other.
 
 - **RGB-only streaming encode.** `create_encoder(W, H, has_rgb=True)` with no `signals` was
   refused by both wrapper layers even though the native ABI accepts it and the batch encoder always
-  allowed `encode({}, rgb=…)`. A pose-only wrapper recording (worldline: RGB + camera poses, no
+  allowed `encode({}, rgb=…)`. A pose-only wrapper recording (wurld: RGB + camera poses, no
   depth) needs exactly this. `None`, `[]` and `{}` are equivalent; a stream with no tracks at all
   is still refused ("need rgb or at least one signal"). (#44)
 

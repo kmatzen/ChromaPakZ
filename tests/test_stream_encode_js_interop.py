@@ -2,7 +2,7 @@
 
 tests/test_stream_interop.py already covers the other direction — a browser-streamed fixture read
 by the native core. This one closes the loop, and it is the path that matters for wrappers like
-worldline, which record from Python (robot, rig, simulator) and play back in a browser.
+wurld, which record from Python (robot, rig, simulator) and play back in a browser.
 
 Both JS decoders are exercised, because they parse differently and a streamed file is exactly
 where they can disagree:
