@@ -39,6 +39,7 @@ enum : uint32_t {
   ID_FlagLacing=0x9C, ID_CodecID=0x86, ID_Name=0x536E, ID_Video=0xE0, ID_PixelWidth=0xB0, ID_PixelHeight=0xBA,
   ID_Tags=0x1254C367, ID_Tag=0x7373, ID_Targets=0x63C0, ID_SimpleTag=0x67C8, ID_TagName=0x45A3, ID_TagString=0x4487,
   ID_Cluster=0x1F43B675, ID_Timestamp=0xE7, ID_SimpleBlock=0xA3, ID_Duration=0x4489,
+  ID_BlockGroup=0xA0, ID_Block=0xA1, ID_BlockDuration=0x9B,
   ID_Cues=0x1C53BB6B, ID_CuePoint=0xBB, ID_CueTime=0xB3, ID_CueTrackPositions=0xB7,
   ID_CueTrack=0xF7, ID_CueClusterPosition=0xF1,
 };
@@ -64,16 +65,16 @@ Bytes el(uint32_t id, const Bytes& payload){
 Bytes elU(uint32_t id, uint64_t n){ return el(id, uintBytes(n)); }
 Bytes elS(uint32_t id, const std::string& s){ return el(id, strBytes(s)); }
 
-struct Track { int number; std::string codecID, name; int width, height; };
+struct Track { int number; std::string codecID, name; int width, height; int type=1; };
 struct Frame { int track; bool key; int timeMs; const uint8_t* data; size_t len; };
 
 Bytes trackEntry(const Track& t){
   Bytes p;
   append(p, elU(ID_TrackNumber, t.number)); append(p, elU(ID_TrackUID, t.number));
-  append(p, elU(ID_TrackType, 1)); append(p, elU(ID_FlagLacing, 0));
+  append(p, elU(ID_TrackType, t.type)); append(p, elU(ID_FlagLacing, 0));
   append(p, elS(ID_CodecID, t.codecID));
   if(!t.name.empty()) append(p, elS(ID_Name, t.name));
-  if(t.width && t.height){ Bytes v; append(v, elU(ID_PixelWidth, t.width)); append(v, elU(ID_PixelHeight, t.height));
+  if(t.type==1 && t.width && t.height){ Bytes v; append(v, elU(ID_PixelWidth, t.width)); append(v, elU(ID_PixelHeight, t.height));
     append(p, el(ID_Video, v)); }
   return el(ID_TrackEntry, p);
 }
@@ -83,6 +84,18 @@ Bytes simpleBlock(int track, int relTime, bool key, const uint8_t* data, size_t 
   p.push_back(key?0x80:0x00);
   p.insert(p.end(), data, data+len);
   return el(ID_SimpleBlock, p);
+}
+
+// Subtitle cues need a duration, and SimpleBlock has nowhere to put one, so timed
+// text goes in a BlockGroup instead. Same wire position as a SimpleBlock otherwise.
+Bytes blockGroup(int track, int relTime, int durMs, const uint8_t* data, size_t len){
+  Bytes b = vint(track);
+  b.push_back((relTime>>8)&0xff); b.push_back(relTime&0xff);   // int16 big-endian
+  b.push_back(0x00);
+  b.insert(b.end(), data, data+len);
+  Bytes g; append(g, el(ID_Block, b));
+  if(durMs>0) append(g, elU(ID_BlockDuration, (uint64_t)durMs));
+  return el(ID_BlockGroup, g);
 }
 
 Bytes ebmlHeader(){
@@ -204,6 +217,22 @@ struct StreamMux {
     if(!open){ base=f.timeMs; open=true; hasCue=false; }
     if(cueKey) hasCue=true;
     append(blocks, simpleBlock(f.track, f.timeMs-base, f.key, f.data, f.len));
+    return out;
+  }
+
+  /** Append one timed-text BlockGroup. Text never drives cluster boundaries — those
+      belong to the cue track — so this only forces a new cluster when the relative
+      timestamp would not fit the int16 a Block header allows. */
+  Bytes writeText(int track, int timeMs, int durMs, const uint8_t* data, size_t len){
+    Bytes out;
+    if(open){ long rel = (long)timeMs - base; if(rel < -32768 || rel > 32767) out = closeCluster(); }
+    if(!open){ base=timeMs; open=true; hasCue=false; }
+    // WebM frames a WebVTT block as: cue-identifier '\n' cue-settings '\n' payload.
+    // Both leading fields are optional but the newlines are not — without them a
+    // reader takes the whole block as the identifier and the cue extracts empty.
+    Bytes framed; framed.push_back('\n'); framed.push_back('\n');
+    framed.insert(framed.end(), data, data+len);
+    append(blocks, blockGroup(track, timeMs-base, durMs, framed.data(), framed.size()));
     return out;
   }
 
@@ -998,6 +1027,7 @@ struct dc_stream_encoder {
   bool hasRgb=false, finished=false;
   std::vector<SignalMeta> sigMeta;
   std::vector<Slot> slots;
+  int textTrack=0;              // 0 when no metadata track was declared
   StreamMux mux;
   Bytes hiPlane, loPlane;       // per-frame packing scratch, reused across the take
 
@@ -1201,6 +1231,13 @@ int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
 int dc_stream_create(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_cues,
                      const dc_signal_spec_t* signals, int num_signals,
                      dc_stream_encoder_t** out){
+  return dc_stream_create_ex(W,H,fps,rgb_kbps,has_rgb,emit_cues,signals,num_signals,NULL,out);
+}
+
+int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_cues,
+                     const dc_signal_spec_t* signals, int num_signals,
+                     const char* text_track_name,
+                     dc_stream_encoder_t** out){
   if(!out || num_signals<0 || fps<=0 || !dimsUsable(W,H)) return 1;
   if(num_signals>0 && !signals) return 1;
   if(num_signals<=0 && !has_rgb) return 1;
@@ -1239,7 +1276,20 @@ int dc_stream_create(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_
   // 30 seconds of blocks open, would defeat the point of streaming.
   h->mux.clusterSpanMs=1000;
   h->mux.emitCues=emit_cues!=0;
-  h->mux.start(tracksForPlan(h->sigMeta, h->hasRgb, W, H),
+  std::vector<Track> tracks = tracksForPlan(h->sigMeta, h->hasRgb, W, H);
+  if(text_track_name && *text_track_name){
+    int next = 1; for(auto& t : tracks) next = std::max(next, t.number+1);
+    // Appended last so existing track numbers are unchanged, and typed subtitle so
+    // ordinary players and ffmpeg treat it as timed text rather than a broken video.
+    // WebM defines its own WebVTT CodecIDs; Matroska's S_TEXT/WEBVTT is not among
+    // them and ffmpeg reports the track as an unknown codec. METADATA rather than
+    // SUBTITLES because these cues are machine-readable data — players must not
+    // render them over the picture, and browsers expose them as a metadata
+    // TextTrack rather than displayed subtitles.
+    tracks.push_back({next,"D_WEBVTT/SUBTITLES",text_track_name,0,0,17});
+    h->textTrack = next;
+  }
+  h->mux.start(tracks,
                buildMetadataJson(W,H,0,fps,h->hasRgb,h->sigMeta,/*streaming=*/true));
   *out=h.release();
   return 0;
@@ -1249,6 +1299,17 @@ int dc_stream_create(int W, int H, int fps, int rgb_kbps, int has_rgb, int emit_
 int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len){
   if(!enc || !out || !out_len) return 1;
   return guard([&]{ return emitChunk(enc->mux.header, out, out_len); });
+}
+
+int dc_stream_add_text(dc_stream_encoder_t* enc, int timestamp_ms, int duration_ms,
+                       const uint8_t* utf8, size_t len, uint8_t** out, size_t* out_len){
+  if(!enc || !utf8 || !out || !out_len) return 1;
+  if(enc->finished || !enc->textTrack) return 1;
+  if(timestamp_ms < 0 || duration_ms < 0) return 1;
+  return guard([&]{
+    Bytes chunk = enc->mux.writeText(enc->textTrack, timestamp_ms, duration_ms, utf8, len);
+    return emitChunk(chunk, out, out_len);
+  });
 }
 
 int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,
