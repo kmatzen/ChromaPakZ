@@ -46,6 +46,13 @@ cmake -S . -B build && cmake --build build -j     # or: native/build.sh
 ./build/dccli decodesignal clip.webm depth depth.u16
 ```
 
+Encoding an **HDR display track** additionally needs a libvpx built with
+`--enable-vp9-highbitdepth` (VP9 profile 2, 10-bit). Homebrew's and Debian's packages have it;
+a libvpx without it builds and runs everything else fine, and fails only when an HDR encode opens
+its encoder — `encode failed (2)` / "the RGB encoder could not be opened". Check yours with
+`nm -g $(pkg-config --variable=libdir vpx)/libvpx.a | grep -c highbd` (0 means no), and see
+`scripts/install-libvpx.sh` for the flags the wheels are built with.
+
 ## How it works
 
 | Layer | Choice |
