@@ -65,9 +65,17 @@ DC_API int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, siz
 
 // As dc_decode_rgb, addressing one RGB stream of a multi-camera (v3) file by its metadata id.
 // `rgb_id` NULL means the primary stream — then this is exactly dc_decode_rgb.
-// Errors: as dc_decode_rgb, plus 8 = no RGB stream with that id in this file.
+// Errors: as dc_decode_rgb, plus 8 = no RGB stream with that id in this file, and
+//         7 = the stream is a 10-bit HDR track — its codes do not fit uint8, use dc_decode_rgb16.
 DC_API int dc_decode_rgb_id(const uint8_t* webm, size_t len, const char* rgb_id,
                             uint8_t* rgba_out, size_t rgba_cap);
+
+// Decode one 10-bit HDR RGB stream to RGBA of 10-bit codes (0..1023; alpha 1023). `rgb_id` NULL
+// means the primary stream. `out_cap` counts uint16 elements (frames * W*H*4), mirroring
+// dc_decode_signal. Errors: as dc_decode_rgb_id, with 7 meaning the stream is 8-bit SDR — use
+// dc_decode_rgb for it.
+DC_API int dc_decode_rgb16(const uint8_t* webm, size_t len, const char* rgb_id,
+                           uint16_t* out, size_t out_cap);
 
 // Quantization helpers. Both are no-ops when n <= 0 or either pointer is NULL. An unusable range
 // (near_/far_ non-positive or equal, levels < 3) writes the invalid code 0 / NaN rather than
@@ -102,6 +110,20 @@ typedef struct {
   const char* view;
 } dc_signal_spec2_t;
 
+// HDR10/HLG description of the display track(s): VP9 profile 2, 10-bit, BT.2020, broadcast
+// range. Applies to every RGB stream of the file. `transfer` uses the WebM
+// TransferCharacteristics values: 16 = PQ (HDR10), 18 = HLG — anything else is error 1.
+// The light levels and ST 2086 mastering block are optional static metadata, written into the
+// container's Colour element (and the CHROMAPAKZ tag) exactly as given.
+typedef struct {
+  int transfer;                       // 16 = PQ, 18 = HLG
+  int max_cll, max_fall;              // content light levels, nits; 0 = unset
+  int has_mastering;                  // nonzero: the ST 2086 fields below are meaningful
+  double rx, ry, gx, gy, bx, by;      // mastering display primaries, CIE 1931 xy
+  double wx, wy;                      // white point
+  double luminance_max, luminance_min;// mastering display luminance, nits
+} dc_hdr_meta_t;
+
 // Encode optional RGB plus zero or more lossless uint16 signals (each N*W*H samples).
 // On success *out is a malloc'd WebM file of *out_len bytes; release it with dc_free().
 // Errors: 1 = invalid argument: NULL out-params, N/fps <= 0, no inputs, a spec with a NULL
@@ -126,6 +148,19 @@ DC_API int dc_encode_multi2(const uint8_t* const* rgbas,
                             const dc_signal_spec2_t* signals, int num_signals,
                             int W, int H, int N, int fps,
                             uint8_t** out, size_t* out_len);
+
+// As dc_encode_multi2 for HDR display tracks: every RGB stream is VP9 profile 2, 10-bit,
+// BT.2020, with the container Colour element written from `hdr` (required, non-NULL). Each
+// rgbas[i] is N*W*H*4 uint16 samples of 10-bit PQ/HLG display codes (values above 1023 clamp).
+// num_rgbs must be >= 1 — HDR describes the display track, so there must be one.
+// Errors: as dc_encode_multi2; a NULL/invalid hdr (transfer not 16/18) is error 1;
+//         2 also covers a libvpx built without --enable-vp9-highbitdepth.
+DC_API int dc_encode_multi_hdr(const uint16_t* const* rgbas,
+                               const dc_rgb_spec_t* rgbs, int num_rgbs,
+                               const dc_hdr_meta_t* hdr,
+                               const dc_signal_spec2_t* signals, int num_signals,
+                               int W, int H, int N, int fps,
+                               uint8_t** out, size_t* out_len);
 
 // ── streaming (live-recording) encode ──
 // dc_encode_multi needs the whole take up front. These entry points encode it frame by frame and
@@ -185,6 +220,15 @@ DC_API int dc_stream_create2(int W, int H, int fps,
                              const char* text_track_name,
                              dc_stream_encoder_t** out);
 
+// As dc_stream_create2 with HDR display tracks (see dc_encode_multi_hdr). Frames are then added
+// with dc_stream_add_frame16 — the 8-bit dc_stream_add_frame/add_frame2 refuse this encoder.
+DC_API int dc_stream_create_hdr(int W, int H, int fps,
+                                const dc_rgb_spec_t* rgbs, int num_rgbs,
+                                const dc_hdr_meta_t* hdr, int emit_cues,
+                                const dc_signal_spec2_t* signals, int num_signals,
+                                const char* text_track_name,
+                                dc_stream_encoder_t** out);
+
 // Append one timed-text cue to the metadata track. Cues ride inside the cluster the
 // surrounding frames are already filling and never drive cluster boundaries, so this
 // usually returns an empty chunk. Fails if no text track was declared.
@@ -212,6 +256,13 @@ DC_API int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,
 DC_API int dc_stream_add_frame2(dc_stream_encoder_t* enc, const uint8_t* const* rgbas,
                                 const uint16_t* const* signal_planes,
                                 uint8_t** out, size_t* out_len);
+
+// dc_stream_add_frame2's HDR form, for encoders opened with dc_stream_create_hdr: each rgbas[i]
+// is W*H*4 uint16 samples of 10-bit display codes. Refused (error 1) on an SDR encoder, exactly
+// as the 8-bit forms are refused on an HDR one — the bit depth was fixed by the header.
+DC_API int dc_stream_add_frame16(dc_stream_encoder_t* enc, const uint16_t* const* rgbas,
+                                 const uint16_t* const* signal_planes,
+                                 uint8_t** out, size_t* out_len);
 
 // Flush the codecs, close the last cluster and append the Cues index if one was asked for at
 // create time. The handle is spent afterwards — destroy it. Same out-param contract as
