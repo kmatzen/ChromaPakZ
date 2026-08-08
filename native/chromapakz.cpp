@@ -1,6 +1,8 @@
 // chromapakz native core: triangle-fold packing + libvpx VP9 lossless + a minimal
 // Matroska/WebM mux/demux that is byte-compatible with src/webm.js.
 #include "chromapakz.h"
+#include <future>
+#include <thread>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -860,6 +862,15 @@ struct TrackEncoder {
     vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return ENC_FAIL;
     cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps;
     cfg.g_profile=0; cfg.g_lag_in_frames=0; cfg.kf_mode=VPX_KF_DISABLED;
+    // Row multithreading, below. Four threads is where this plateaus for the small
+    // frames here (256x192): 2 threads 53.3 ms, 4 threads 51.0, 8 threads 51.1.
+    // Encoders run one at a time on the write queue, so they do not contend.
+    // Row multithreading, below. With the streaming path now encoding its tracks
+    // concurrently this barely matters there (1 thread 16.4 ms, 4 threads 16.0),
+    // but the batch encoder still drives tracks serially and gains ~8 ms/frame
+    // from it. Avoid 2: it measured reliably worse than either 1 or 4 (22.6 ms),
+    // reproducibly, so it is not sampling noise.
+    cfg.g_threads = std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
     if(lossless){
       cfg.rc_min_quantizer=0; cfg.rc_max_quantizer=0;
       cfg.g_pass=VPX_RC_ONE_PASS; cfg.g_error_resilient=0;
@@ -873,14 +884,31 @@ struct TrackEncoder {
       // packed depth planes LOSSY while the metadata still advertises "lossless":true. Silent
       // data corruption is worse than a failed encode, so refuse rather than proceed.
       if(vpx_codec_control(&ctx, VP9E_SET_LOSSLESS, 1)) return ENC_NO_LOSSLESS;
-      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 1);   // speed knob only — costs time, not fidelity
+      // Speed knob only: under VP9E_SET_LOSSLESS the reconstruction is bit-exact at
+      // every setting, so this trades encode time against compression ratio, never
+      // fidelity. Measured on a real LiDAR take (256x192, RGB + depth + confidence),
+      // which is the demanding case because sensor noise is expensive to code
+      // losslessly: cpu-used=1 89.7 ms/frame at 39.1 KiB, cpu-used=6 58.9 ms at
+      // 40.1 KiB — 1.5x faster for 2.5% more bytes. 7..9 give nothing further.
+      // Capture is frame-budget bound, so the time matters more than the bytes.
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 6);
     }else{
-      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 2);
+      // Lossy, so unlike the lossless path this trades picture quality, not just
+      // size: on a real take, cpu-used=2 gives 42.75 dB PSNR and =4 gives 40.75 dB,
+      // for ~7 ms/frame. Capture is frame-budget bound and the RGB track is the
+      // colour reference beside bit-exact depth, so the milliseconds win. Past 4 is
+      // pointless — cpu-used=6 measured both slower and worse.
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 4);
       vpx_codec_control(&ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
     }
     vpx_codec_control(&ctx, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
     // On failure vpx_img_alloc returns NULL and leaves img.planes unset — the copy below would
     // then memcpy through wild pointers.
+    // g_threads alone buys nothing (59.5 -> 58.7 ms): VP9 only spreads work across
+    // threads with row-mt or tiling, and tile columns need >=256px per tile, which
+    // a 256-wide frame cannot give more than one of. Row-mt is width-independent
+    // and is the whole gain: 59.5 -> 51.0 ms, identical bytes, still bit-exact.
+    vpx_codec_control(&ctx, VP9E_SET_ROW_MT, 1);
     if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)) return ENC_FAIL;
     haveImg=true;
     img.cs = VPX_CS_BT_709; img.range = VPX_CR_FULL_RANGE;
@@ -1029,7 +1057,8 @@ struct dc_stream_encoder {
   std::vector<Slot> slots;
   int textTrack=0;              // 0 when no metadata track was declared
   StreamMux mux;
-  Bytes hiPlane, loPlane;       // per-frame packing scratch, reused across the take
+  struct Packed { Bytes hi, lo; };
+  std::vector<Packed> packed;   // per-signal packing scratch, reused across the take
 
   /**
    * Drive every track through one round — a frame when `rgba`/`planes` are given, a flush when
@@ -1037,31 +1066,61 @@ struct dc_stream_encoder {
    * `chunk`. Returns 0, or the error code named by whichever track failed.
    */
   int round(const uint8_t* rgba, const uint16_t* const* planes, Bytes& chunk){
+    // Each track is an independent VP9 encoder, so the slots can run concurrently;
+    // only the muxing has to stay ordered. Packing moves ahead of the encode and
+    // into per-signal buffers — the old single hi/lo scratch pair was reused across
+    // signals, which is exactly what forced the encodes to be serial.
+    size_t px=(size_t)W*(size_t)H;
+    if(planes){
+      packed.resize(sigMeta.size());
+      for(size_t i=0;i<sigMeta.size();i++){
+        packed[i].hi.resize(px); packed[i].lo.resize(px);
+        pack(planes[i], px, packed[i].hi.data(), packed[i].lo.data());
+      }
+    }
+
+    // Source plane and error code per slot, in slot (== ascending track) order.
+    std::vector<const uint8_t*> src(slots.size(), nullptr);
+    std::vector<int> errOf(slots.size(), 0);
+    size_t idx=0;
+    if(hasRgb){ src[idx]=rgba; errOf[idx]=2; idx++; }
+    for(size_t i=0;i<sigMeta.size();i++){
+      src[idx]=planes?packed[i].hi.data():nullptr; errOf[idx]=3; idx++;
+      src[idx]=planes?packed[i].lo.data():nullptr; errOf[idx]=3; idx++;
+    }
+
+    std::vector<std::vector<Bytes>> pktsOf(slots.size());
+    std::vector<std::vector<bool>> keysOf(slots.size());
+    std::vector<int> rcOf(slots.size(), 0);
+    {
+      // One task per slot. Each writes only its own vectors, so nothing is shared
+      // across threads; the encoders hold separate vpx contexts.
+      std::vector<std::future<void>> running;
+      running.reserve(slots.size());
+      for(size_t k=1;k<slots.size();k++){
+        running.push_back(std::async(std::launch::async, [&,k]{
+          if(!slots[k].enc->encode(src[k], pktsOf[k], keysOf[k])) rcOf[k]=errOf[k];
+        }));
+      }
+      // Slot 0 on this thread: one fewer hand-off, and it is usually RGB, the
+      // longest single track.
+      if(!slots.empty() && !slots[0].enc->encode(src[0], pktsOf[0], keysOf[0])) rcOf[0]=errOf[0];
+      for(auto& f : running) f.get();
+    }
+    for(size_t k=0;k<slots.size();k++) if(rcOf[k]) return rcOf[k];
+
     std::vector<Bytes> pkts; std::vector<bool> keys;
     std::vector<int> trackOf, timeOf;
-    auto run=[&](Slot& sl, const uint8_t* src, int errCode)->int{
-      size_t before=pkts.size();
-      if(!sl.enc->encode(src, pkts, keys)) return errCode;
-      for(size_t k=before;k<pkts.size();k++){
-        trackOf.push_back(sl.track);
-        timeOf.push_back((int)(1000.0*sl.emitted/fps));
-        sl.emitted++;
+    for(size_t k=0;k<slots.size();k++){
+      for(size_t n=0;n<pktsOf[k].size();n++){
+        pkts.push_back(std::move(pktsOf[k][n]));
+        keys.push_back(keysOf[k][n]);
+        trackOf.push_back(slots[k].track);
+        timeOf.push_back((int)(1000.0*slots[k].emitted/fps));
+        slots[k].emitted++;
       }
-      return 0;
-    };
-    size_t idx=0;
-    if(hasRgb){ if(int rc=run(slots[idx++], rgba, 2)) return rc; }
-    size_t px=(size_t)W*(size_t)H;
-    for(size_t i=0;i<sigMeta.size();i++){
-      const uint8_t *hi=nullptr, *lo=nullptr;
-      if(planes){
-        hiPlane.resize(px); loPlane.resize(px);
-        pack(planes[i], px, hiPlane.data(), loPlane.data());
-        hi=hiPlane.data(); lo=loPlane.data();
-      }
-      if(int rc=run(slots[idx++], hi, 3)) return rc;
-      if(int rc=run(slots[idx++], lo, 3)) return rc;
     }
+
     // Blocks must reach the mux in (time, track) order: the cluster boundary is decided by the cue
     // track's keyframe, and a block sorted ahead of it would land in the closing cluster instead of
     // the one it belongs to.
