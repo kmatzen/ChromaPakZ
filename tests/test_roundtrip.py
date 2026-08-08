@@ -26,7 +26,7 @@ class RoundTrip(unittest.TestCase):
         self.assertEqual(info["frames"], 6)
         self.assertEqual(info["levels"], 2048)
         self.assertEqual([s["id"] for s in info["signals"]], ["depth"])
-        self.assertEqual(info["metadata"]["version"], 2)
+        self.assertEqual(info["metadata"]["version"], 3)
 
     def test_signal_and_rgb_decode(self):
         data = cz.encode({"depth": self.depth}, specs={"depth": self.depth_spec}, rgb=self.rgb)

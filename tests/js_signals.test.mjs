@@ -23,7 +23,7 @@ test('two signals survive mux -> demux -> normalizeMetadata', () => {
   const metadata = buildFileMetadata({ W, H, fps: 30, n: N, hasRgb: false, signals });
   const d = demux(mux({ tracks, frames, metadata, durationMs: 100 }));
   const meta = normalizeMetadata(d.metadata);
-  assert.equal(meta.version, 2);
+  assert.equal(meta.version, 3);
   assert.deepEqual(meta.signals.map(s => s.id), ['depth', 'objectId']);
   assert.equal(d.frames.length, N * 4, 'frame packets');
 });

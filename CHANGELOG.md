@@ -4,6 +4,49 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.7.0 — 2026-08-08
+
+### Added — multiple RGB tracks (stereo / multi-camera) — #47
+
+A file can now carry N synchronized lossy RGB streams beside the lossless
+signals — a stereo rig stores both cameras' pixels in the same clusters, on the
+same timeline. Metadata is **v3**: `rgbs[]` lists every stream
+(`{id, track, codec}`, tracks 1..N in declaration order); the legacy `rgb` key
+stays and always duplicates `rgbs[0]`. The **primary** stream keeps track 1 and
+the container name `rgb` — the pair pre-0.7.0 readers key on — so old readers
+decode it exactly as before and ignore the rest; secondaries are named
+`rgb-{id}`. Signal hi/lo tracks number after all RGB tracks. All streams share
+the file's W×H and its frame grid: every declared stream is written on every
+frame (the JS encoder additionally lets a stream start late, as signals always
+could, but never gap). Unsynchronized rigs are out of scope.
+
+- **JS**: `createEncoder({ rgbs: ['cam0', { id: 'cam1', kbps }] })`,
+  `addFrame({ rgbs: { cam0, cam1 } })` (`rgb:` stays sugar for the primary);
+  decoded frames gain `frame.rgbs`, `decode()` a per-stream `rgbs` series.
+- **Python**: `encode(rgbs={id: array}, rgb_kbps={id: kbps})`,
+  `create_encoder(rgbs=[...])` + `add_frame(rgbs={...})`,
+  `decode_rgb(data, stream=)`, `decode()["rgbs"]`, `probe()["rgbs"]`.
+- **C ABI**: new `dc_rgb_spec_t` / `dc_signal_spec2_t`, `dc_encode_multi2`,
+  `dc_stream_create2`, `dc_stream_add_frame2`, `dc_decode_rgb_id`. The original
+  entry points are unchanged single-stream forms (a multi-stream encoder refuses
+  the single-pointer `dc_stream_add_frame`); `dc_probe`'s `has_rgb` out-param now
+  counts streams — still 0/1 for old files, so truthiness checks keep working.
+- **`view` hint**: a signal spec/metadata entry may name the RGB stream whose
+  camera frame it lives in (e.g. disparity in `cam0`'s rectified frame).
+  Recorded verbatim, interpreted by nothing — association semantics belong to
+  wrapper formats.
+
+### Compatibility
+
+Additive. Old files (v2, no `rgbs`) read unchanged in 0.7.0 readers as a single
+stream under the default id `"rgb"`. New single-stream files bump to
+`"version": 3` and add a one-entry `rgbs[]`; pre-0.7.0 readers ignore the
+unknown key (the C parser walks the document structurally) and decode via the
+legacy `rgb` key / track name as before. Multi-stream files decode their primary
+in old readers; the extra streams are invisible there. The C and JS writers
+remain byte-identical for identical configurations (covered by
+`tests/test_multi_rgb.py`).
+
 ## 0.6.0 — 2026-08-07
 
 ### Changed — encode speed

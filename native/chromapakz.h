@@ -49,17 +49,25 @@ extern "C" {
 // Read W/H/N/fps + inverse-depth params + RGB presence from a file's metadata. Any out-param
 // may be NULL. N is a hint for sizing decode buffers, not a guarantee — see the note on frame
 // counting in the implementation; the dc_decode_* capacity arguments are what bound the writes.
+// `has_rgb` receives the number of RGB streams the file carries (0 or 1 before multi-RGB, so
+// existing truthiness checks keep working; N for a v3 multi-camera file).
 // Errors: 1 = webm is NULL, len is 0, or the bytes carry no chromapakz metadata.
 DC_API int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
                     double* near_, double* far_, int* levels, int* has_rgb);
 
-// Decode the RGB track into `rgba_out`, which holds `rgba_cap` bytes (frames * W*H*4).
+// Decode the primary RGB track into `rgba_out`, which holds `rgba_cap` bytes (frames * W*H*4).
 // Writes only as many whole frames as the capacity allows; a stream with more returns
 // DC_ERR_CAPACITY and leaves the buffer's contents unspecified. Frames the file does not
 // contain are left untouched, so pass a zeroed buffer if you read the whole of it back.
 // Errors: 1 = NULL argument or no metadata; 2 = the file declares unusable dimensions;
 //         3 = VP9 decode failed; 6 = the file has no RGB track.
 DC_API int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgba_cap);
+
+// As dc_decode_rgb, addressing one RGB stream of a multi-camera (v3) file by its metadata id.
+// `rgb_id` NULL means the primary stream — then this is exactly dc_decode_rgb.
+// Errors: as dc_decode_rgb, plus 8 = no RGB stream with that id in this file.
+DC_API int dc_decode_rgb_id(const uint8_t* webm, size_t len, const char* rgb_id,
+                            uint8_t* rgba_out, size_t rgba_cap);
 
 // Quantization helpers. Both are no-ops when n <= 0 or either pointer is NULL. An unusable range
 // (near_/far_ non-positive or equal, levels < 3) writes the invalid code 0 / NaN rather than
@@ -75,6 +83,25 @@ typedef struct {
   int levels;
 } dc_signal_spec_t;
 
+// One RGB stream of a multi-camera (v3) file. Streams are numbered in the order given —
+// the first is the primary (track 1, container name "rgb", the one legacy readers decode).
+typedef struct {
+  const char* id;   // stream id recorded in the metadata; NULL only for a single stream = "rgb"
+  int kbps;         // per-stream bitrate; 0 = the 2000 default
+} dc_rgb_spec_t;
+
+// dc_signal_spec_t plus the optional `view` hint (the id of the RGB stream whose camera frame
+// this signal lives in). The hint is recorded in the metadata verbatim and never interpreted —
+// association semantics belong to the wrapper format. NULL = unspecified.
+typedef struct {
+  const char* id;
+  const uint16_t* data;
+  int inverse_depth;
+  double near_, far_;
+  int levels;
+  const char* view;
+} dc_signal_spec2_t;
+
 // Encode optional RGB plus zero or more lossless uint16 signals (each N*W*H samples).
 // On success *out is a malloc'd WebM file of *out_len bytes; release it with dc_free().
 // Errors: 1 = invalid argument: NULL out-params, N/fps <= 0, no inputs, a spec with a NULL
@@ -88,6 +115,17 @@ DC_API int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
                            const dc_signal_spec_t* signals, int num_signals,
                            int W, int H, int N, int fps,
                            uint8_t** out, size_t* out_len);
+
+// As dc_encode_multi, with any number of RGB streams: `rgbas` is `num_rgbs` pointers, each to
+// N*W*H*4 bytes, described by `rgbs` in the same order. All streams share W/H and the frame
+// grid — every stream carries all N frames. num_rgbs may be 0 (signals only).
+// Errors: as dc_encode_multi; a NULL/duplicate/empty stream id (NULL is allowed only when
+// num_rgbs == 1) or a NULL rgbas entry is error 1.
+DC_API int dc_encode_multi2(const uint8_t* const* rgbas,
+                            const dc_rgb_spec_t* rgbs, int num_rgbs,
+                            const dc_signal_spec2_t* signals, int num_signals,
+                            int W, int H, int N, int fps,
+                            uint8_t** out, size_t* out_len);
 
 // ── streaming (live-recording) encode ──
 // dc_encode_multi needs the whole take up front. These entry points encode it frame by frame and
@@ -138,6 +176,15 @@ DC_API int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb,
                                const char* text_track_name,
                                dc_stream_encoder_t** out);
 
+// As dc_stream_create_ex, with any number of RGB streams (see dc_rgb_spec_t): streams take
+// tracks 1..num_rgbs in the order given, signals follow. Frames are then added with
+// dc_stream_add_frame2. Same errors as dc_stream_create_ex; invalid stream ids are error 1.
+DC_API int dc_stream_create2(int W, int H, int fps,
+                             const dc_rgb_spec_t* rgbs, int num_rgbs, int emit_cues,
+                             const dc_signal_spec2_t* signals, int num_signals,
+                             const char* text_track_name,
+                             dc_stream_encoder_t** out);
+
 // Append one timed-text cue to the metadata track. Cues ride inside the cluster the
 // surrounding frames are already filling and never drive cluster boundaries, so this
 // usually returns an empty chunk. Fails if no text track was declared.
@@ -158,6 +205,13 @@ DC_API int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out
 DC_API int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,
                                const uint16_t* const* signal_planes,
                                uint8_t** out, size_t* out_len);
+
+// As dc_stream_add_frame for an encoder opened with dc_stream_create2: `rgbas` is an array of
+// num_rgbs pointers (each W*H*4 bytes) in create-time order, required exactly when the stream
+// declared any RGB. Every declared stream must be present on every frame.
+DC_API int dc_stream_add_frame2(dc_stream_encoder_t* enc, const uint8_t* const* rgbas,
+                                const uint16_t* const* signal_planes,
+                                uint8_t** out, size_t* out_len);
 
 // Flush the codecs, close the last cluster and append the Cues index if one was asked for at
 // create time. The handle is spent afterwards — destroy it. Same out-param contract as

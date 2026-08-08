@@ -13,10 +13,10 @@ test('empty signals[] is rejected', () => {
   assert.throws(() => normalizeMetadata({ version: 2, width: 64, signals: [] }));
 });
 
-test('encode metadata is v2 with no top-level depth', () => {
+test('encode metadata is v3 with no top-level depth', () => {
   const signals = planSignals([{ id: 'depth', near: 0.3, far: 9 }], false);
   const meta = buildFileMetadata({ W: 64, H: 48, fps: 30, n: 1, hasRgb: false, signals });
-  assert.equal(meta.version, 2);
+  assert.equal(meta.version, 3);
   assert.ok(!('depth' in meta), 'no top-level depth key');
   assert.equal(normalizeMetadata(meta).signals.length, 1);
 });
