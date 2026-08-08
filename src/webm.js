@@ -1,5 +1,6 @@
-// Minimal pure-JS Matroska/WebM muxer + demuxer for the subset chromapakz needs:
-// multiple VP9 video tracks, one cluster-split timeline, and a metadata tag.
+// Minimal pure-JS Matroska/WebM muxer + demuxer for the subset chromapakz needs: multiple VP9
+// video tracks, one cluster-split timeline, a metadata tag, an optional WebVTT timed-text track,
+// and the Colour element that carries HDR signalling (see colourElement / walkColour).
 // Batch mux/demux plus incremental createStreamMux / createStreamDemux for network streaming.
 
 // ── EBML element IDs (stored with their length-marker bits, as on disk) ──
