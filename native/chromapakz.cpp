@@ -1,6 +1,7 @@
 // chromapakz native core: triangle-fold packing + libvpx VP9 lossless + a minimal
 // Matroska/WebM mux/demux that is byte-compatible with src/webm.js.
 #include "chromapakz.h"
+#include <thread>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -860,6 +861,10 @@ struct TrackEncoder {
     vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return ENC_FAIL;
     cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps;
     cfg.g_profile=0; cfg.g_lag_in_frames=0; cfg.kf_mode=VPX_KF_DISABLED;
+    // Row multithreading, below. Four threads is where this plateaus for the small
+    // frames here (256x192): 2 threads 53.3 ms, 4 threads 51.0, 8 threads 51.1.
+    // Encoders run one at a time on the write queue, so they do not contend.
+    cfg.g_threads = std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
     if(lossless){
       cfg.rc_min_quantizer=0; cfg.rc_max_quantizer=0;
       cfg.g_pass=VPX_RC_ONE_PASS; cfg.g_error_resilient=0;
@@ -888,6 +893,11 @@ struct TrackEncoder {
     vpx_codec_control(&ctx, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
     // On failure vpx_img_alloc returns NULL and leaves img.planes unset — the copy below would
     // then memcpy through wild pointers.
+    // g_threads alone buys nothing (59.5 -> 58.7 ms): VP9 only spreads work across
+    // threads with row-mt or tiling, and tile columns need >=256px per tile, which
+    // a 256-wide frame cannot give more than one of. Row-mt is width-independent
+    // and is the whole gain: 59.5 -> 51.0 ms, identical bytes, still bit-exact.
+    vpx_codec_control(&ctx, VP9E_SET_ROW_MT, 1);
     if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)) return ENC_FAIL;
     haveImg=true;
     img.cs = VPX_CS_BT_709; img.range = VPX_CR_FULL_RANGE;
