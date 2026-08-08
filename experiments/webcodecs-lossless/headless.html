@@ -125,7 +125,7 @@ window.__runMultiSignalWebM = async (W=128, H=96, N=6) => {
   const bytes=await enc.finish();
   const dec=DC.createDecoder(bytes);
   if(dec.signals.length!==2) throw new Error('expected 2 signals in metadata');
-  if(dec.metadata.version!==2) throw new Error('expected metadata version 2');
+  if(dec.metadata.version!==3) throw new Error('expected metadata version 3');
   let exactDepth=true, exactOid=true, i=0;
   for await (const frame of dec){
     const A=DC.quantizeInverseDepth(depthFloat[i],near,far), B=frame.signals.depth.u16;
