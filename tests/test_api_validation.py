@@ -125,7 +125,7 @@ class MultiSignalContract(unittest.TestCase):
 
     def test_metadata_lists_both_signals_on_distinct_tracks(self):
         meta = cz.parse_metadata(self.data)
-        self.assertEqual(meta.get("version"), 2)
+        self.assertEqual(meta.get("version"), 3)
         by_id = {s["id"]: s for s in meta["signals"]}
         self.assertEqual(set(by_id), {"depth", "objectId"})
         self.assertNotEqual(by_id["depth"]["tracks"]["hi"], by_id["objectId"]["tracks"]["hi"])

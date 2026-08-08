@@ -12,6 +12,7 @@ import {
   slotKeysForMetadata,
   isSlotComplete,
   collectFrameInputs,
+  rgbSlotKey,
 } from '../src/signals.js';
 
 test('planSignals rejects malformed specs', () => {
@@ -64,10 +65,12 @@ test('buildTracksFromPlan mirrors the plan', () => {
 test('buildFileMetadata: batch vs streaming', () => {
   const plan = planSignals([{ id: 'depth', near: 0.3, far: 9 }], true);
   const batch = buildFileMetadata({ W: 64, H: 48, fps: 30, n: 7, hasRgb: true, signals: plan });
-  assert.equal(batch.version, 2);
+  assert.equal(batch.version, 3);
   assert.equal(batch.frames, 7);
   assert.equal(batch.streaming, undefined);
   assert.equal(batch.rgb?.track, 1, 'rgb track recorded');
+  assert.deepEqual(batch.rgbs, [{ id: 'rgb', track: 1, codec: 'vp09.00.10.08' }],
+    'rgbs[] mirrors the legacy rgb as its first entry');
 
   const stream = buildFileMetadata({ W: 64, H: 48, fps: 30, n: 0, hasRgb: false, signals: plan, streaming: true });
   assert.equal(stream.frames, null);
@@ -141,9 +144,10 @@ test('blocksByTime sorts slots and slot completeness needs every track', () => {
   assert.deepEqual(slots.map(s => s.timeMs), [0, 33], 'slots sorted by time');
 
   const keys = slotKeysForMetadata(meta);
-  assert.ok(keys.rgb === true && keys.d === true, 'slot keys include rgb + signal');
+  assert.deepEqual(keys.rgbIds, ['rgb'], 'legacy rgb becomes the default stream id');
+  assert.deepEqual(keys.signalIds, ['d'], 'slot keys include the signal');
   assert.ok(isSlotComplete(slots[0], keys) && isSlotComplete(slots[1], keys), 'complete slots');
-  assert.ok(!isSlotComplete({ timeMs: 66, rgb: fr(66), 'd:hi': fr(66) }, keys), 'missing lo -> incomplete');
+  assert.ok(!isSlotComplete({ timeMs: 66, [rgbSlotKey('rgb')]: fr(66), 'd:hi': fr(66) }, keys), 'missing lo -> incomplete');
   assert.ok(!isSlotComplete({ timeMs: 66, 'd:hi': fr(66), 'd:lo': fr(66) }, keys), 'missing rgb -> incomplete');
 
   const noRgbKeys = slotKeysForMetadata({ version: 2, signals: [{ id: 'd', tracks: { hi: 1, lo: 2 } }] });

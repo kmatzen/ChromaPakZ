@@ -85,6 +85,25 @@ Once a stream (RGB or a given signal) has been written, it must appear on every 
 a stream that stops and resumes is refused, because each track's timestamps come from its own frame
 counter and a gap cannot be realigned.
 
+### Multiple RGB streams (stereo / multi-camera)
+
+`rgbs` declares N synchronized RGB streams instead of the single default one (mutually exclusive
+with `hasRgb`; entries are ids or `{ id, kbps }` for a per-stream bitrate). Order fixes the track
+numbering — the first stream is the **primary**: track 1, container name `rgb`, the stream legacy
+readers and plain `<video>` playback see. Frames then carry `rgbs: { id: plane }`; `rgb:` stays
+sugar for the primary. Named streams cannot be inferred from frame 0, so `rgbs` must be declared:
+
+```javascript
+const enc = createEncoder({ W, H, signals, rgbs: ['cam0', { id: 'cam1', kbps: 1_000_000 }] });
+await enc.addFrame({ rgbs: { cam0, cam1 }, signals: { … } });
+```
+
+Decoded frames gain `frame.rgbs` (`{ id: plane }`) beside the legacy `frame.rgb` (= the primary),
+and the batch `decode()` returns a per-stream `rgbs` series. All streams share the encoder's
+`W`×`H` and the frame grid; the per-frame contiguity rule above applies to each stream. A signal
+spec may carry `view: '<rgb id>'` — an informational hint (recorded in the metadata, interpreted
+by nothing) naming the camera frame the signal lives in.
+
 ### Plane sizes
 
 Every plane handed to `addFrame()` must match the encoder's geometry exactly: `W*H` samples for a
@@ -143,19 +162,26 @@ depth = cz.decode_signal(data, "depth")
 
 | Function | Purpose |
 |---|---|
-| `encode(signals, specs=, rgb=, fps=30, rgb_kbps=2000)` | Multi-signal encode → WebM bytes |
-| `create_encoder(width, height, signals=, fps=, has_rgb=, on_chunk=, cues=)` | Streaming encoder for live recording |
-| `decode(data, signal_ids=)` | Decode signals + optional RGB |
+| `encode(signals, specs=, rgb=, rgbs=, fps=30, rgb_kbps=2000)` | Multi-signal encode → WebM bytes |
+| `create_encoder(width, height, signals=, fps=, has_rgb=, rgbs=, on_chunk=, cues=)` | Streaming encoder for live recording |
+| `decode(data, signal_ids=)` | Decode signals + RGB (`rgb` = primary; `rgbs` = every stream) |
 | `decode_signal(data, id)` | One `(N,H,W)` uint16 plane |
-| `decode_rgb(data)` | RGB track → `(N,H,W,4)` uint8 RGBA |
-| `probe(data)` | `width`, `height`, `frames`, `fps`, `near`, `far`, `levels`, `has_rgb`, `signals` |
-| `parse_metadata(data)` | Full v2 JSON |
+| `decode_rgb(data, stream=)` | One RGB stream (default: primary) → `(N,H,W,4)` uint8 RGBA |
+| `probe(data)` | `width`, `height`, `frames`, `fps`, `near`, `far`, `levels`, `has_rgb`, `rgbs`, `signals` |
+| `parse_metadata(data)` | Full metadata JSON |
 | `inverse_depth_spec(near, far, levels=65536)` | Spec dict for a depth signal (`3 <= levels <= 65536`) |
 | `quantize_inverse(z, near=, far=, levels=)` | Float depth → uint16 codes (`0` = invalid) |
 | `dequantize_inverse(d, near=, far=, levels=)` | uint16 codes → float32 metres (invalid → NaN) |
 
 `fps` and `rgb_kbps` are encode-time knobs: frame rate written to the container, and the VP9 bitrate
-for the *lossy* RGB track (signals are always lossless, and unaffected by `rgb_kbps`).
+for the *lossy* RGB tracks (signals are always lossless, and unaffected by `rgb_kbps`).
+
+Stereo / multi-camera pixels go in `rgbs` — `{id: (N,H,W,4) array}`, order fixing the track
+numbering, the first stream being the primary one legacy readers decode; `rgb_kbps` may then be a
+`{id: kbps}` dict. Streaming mirrors it: `create_encoder(rgbs=["cam0", ("cam1", 900)])` (or a
+`{id: kbps}` dict), then `add_frame(rgbs={"cam0": a, "cam1": b}, signals=…)` with every declared
+stream on every frame. A spec may carry `view: "<rgb id>"` — an informational hint naming the
+camera frame a signal lives in, recorded in the metadata and interpreted by nothing.
 
 The native core is loaded on first use, not at import — so `inverse_depth_spec`, the validation
 helpers and `chromapakz.webm_inspect` are usable (and unit-testable) without a compiled `_core`.
@@ -239,11 +265,15 @@ quantize float depth with `quantize_inverse()` first.
 
 | Function | Purpose |
 |---|---|
-| `dc_encode_multi` | RGB + N signals |
-| `dc_stream_create` / `_header` / `_add_frame` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording |
+| `dc_encode_multi` / `dc_encode_multi2` | RGB (one / N streams) + N signals |
+| `dc_stream_create` / `_create2` / `_header` / `_add_frame` / `_add_frame2` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording |
 | `dc_decode_signal` | Decode by id |
 | `dc_get_metadata` | CHROMAPAKZ JSON |
-| `dc_probe` / `dc_decode_rgb` | Header + RGB |
+| `dc_probe` / `dc_decode_rgb` / `dc_decode_rgb_id` | Header + RGB (primary / by stream id) |
+
+The `*2` entry points (0.7.0) take `dc_rgb_spec_t` stream descriptors and `dc_signal_spec2_t`
+(the v1 struct plus `view`); the originals remain as single-stream forms — existing callers are
+untouched, and `dc_probe`'s `has_rgb` out-param now counts streams (still 0/1 for old files).
 
 Every entry point returns `0` on success and a nonzero code on failure — none of them throw, and
 none of them abort on NULL or degenerate arguments. Codes `1`–`8` are per-function, documented on

@@ -14,8 +14,48 @@ const VP9 = 'vp09.00.10.08';
 const SCHEME_TRIFOLD = 'tri-fold-8+8';
 const QUANT_INVERSE_DEPTH = 'inverse-depth';
 
-/** Track number RGB always occupies when a file carries it; signal tracks start after it. */
+/** Track number the primary RGB stream always occupies when a file carries any. */
 export const RGB_TRACK = 1;
+
+/** Stream id used when a file carries RGB that was never given an explicit id. */
+export const DEFAULT_RGB_ID = 'rgb';
+
+/**
+ * Slot key for one RGB stream. JSON-quoting the id keeps the key space collision-free against
+ * signal keys (`${id}:hi` / `${id}:lo`): an rgb key always ends in `"`, a signal key never does,
+ * whatever characters either id contains.
+ */
+export const rgbSlotKey = id => `rgb:${JSON.stringify(id)}`;
+
+/**
+ * Normalize createEncoder's `rgbs` declaration — an array of ids (strings) or
+ * `{ id, kbps? }` entries — into `[{ id, kbps }]`, order preserved (it fixes track numbering).
+ */
+export function normalizeRgbSpecs(rgbs){
+  if(!Array.isArray(rgbs)) throw new Error('rgbs must be an array of stream ids or { id, kbps } entries');
+  const out=[]; const seen=new Set();
+  for(const raw of rgbs){
+    const spec = typeof raw === 'string' ? { id: raw } : raw;
+    const id=spec?.id;
+    if(typeof id !== 'string' || !id) throw new Error('each rgb stream needs a non-empty string id');
+    if(seen.has(id)) throw new Error(`duplicate rgb stream id "${id}"`);
+    seen.add(id);
+    out.push({ id, kbps: spec.kbps ?? null });
+  }
+  return out;
+}
+
+/**
+ * Assign track numbers and container names to RGB streams. The primary stream keeps track 1 and
+ * the container name "rgb" — that pair is what pre-multi-RGB readers (and the cue-track choice)
+ * key on — and secondaries follow as `rgb-{id}` on tracks 2..N. Signals number after all of them.
+ */
+export function planRgbs(specs){
+  return specs.map((s, i)=>({
+    id: s.id, track: i+1, codec: VP9, kbps: s.kbps ?? null,
+    trackName: i===0 ? 'rgb' : `rgb-${s.id}`,
+  }));
+}
 
 export const SIGNAL_DEPTH = {
   id: 'depth',
@@ -44,20 +84,31 @@ export function normalizeMetadata(meta){
       : s.quant === QUANT_INVERSE_DEPTH ? { type: QUANT_INVERSE_DEPTH, near: s.near, far: s.far, levels: s.levels } : s.quant;
     return { ...s, tracks: { hi: s.tracks.hi, lo: s.tracks.lo }, quant };
   });
-  return { ...meta, signals };
+  // rgbs[] (v3) is authoritative when present; a legacy `rgb` (v2, always the sole stream)
+  // is folded into a one-entry list under the default id so every reader path below sees
+  // one shape. `rgb` stays on the object untouched for callers that still read it.
+  const rgbs = Array.isArray(meta.rgbs) && meta.rgbs.length
+    ? meta.rgbs.filter(r=>r && r.track).map((r, i)=>({
+        id: typeof r.id === 'string' && r.id ? r.id : (i===0 ? DEFAULT_RGB_ID : `rgb${i}`),
+        track: r.track, codec: r.codec }))
+    : meta.rgb ? [{ id: DEFAULT_RGB_ID, track: meta.rgb.track ?? RGB_TRACK, codec: meta.rgb.codec }] : [];
+  return { ...meta, rgbs, signals };
 }
 
-export function planSignals(specs, hasRgb){
+export function planSignals(specs, rgbCount){
+  // Historically a boolean (one RGB stream or none); a number counts the RGB streams that
+  // precede the signal tracks.
+  const nRgb = typeof rgbCount === 'number' ? rgbCount : (rgbCount ? 1 : 0);
   // An RGB-only take (video + wrapper metadata, no aux planes) is a valid plan; a file
   // with no tracks at all is not.
   if(!specs?.length){
-    if(!hasRgb) throw new Error('planSignals: need rgb or at least one signal spec');
+    if(!nRgb) throw new Error('planSignals: need rgb or at least one signal spec');
     return [];
   }
   const signals=[];
-  // Numbering is frozen here, so `hasRgb` must be final: a track reserved for RGB that never
-  // arrives (or an RGB track claimed after the fact) collides with signals[0].tracks.hi.
-  let next=hasRgb ? RGB_TRACK+1 : 1;
+  // Numbering is frozen here, so the RGB stream count must be final: a track reserved for RGB
+  // that never arrives (or an RGB track claimed after the fact) collides with signals[0].tracks.hi.
+  let next=nRgb+1;
   for(const raw of specs){
     const id=raw.id ?? raw.name;
     if(!id) throw new Error('each signal needs an id');
@@ -79,14 +130,24 @@ export function planSignals(specs, hasRgb){
       tracks: { hi, lo },
       trackNames: { hi: `signal-${id}-hi`, lo: `signal-${id}-lo` },
       quant,
+      // Optional, semantically inert hint: the id of the RGB stream whose camera frame this
+      // signal lives in. Recorded in the metadata for downstream consumers; never interpreted.
+      view: typeof raw.view === 'string' && raw.view ? raw.view : null,
     });
   }
   return signals;
 }
 
-export function buildTracksFromPlan(W, H, hasRgb, signals){
+/** `rgbPlan` is planRgbs() output; a boolean is accepted for pre-multi-RGB callers. */
+function coerceRgbPlan(rgbPlan){
+  if(Array.isArray(rgbPlan)) return rgbPlan;
+  return rgbPlan ? planRgbs([{ id: DEFAULT_RGB_ID }]) : [];
+}
+
+export function buildTracksFromPlan(W, H, rgbPlan, signals){
   const tracks=[];
-  if(hasRgb) tracks.push({ number:RGB_TRACK, codecID:'V_VP9', name:'rgb', width:W, height:H });
+  for(const r of coerceRgbPlan(rgbPlan))
+    tracks.push({ number:r.track, codecID:'V_VP9', name:r.trackName, width:W, height:H });
   for(const s of signals){
     tracks.push({ number:s.tracks.hi, codecID:'V_VP9', name:s.trackNames.hi, width:W, height:H });
     tracks.push({ number:s.tracks.lo, codecID:'V_VP9', name:s.trackNames.lo, width:W, height:H });
@@ -94,7 +155,8 @@ export function buildTracksFromPlan(W, H, hasRgb, signals){
   return tracks;
 }
 
-export function buildFileMetadata({ W, H, fps, n, hasRgb, signals, streaming=false }){
+export function buildFileMetadata({ W, H, fps, n, hasRgb, rgbs, signals, streaming=false }){
+  const rgbPlan=coerceRgbPlan(rgbs ?? hasRgb);
   const sigMeta=signals.map(s=>({
     id: s.id,
     tracks: { hi: s.tracks.hi, lo: s.tracks.lo },
@@ -104,12 +166,16 @@ export function buildFileMetadata({ W, H, fps, n, hasRgb, signals, streaming=fal
     dtype: s.dtype,
     invalidCode: s.invalidCode,
     quant: s.quant,
+    view: s.view ?? undefined,
   }));
+  // v3 keeps the legacy `rgb` key pointing at the primary stream (always equal to rgbs[0]),
+  // so pre-multi-RGB readers decode it exactly as before; `rgbs` is what v3 readers use.
   return {
-    version: 2, width: W, height: H, fps,
+    version: 3, width: W, height: H, fps,
     frames: streaming ? null : n,
     streaming: streaming || undefined,
-    rgb: hasRgb ? { track: RGB_TRACK, codec: VP9 } : null,
+    rgb: rgbPlan.length ? { track: rgbPlan[0].track, codec: VP9 } : null,
+    rgbs: rgbPlan.length ? rgbPlan.map(r=>({ id: r.id, track: r.track, codec: r.codec })) : undefined,
     signals: sigMeta,
   };
 }
@@ -146,46 +212,42 @@ export function materializeSignal(u16, signal){
 }
 
 /**
- * Is there anything in this slot a reader can decode — rgb, or a complete hi/lo pair?
+ * Is there anything in this slot a reader can decode — an rgb stream, or a complete hi/lo pair?
  * Tracks need not share timestamps (rgb-only frames, per-track offsets, truncated files), so a slot
  * can end up holding nothing usable. Both decode paths drop those slots by this one rule, which is
  * what keeps buffered and streaming decode agreeing on frame counts for the same file.
+ * `meta` is normalized metadata (it needs both `rgbs` and `signals`).
  */
-export function slotHasContent(slot, signals){
-  if(slot.rgb) return true;
-  return signals.some(s=>slot[`${s.id}:hi`] && slot[`${s.id}:lo`]);
+export function slotHasContent(slot, meta){
+  if(meta.rgbs.some(r=>slot[rgbSlotKey(r.id)])) return true;
+  return meta.signals.some(s=>slot[`${s.id}:hi`] && slot[`${s.id}:lo`]);
 }
 
 export function blocksByTime(tracks, metadata){
   const meta=normalizeMetadata(metadata);
-  const rgbT=meta.rgb?.track;
   const map=new Map();
   function add(key, fr){
     if(!map.has(fr.timeMs)) map.set(fr.timeMs, { timeMs: fr.timeMs });
     map.get(fr.timeMs)[key]=fr;
   }
-  if(rgbT && tracks[rgbT]) for(const f of tracks[rgbT].frames) add('rgb', f);
+  for(const r of meta.rgbs)
+    if(tracks[r.track]) for(const f of tracks[r.track].frames) add(rgbSlotKey(r.id), f);
   for(const s of meta.signals){
     if(tracks[s.tracks.hi]) for(const f of tracks[s.tracks.hi].frames) add(`${s.id}:hi`, f);
     if(tracks[s.tracks.lo]) for(const f of tracks[s.tracks.lo].frames) add(`${s.id}:lo`, f);
   }
   return [...map.keys()].sort((a,b)=>a-b).map(t=>map.get(t))
-    .filter(slot=>slotHasContent(slot, meta.signals));
+    .filter(slot=>slotHasContent(slot, meta));
 }
 
 export function slotKeysForMetadata(metadata){
   const meta=normalizeMetadata(metadata);
-  const keys={ rgb: !!meta.rgb };
-  for(const s of meta.signals) keys[s.id]=true;
-  return keys;
+  return { rgbIds: meta.rgbs.map(r=>r.id), signalIds: meta.signals.map(s=>s.id) };
 }
 
 export function isSlotComplete(slot, keys){
-  if(keys.rgb && !slot.rgb) return false;
-  for(const id of Object.keys(keys)){
-    if(id==='rgb') continue;
-    if(!slot[`${id}:hi`] || !slot[`${id}:lo`]) return false;
-  }
+  for(const id of keys.rgbIds) if(!slot[rgbSlotKey(id)]) return false;
+  for(const id of keys.signalIds) if(!slot[`${id}:hi`] || !slot[`${id}:lo`]) return false;
   return true;
 }
 
