@@ -62,7 +62,9 @@
   <p>Generate (or load) an RGBD clip, encode it in-browser via WebCodecs VP9, then decode and view it back.
      The RGB pane is what a legacy player shows; depth (and other uint16 signals) ride along, bit-exact.
      On Chromium this runs entirely on WebCodecs with no WASM; other engines transparently load a small
-     libvpx-WASM fallback.</p>
+     libvpx-WASM fallback. Loading a file whose display track is <b>HDR</b> (10-bit, VP9 profile 2) shows
+     its signals but leaves the RGB pane empty — browsers play those tracks in <code>&lt;video&gt;</code>,
+     and the JS library skips them rather than decode them.</p>
 </header>
 
 <div id="unsupported">This browser's <code>WebCodecs</code> path isn't bit-exact here, so the demo will use the
