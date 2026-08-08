@@ -4,6 +4,49 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.6.0 — 2026-08-07
+
+### Changed — encode speed
+
+A capture's write chain runs one frame at a time, so every millisecond here is
+frame budget. Measured throughout on a real LiDAR take (256x192, RGB + depth +
+confidence) rather than synthetic data — sensor noise is what makes lossless
+coding expensive, and smooth synthetic depth understates it threefold.
+
+    original                        89.7 ms/frame
+    lossless cpu-used 1 -> 6        59.5
+    row multithreading              51.2
+    lossy rgb cpu-used 2 -> 4       44.3
+    concurrent track encoding       ~18            5x overall
+
+- **Tracks encode concurrently.** Each track is an independent VP9 encoder, so a
+  frame's slots can run at the same time; only the muxing has to stay ordered.
+  The single hi/lo packing scratch pair was reused across signals, which is what
+  had forced the encodes to be serial — packing now happens first, into
+  per-signal buffers. Output is byte-identical run to run: blocks merge in slot
+  order and are still sorted by (time, track) before muxing.
+
+- **Lossless `cpu-used` 1 -> 6.** Under `VP9E_SET_LOSSLESS` the reconstruction is
+  bit-exact at every setting, so this knob only trades encode time against
+  compression ratio. It was pinned near the slow end. 1.5x faster for 2.5% more
+  bytes; 7..9 give nothing further.
+
+- **Row multithreading.** `g_threads` alone buys nothing — VP9 only spreads work
+  across threads with row-mt or tiling, and tile columns want >=256px per tile,
+  which a 256-wide frame cannot give more than one of. Now mostly matters to the
+  batch encoder, which still drives tracks serially. Avoid `g_threads=2`: it
+  measured reproducibly worse than either 1 or 4.
+
+- **Lossy RGB `cpu-used` 2 -> 4.** The one fidelity change in this release: at a
+  fixed 2000 kbps, PSNR 42.75 dB -> 40.75 dB for ~7 ms/frame. Depth and other
+  lossless signals are unaffected and remain bit-exact.
+
+### Compatibility
+
+No API or format change. Files written by 0.6.0 differ from 0.5.0 only in the
+lossy RGB track's rate-distortion choices; every lossless signal round-trips
+bit-exactly as before, and 0.5.0 readers read 0.6.0 files.
+
 ## 0.5.0 — 2026-08-07
 
 ### Added
