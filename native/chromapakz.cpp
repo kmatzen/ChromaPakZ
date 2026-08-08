@@ -873,7 +873,14 @@ struct TrackEncoder {
       // packed depth planes LOSSY while the metadata still advertises "lossless":true. Silent
       // data corruption is worse than a failed encode, so refuse rather than proceed.
       if(vpx_codec_control(&ctx, VP9E_SET_LOSSLESS, 1)) return ENC_NO_LOSSLESS;
-      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 1);   // speed knob only — costs time, not fidelity
+      // Speed knob only: under VP9E_SET_LOSSLESS the reconstruction is bit-exact at
+      // every setting, so this trades encode time against compression ratio, never
+      // fidelity. Measured on a real LiDAR take (256x192, RGB + depth + confidence),
+      // which is the demanding case because sensor noise is expensive to code
+      // losslessly: cpu-used=1 89.7 ms/frame at 39.1 KiB, cpu-used=6 58.9 ms at
+      // 40.1 KiB — 1.5x faster for 2.5% more bytes. 7..9 give nothing further.
+      // Capture is frame-budget bound, so the time matters more than the bytes.
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 6);
     }else{
       vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 2);
       vpx_codec_control(&ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
