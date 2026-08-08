@@ -77,6 +77,11 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
     const be=await getBackend();
 
     for(const r of meta.rgbs){
+      // A 10-bit HDR display track (v3 `hdr`) has no JS decode path yet — the browser plays it
+      // natively in <video>, and WebCodecs would need the profile-2 codec string plus a 16-bit
+      // output format the backends don't speak. Skip it (signals and SDR streams still decode)
+      // rather than push profile-2 packets at an 8-bit decoder.
+      if(r.hdr) continue;
       const block=slot[rgbSlotKey(r.id)];
       if(!block) continue;
       if(!rgbDec[r.id]) rgbDec[r.id]=be.createTrackDecoder({ kind:'rgba', W, H });
@@ -139,8 +144,11 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
  *   `{ id, kbps? }` entries, order fixing track numbers. Mutually exclusive with hasRgb. Frames
  *   then carry `rgbs: { id: plane }` (`rgb:` stays sugar for the first stream).
  */
-export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, rgbs=null, textTrack=null }){
+export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, rgbs=null, textTrack=null, hdr=null }){
   const specList=resolveSignalSpecs(signals);
+  if(hdr!==null)
+    throw new Error('createEncoder: HDR display tracks are not supported by the browser encoder '
+      + '— encode HDR with the native/Python encoder; browsers play the result in <video>');
   if(hasRgb!==null && typeof hasRgb!=='boolean')
     throw new Error('createEncoder: hasRgb must be true, false, or omitted');
   if(rgbs!==null && hasRgb!==null)
