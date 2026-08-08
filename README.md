@@ -2,19 +2,25 @@
 
 <p align="center"><img src="https://raw.githubusercontent.com/kmatzen/ChromaPakZ/main/docs/logo.png" alt="ChromaPakZ — lossless RGBD video encoder" width="680"></p>
 
-**A lossless RGBD video codec** (クロマパックZ): a single ordinary `.webm` that carries an 8-bit **RGB**
-track alongside **bit-exact 16-bit auxiliary signals** — depth, object IDs, packed normals, or any other
-`W×H` `uint16` plane — all kept in sync. Its design goals:
+**A lossless RGBD video codec** (クロマパックZ): a single ordinary `.webm` that carries one or more
+viewable **RGB** tracks alongside **bit-exact 16-bit auxiliary signals** — depth, object IDs, packed
+normals, or any other `W×H` `uint16` plane — all kept in sync. Its design goals:
 
 - a **legacy player shows plain RGB** — the depth rides in extra tracks an ordinary player ignores;
 - it uses only **royalty-free** codecs (VP9 / libvpx, BSD-licensed) — no GPL encoder, no patent pool;
 - it runs **in the browser through WebCodecs** — **no WASM on Chromium**, with a small libvpx-WASM
   fallback for engines whose native path isn't bit-exact;
 - each 16-bit signal is packed with a single **reversible map**, not a stack of per-range slices to manage;
-- **multiple lossless uint16 signals** (depth, object IDs, …) share one container, frame-aligned.
+- **multiple lossless uint16 signals** (depth, object IDs, …) share one container, frame-aligned;
+- **multiple synchronized RGB streams** for stereo / multi-camera rigs — one per camera, same clusters,
+  same timeline;
+- the display track can be **8-bit SDR or 10-bit HDR10/HLG** (VP9 profile 2, BT.2020, with the WebM
+  `Colour` element players actually read).
 
 The same format is implemented three times — **browser (WebCodecs)**, **C++ (libvpx)**, and **Python** —
-and a file written by any one of them decodes bit-exactly in the other two.
+and a file written by any one of them decodes bit-exactly in the other two. One exception, by design:
+HDR display tracks are written by the C++/Python encoders only, and a browser *plays* them in `<video>`
+rather than decoding them through the JS library (the lossless signals still decode everywhere).
 
 ## Quickstart
 
@@ -58,7 +64,7 @@ its encoder — `encode failed (2)` / "the RGB encoder could not be opened". Che
 | Layer | Choice |
 |---|---|
 | **Container** | WebM / Matroska, multi-track. The primary RGB stream is track 1, so any player shows it; depth tracks are ignored by players that don't know them. A Duration, a Cues index, and ~1 s RGB keyframes make it **seekable** in `<video>` (depth stays single-keyframe — it isn't what `<video>` plays). |
-| **RGB tracks** | 8-bit VP9, YUV 4:2:0, BT.709 full-range — normal, viewable video streams. One per camera for stereo / multi-camera rigs (`rgbs`); legacy readers see the primary. |
+| **RGB tracks** | Normal, viewable video streams: 8-bit VP9, YUV 4:2:0, BT.709 full-range — or, for HDR, VP9 profile 2, 10-bit, BT.2020 broadcast-range with a WebM `Colour` element. One per camera for stereo / multi-camera rigs (`rgbs`); legacy readers see the primary. |
 | **Lossless signals** | Each signal: optional quant (e.g. inverse-depth for float depth) → **uint16** → **triangle-fold 8+8** → two **VP9 lossless** tracks. Add object IDs, labels, etc. as additional signal pairs. |
 | **Metadata** | v3 — `rgbs[]` (every RGB stream) + `signals[]` (each signal: `id`, tracks, scheme, quant). |
 
@@ -149,8 +155,10 @@ point is **QP 0, bit-exact**. Regenerate with `python python/plot_rd.py`.
 ## Cross-language implementations
 
 All three read and write the identical `.webm`, verified bit-exact in every direction (browser ⇄ C++ ⇄
-Python), and produce standard files — `ffprobe` reports `matroska,webm` with one RGB stream plus two VP9
-streams per lossless signal, and ffmpeg decodes track 0 as plain RGB when present.
+Python), and produce standard files — `ffprobe` reports `matroska,webm` with one VP9 stream per RGB
+camera plus two per lossless signal, and ffmpeg decodes track 0 as plain RGB when present. The one
+asymmetry is HDR: a 10-bit display track is written natively (C++/Python) and played by the browser
+rather than decoded by the JS library, which skips it and still decodes every signal.
 
 Format schema: [`docs/FORMAT.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/FORMAT.md). API: [`docs/API.md`](https://github.com/kmatzen/ChromaPakZ/blob/main/docs/API.md).
 

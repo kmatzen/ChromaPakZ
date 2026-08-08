@@ -81,3 +81,26 @@ test('addText without a declared track throws', async () => {
                               signals: [{ id: 'depth', near: 0.3, far: 9.0 }] });
   await assert.rejects(() => enc.addText('nope', 0), /textTrack/);
 });
+
+// The buffered path builds its file from muxFrames via mux(), which emits SimpleBlocks and has
+// nowhere to put a cue's duration — so a cue written there used to be accepted and then dropped,
+// producing a file with the text track declared and not one block in it. Silent data loss is the
+// one outcome a recorder cannot detect, so this must fail loudly instead.
+test('addText on a buffered encoder throws rather than silently dropping the cue', async () => {
+  const enc = createEncoder({ W: 64, H: 48, fps: 30, hasRgb: true, textTrack: 'poses',
+                              signals: [{ id: 'depth', near: 0.3, far: 9.0 }] });
+  await assert.rejects(() => enc.addText('lost', 0), /streaming encoder/);
+});
+
+test('a streamed cue really reaches the bytes', async () => {
+  const chunks = [];
+  const enc = createEncoder({ W: 32, H: 16, fps: 30, hasRgb: true, textTrack: 'poses',
+                              backend: 'wasm', signals: [{ id: 'depth', near: 0.3, far: 9.0 }],
+                              onChunk: c => chunks.push(c) });
+  await enc.addFrame({ rgb: new Uint8Array(32 * 16 * 4).fill(9),
+                       signals: { depth: { u16: new Uint16Array(32 * 16).fill(1234) } } });
+  await enc.addText('CUE-PAYLOAD', 0, 1 / 30);
+  const bytes = await enc.finish();
+  assert.ok(new TextDecoder().decode(bytes).includes('CUE-PAYLOAD'),
+    'the cue payload must be present in the finished file');
+});
