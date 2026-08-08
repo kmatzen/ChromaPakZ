@@ -4,6 +4,26 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## Unreleased
+
+### Fixed
+
+- **`addText` on a buffered browser encoder silently dropped the cue.** Timed text is written
+  through the incremental muxer, but the buffered path builds its file from `muxFrames` via
+  `mux()`, which emits SimpleBlocks and has nowhere to put a cue's duration — so the finished
+  file declared the text track and carried none of its blocks. It now throws, pointing at the
+  streaming encoder. Present since the metadata track landed in 0.5.0.
+
+### Docs
+
+- Swept every doc for claims the 0.7.0/0.8.0 format changes invalidated: the README's one-RGB-track
+  and 8-bit-SDR framing, the cross-language "bit-exact in every direction" claim (HDR is
+  write-native / play-in-browser), `docs/RELEASING.md`'s libvpx flag list (missing
+  `--enable-vp9-highbitdepth`, and its now-three acceptance conditions), `decode_rgb`'s dtype for
+  HDR streams, the Python signatures missing `hdr=`/`text_track=`, `DC_ERR_GEOMETRY`'s 8-bit-only
+  wording, and the C entry-point list. Also documented the timed-text track, which had shipped in
+  0.5.0 with no user-facing docs at all.
+
 ## 0.8.0 — 2026-08-08
 
 ### Added — HDR10/HLG display track: VP9 profile 2 + WebM Colour signalling — #51
