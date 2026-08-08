@@ -70,7 +70,8 @@ tell "this stream is broken" from "this stream hasn't finished arriving".
 
 `createEncoder` freezes the track numbering on the first `addFrame`: RGB, when present, is track 1
 and signal pairs follow it. If frame 0 carries no `rgb`, signals start at track 1 instead — so a
-clip whose RGB only starts later must say so up front:
+clip whose RGB only starts later must say so up front. (With several RGB streams the rule
+generalizes — streams take tracks 1..N and signals start at N+1; see *Multiple RGB streams* below.)
 
 ```javascript
 createEncoder({ W, H, signals, hasRgb: true });   // reserve track 1 for rgb before frame 0
@@ -114,6 +115,25 @@ omits them; there is no 10-bit WebCodecs output path yet), and their metadata �
 `vp09.02.…` codec string and the `hdr` object — is available on `metadata.rgbs[i]`. The muxer
 and demuxer in `src/webm.js` fully support the WebM `Colour` element (`track.colour`),
 byte-compatible with the C muxer.
+
+### Timed-text metadata track
+
+A file can carry one WebVTT track for machine-readable per-frame notes — poses, GPS fixes, event
+markers — beside the video. Declare it at construction (the header is written before frame 0, so
+it cannot be added later) and write cues with timestamps in seconds. In the browser this is a
+**streaming-encoder** feature: cues go through the incremental muxer, so `onChunk` is required
+and `addText` throws without it.
+
+```javascript
+const enc = createEncoder({ W, H, signals, hasRgb: true, textTrack: 'poses', onChunk: sink });
+await enc.addText(JSON.stringify({ t, pose }), timestampSeconds, durationSeconds);
+```
+
+Python mirrors it: `create_encoder(..., text_track="poses")` then `enc.add_text(text, timestamp,
+duration=None)`; the C ABI is `dc_stream_create_ex` + `dc_stream_add_text`. The track is appended
+after all video/signal tracks, so it never shifts their numbers, and ordinary players treat it as
+subtitles they may ignore. Cues ride inside whichever cluster the surrounding frames are filling,
+so `addText` usually returns no bytes of its own.
 
 ### Plane sizes
 
@@ -173,11 +193,11 @@ depth = cz.decode_signal(data, "depth")
 
 | Function | Purpose |
 |---|---|
-| `encode(signals, specs=, rgb=, rgbs=, fps=30, rgb_kbps=2000)` | Multi-signal encode → WebM bytes |
-| `create_encoder(width, height, signals=, fps=, has_rgb=, rgbs=, on_chunk=, cues=)` | Streaming encoder for live recording |
+| `encode(signals, specs=, rgb=, rgbs=, fps=30, rgb_kbps=2000, hdr=)` | Multi-signal encode → WebM bytes |
+| `create_encoder(width, height, signals=, fps=, has_rgb=, rgbs=, hdr=, on_chunk=, cues=, text_track=)` | Streaming encoder for live recording |
 | `decode(data, signal_ids=)` | Decode signals + RGB (`rgb` = primary; `rgbs` = every stream) |
 | `decode_signal(data, id)` | One `(N,H,W)` uint16 plane |
-| `decode_rgb(data, stream=)` | One RGB stream (default: primary) → `(N,H,W,4)` uint8 RGBA |
+| `decode_rgb(data, stream=)` | One RGB stream (default: primary) → `(N,H,W,4)` RGBA — uint8 for SDR, uint16 10-bit codes for HDR |
 | `probe(data)` | `width`, `height`, `frames`, `fps`, `near`, `far`, `levels`, `has_rgb`, `rgbs`, `signals` |
 | `parse_metadata(data)` | Full metadata JSON |
 | `inverse_depth_spec(near, far, levels=65536)` | Spec dict for a depth signal (`3 <= levels <= 65536`) |
@@ -285,7 +305,7 @@ quantize float depth with `quantize_inverse()` first.
 | Function | Purpose |
 |---|---|
 | `dc_encode_multi` / `dc_encode_multi2` / `dc_encode_multi_hdr` | RGB (one / N streams / N HDR streams) + N signals |
-| `dc_stream_create` / `_create2` / `_create_hdr` / `_header` / `_add_frame` / `_add_frame2` / `_add_frame16` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording |
+| `dc_stream_create` / `_create_ex` / `_create2` / `_create_hdr` / `_header` / `_add_frame` / `_add_frame2` / `_add_frame16` / `_add_text` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording (`_ex` adds the timed-text track; `_add_text` writes its cues) |
 | `dc_decode_signal` | Decode by id |
 | `dc_get_metadata` | CHROMAPAKZ JSON |
 | `dc_probe` / `dc_decode_rgb` / `dc_decode_rgb_id` / `dc_decode_rgb16` | Header + RGB (primary / by stream id / 10-bit HDR) |
@@ -332,7 +352,7 @@ int dc_decode_rgb(const uint8_t* webm, size_t len,
 | Code | Meaning |
 |---|---|
 | `9` (`DC_ERR_CAPACITY`) | the track decodes to more frames than the capacity holds — the header under-declared `frames`, or a block carried a VP9 superframe |
-| `10` (`DC_ERR_GEOMETRY`) | a decoded frame is not the 8-bit I420 `W×H` the metadata declares |
+| `10` (`DC_ERR_GEOMETRY`) | a decoded frame is not the `W×H` I420 the metadata declares — 8-bit for the SDR entry points, 10-bit for `dc_decode_rgb16` |
 
 Neither ever writes past `*_cap`. Frames the file does not actually contain are left untouched,
 so zero the buffer first if you read all of it back — the Python bindings do.

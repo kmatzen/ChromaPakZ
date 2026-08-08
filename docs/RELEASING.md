@@ -157,14 +157,18 @@ libvpx too (`install-libvpx.sh` configures for `uname -m`), and cibuildwheel can
   globally then owns ours. `decord` does exactly this — it dlopens with `RTLD_GLOBAL` — so
   `import decord` before `import chromapakz` used to bind our encoder to decord's (older, ABI-incompatible)
   libvpx. `tests/test_symbol_isolation.py` runs in `test-command` and fails the wheel if this ever regresses.
-- **Linux** builds libvpx from source (pinned 1.14.1, `--enable-static --enable-pic`) via
-  `scripts/install-libvpx.sh`, because EPEL's libvpx predates the VP9 encoder controls we use; a system
-  libvpx is accepted only if it is ≥ 1.10 *and* ships a `libvpx.a`. Bump `VER` there to move libvpx. The
-  script installs `nasm`/`yasm` (one is required to build libvpx).
-- **macOS** builds libvpx from source as well (static, PIC) and pins `MACOSX_DEPLOYMENT_TARGET` to 13.0.
-  It used to use the Homebrew bottle, whose objects carry the runner's own macOS as their minimum
-  version and so forced every wheel to 15.0 — leaving macOS 13/14 users on a source build. Both macOS arches are
-  built, each on its own runner (`macos-latest` for arm64, `macos-13` for x86_64).
+- **Linux** builds libvpx from source (pinned 1.14.1, `--enable-static --enable-pic
+  --enable-vp9-highbitdepth`) via `scripts/install-libvpx.sh`, because EPEL's libvpx predates the VP9
+  encoder controls we use; a system libvpx is accepted only if it is ≥ 1.10, ships a `libvpx.a`, *and*
+  was built with high bit depth. That last condition is a compile-time option no version implies, so
+  the script probes the archive for a `highbd` symbol — without it the HDR display track (VP9 profile
+  2) cannot open its encoder, which is how the first 0.8.0 release run failed. Bump `VER` there to move
+  libvpx. The script installs `nasm`/`yasm` (one is required to build libvpx).
+- **macOS** builds libvpx from source as well (static, PIC, high bit depth) and pins
+  `MACOSX_DEPLOYMENT_TARGET` to 13.0. It used to use the Homebrew bottle, whose objects carry the
+  runner's own macOS as their minimum version and so forced every wheel to 15.0 — leaving macOS 13/14
+  users on a source build. Only arm64 is built (`macos-latest`); see the Intel note above for why
+  x86_64 is not.
 - **Linux aarch64** uses the native `ubuntu-24.04-arm` runner rather than QEMU — emulating a from-source
   libvpx build costs hours. If that runner label changes, update the `wheels` matrix in `release.yml`.
 - Windows wheels are not configured (libvpx on MSVC is fiddly); add a `[tool.cibuildwheel.windows]`
