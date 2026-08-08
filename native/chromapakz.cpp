@@ -887,7 +887,13 @@ struct TrackEncoder {
       // Capture is frame-budget bound, so the time matters more than the bytes.
       vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 6);
     }else{
-      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 2);
+      // Lossy, so unlike the lossless path this trades picture quality, not just
+      // size: on a real take at a fixed 2000 kbps, cpu-used=2 gives 42.75 dB PSNR
+      // and =4 gives 40.75 dB, for ~7 ms/frame. Capture is frame-budget bound and
+      // the RGB track is the colour reference beside bit-exact depth, so the
+      // milliseconds win. Past 4 is pointless — cpu-used=6 measured both slower
+      // and worse (40.44 dB).
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 4);
       vpx_codec_control(&ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
     }
     vpx_codec_control(&ctx, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
