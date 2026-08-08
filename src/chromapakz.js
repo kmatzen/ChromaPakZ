@@ -298,10 +298,18 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
 
     addFrame(frame){ return serialize(()=>addFrameImpl(frame)); },
 
-    /** Append one timed-text cue to the metadata track. `timestamp`/`duration` in seconds. */
+    /**
+     * Append one timed-text cue to the metadata track. `timestamp`/`duration` in seconds.
+     * Streaming encoders only: cues are written through the incremental muxer, and the buffered
+     * path builds its file from `muxFrames` via mux(), which emits SimpleBlocks and has nowhere
+     * to put a cue's duration. Without this guard the cue was accepted and then silently dropped
+     * — the file came back with the text track declared and not one block in it.
+     */
     addText(text, timestamp, duration=null){
       return serialize(async ()=>{
         if(!textTrack) throw new Error('addText: createEncoder was not given a textTrack');
+        if(!onChunk) throw new Error('addText: timed text needs the streaming encoder — pass '
+          + 'createEncoder({ onChunk }); the buffered path cannot carry cues');
         ensureStreamMux();
         const durMs=Math.max(0, Math.round((duration ?? 1/fps)*1000));
         const chunk=streamMux.writeText(textTrackNumber, Math.round(timestamp*1000), durMs, String(text));

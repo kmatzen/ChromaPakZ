@@ -71,6 +71,10 @@ dataset: ~91% AV1 10-bit *decode* vs ~8% *encode* coverage — cited). The relia
 | Split | bpp (synthetic) | Note |
 |---|---|---|
 | **8 + 8** (two 8-bit planes) | **4.50** | **CHOSEN** — widest browser reach, no profile-2 dependency |
+<!-- Signal packing only, and still current: the signal planes remain 8+8. The "no profile-2
+     dependency" rationale is narrower since 0.8.0, which added an *optional* profile-2 10-bit HDR
+     display track — that is the viewable RGB half, not the lossless signals measured here. -->
+
 | 10 + 6 (VP9 profile-2 10-bit + 8-bit) | 4.70 (+4%) | 10-bit plane costs more than it saves |
 | native 16-bit | n/a | no royalty-free browser-encodable 16-bit codec exists |
 | range-slices (original design) | — | the bookkeeping R6 explicitly wants gone |
