@@ -15,7 +15,17 @@
 # VP9 encoder controls we use (VP9E_SET_COLOR_RANGE etc., added in libvpx 1.6). EPEL on older
 # manylinux images ships a libvpx that satisfies `pkg-config --exists vpx` but predates those
 # symbols, which is why we version-gate and otherwise build from source.
+#
+# Since 0.8.0 the core also needs --enable-vp9-highbitdepth (the HDR display track is VP9
+# profile 2, 10-bit). That is a compile-time option no version gate can see, so a system libvpx
+# is additionally probed for a high-bit-depth symbol — a library without it would build a wheel
+# whose dc_*_hdr entry points fail at runtime with "the RGB encoder could not be opened", which
+# is exactly how the 0.8.0 wheels failed the first time.
 set -euo pipefail
+
+# True when the static archive was compiled with CONFIG_VP9_HIGHBITDEPTH (highbd_* objects exist
+# only under that flag).
+has_highbitdepth(){ nm -g "$1" 2>/dev/null | grep -q highbd; }
 
 MIN_MAJOR=1 MIN_MINOR=10   # require >= 1.10 to be safe
 VER=1.14.1
@@ -32,6 +42,7 @@ if [ "$OS" = "Darwin" ]; then
   rm -rf /tmp/vpx && mkdir -p /tmp/vpx && tar xzf /tmp/vpx.tgz -C /tmp/vpx --strip-components=1
   cd /tmp/vpx
   ./configure --prefix="$PREFIX" --enable-pic --enable-static --disable-shared \
+    --enable-vp9-highbitdepth \
     --disable-examples --disable-tools --disable-docs --disable-unit-tests
   make -j"$(sysctl -n hw.ncpu)"
   sudo make install
@@ -52,10 +63,13 @@ if pkg-config --exists vpx; then
   V=$(pkg-config --modversion vpx); MAJ=${V%%.*}; REST=${V#*.}; MIN=${REST%%.*}
   LIBDIR=$(pkg-config --variable=libdir vpx)
   if [ "${MAJ:-0}" -gt "$MIN_MAJOR" ] || { [ "${MAJ:-0}" -eq "$MIN_MAJOR" ] && [ "${MIN:-0}" -ge "$MIN_MINOR" ]; }; then
-    if [ -f "${LIBDIR}/libvpx.a" ]; then
-      echo "libvpx from system package: $V (>= ${MIN_MAJOR}.${MIN_MINOR}, static archive present, ok)"; exit 0
+    if [ -f "${LIBDIR}/libvpx.a" ] && has_highbitdepth "${LIBDIR}/libvpx.a"; then
+      echo "libvpx from system package: $V (>= ${MIN_MAJOR}.${MIN_MINOR}, static, high-bit-depth, ok)"; exit 0
+    elif [ -f "${LIBDIR}/libvpx.a" ]; then
+      echo "system libvpx $V was built without --enable-vp9-highbitdepth — building from source"
+    else
+      echo "system libvpx $V has no ${LIBDIR}/libvpx.a — building a static one from source"
     fi
-    echo "system libvpx $V has no ${LIBDIR}/libvpx.a — building a static one from source"
   else
     echo "system libvpx $V is too old (< ${MIN_MAJOR}.${MIN_MINOR}) — building from source"
   fi
@@ -78,6 +92,7 @@ cd /tmp/vpx
 # Static + PIC: static so _core.so has no vpx_* to resolve dynamically, PIC because those objects
 # get linked into a shared library.
 ./configure --enable-pic --enable-static --disable-shared \
+  --enable-vp9-highbitdepth \
   --disable-examples --disable-tools --disable-docs --disable-unit-tests
 make -j"$(nproc)"
 make install
