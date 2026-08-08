@@ -50,10 +50,10 @@ cmake -S . -B build && cmake --build build -j     # or: native/build.sh
 
 | Layer | Choice |
 |---|---|
-| **Container** | WebM / Matroska, multi-track. RGB is track 1, so any player shows it; depth tracks are ignored by players that don't know them. A Duration, a Cues index, and ~1 s RGB keyframes make it **seekable** in `<video>` (depth stays single-keyframe — it isn't what `<video>` plays). |
-| **RGB track** | 8-bit VP9, YUV 4:2:0, BT.709 full-range — a normal, viewable video stream. |
+| **Container** | WebM / Matroska, multi-track. The primary RGB stream is track 1, so any player shows it; depth tracks are ignored by players that don't know them. A Duration, a Cues index, and ~1 s RGB keyframes make it **seekable** in `<video>` (depth stays single-keyframe — it isn't what `<video>` plays). |
+| **RGB tracks** | 8-bit VP9, YUV 4:2:0, BT.709 full-range — normal, viewable video streams. One per camera for stereo / multi-camera rigs (`rgbs`); legacy readers see the primary. |
 | **Lossless signals** | Each signal: optional quant (e.g. inverse-depth for float depth) → **uint16** → **triangle-fold 8+8** → two **VP9 lossless** tracks. Add object IDs, labels, etc. as additional signal pairs. |
-| **Metadata** | v2 `signals[]` only — each signal (`id`, tracks, scheme, quant). |
+| **Metadata** | v3 — `rgbs[]` (every RGB stream) + `signals[]` (each signal: `id`, tracks, scheme, quant). |
 
 **Inverse-depth quantization** spends precision where it matters (near surfaces), matching how stereo/ToF
 sensors behave. Float can't be stored losslessly in 16 bits, so this quantization *is* the format's defined

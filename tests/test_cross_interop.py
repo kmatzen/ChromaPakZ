@@ -18,7 +18,7 @@ class CrossInterop(unittest.TestCase):
 
     def test_metadata_is_v2_signals_only(self):
         meta = cz.parse_metadata(self.data)
-        self.assertEqual(meta["version"], 2)
+        self.assertEqual(meta["version"], 3)
         self.assertEqual({s["id"] for s in meta["signals"]}, {"depth", "objectId"})
         self.assertNotIn("depth", meta, "v1 top-level depth key must be gone")
 

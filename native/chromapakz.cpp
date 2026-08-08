@@ -553,10 +553,14 @@ bool jNumberValue(const std::string& j, size_t& p, int depth, double& out, bool&
 }
 
 struct SignalQuantMeta { bool inverse_depth=false; double near_=0, far_=0; int levels=65536; };
-struct SignalMeta { std::string id; int track_hi=0, track_lo=0; SignalQuantMeta quant; };
+struct SignalMeta { std::string id; int track_hi=0, track_lo=0; SignalQuantMeta quant; std::string view; };
+struct RgbMeta { std::string id; int track=1; };
 struct FileMeta {
   int version=1, width=0, height=0, fps=30, frames=0;
   bool has_rgb=false; int rgb_track=1;
+  // Every RGB stream, primary first. Parsed from v3 `rgbs[]`; for a pre-v3 file the legacy
+  // `rgb` key is folded into a single entry under the default id, so readers see one shape.
+  std::vector<RgbMeta> rgbs;
   std::vector<SignalMeta> signals;
 };
 
@@ -640,9 +644,33 @@ void parseSignalsV2(const std::string& j, size_t at, FileMeta& m){
   });
 }
 
+/** `rgbs[]` (v3), starting at the array's `[`. An entry without a usable id+track is dropped. */
+void parseRgbsV3(const std::string& j, size_t at, FileMeta& m){
+  size_t p=at;
+  jEachElement(j,p,1,[&](size_t& ep)->bool{
+    RgbMeta r; r.track=0; bool haveId=false, ok=true;
+    bool wf=jEachMember(j,ep,2,[&](const std::string& k, size_t& vp)->bool{
+      if(k=="id"){
+        jWs(j,vp);
+        if(vp<j.size() && j[vp]=='"'){
+          if(!jString(j,vp,r.id)) return false;
+          haveId=true; return true;
+        }
+        return jSkipValue(j,vp,3);
+      }
+      double v=0;
+      if(k=="track"){ if(jNumberValue(j,vp,3,v,ok)) r.track=clampToInt(v); return ok; }
+      return jSkipValue(j,vp,3);
+    });
+    if(!wf || !ok) return false;
+    if(haveId && r.track>0) m.rgbs.push_back(r);
+    return true;
+  });
+}
+
 FileMeta parseMetadata(const std::string& j){
   FileMeta m;
-  size_t p=0, signalsAt=std::string::npos;
+  size_t p=0, signalsAt=std::string::npos, rgbsAt=std::string::npos;
   bool ok=true;
   // `signals` is parsed after the walk rather than during it, because whether to parse it at all
   // depends on `version`, which JSON does not promise to have seen first.
@@ -665,11 +693,17 @@ FileMeta parseMetadata(const std::string& j){
       return jSkipValue(j,vp,1);
     }
     if(k=="signals"){ signalsAt=vp; return jSkipValue(j,vp,1); }
+    if(k=="rgbs"){ rgbsAt=vp; return jSkipValue(j,vp,1); }
     return jSkipValue(j,vp,1);
   });
   if(m.fps<=0) m.fps=30;
   if(m.frames<0) m.frames=0;
   if(m.version>=2 && signalsAt!=std::string::npos) parseSignalsV2(j,signalsAt,m);
+  if(rgbsAt!=std::string::npos) parseRgbsV3(j,rgbsAt,m);
+  // One shape for every reader below: rgbs[] is authoritative when the file carries it,
+  // otherwise the legacy `rgb` key becomes the sole stream under the default id.
+  if(!m.rgbs.empty()){ m.has_rgb=true; m.rgb_track=m.rgbs[0].track; }
+  else if(m.has_rgb) m.rgbs.push_back({"rgb", m.rgb_track});
   return m;
 }
 
@@ -695,8 +729,11 @@ std::string quantJson(const SignalQuantMeta& q){
 // `streaming` writes "frames":null,"streaming":true in place of a count, matching what the JS
 // stream muxer emits: when the header goes out the take has not happened yet, and a reader
 // recovers the count by counting blocks (see the note in dc_probe).
-std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::vector<SignalMeta>& signals,
-                              bool streaming=false){
+//
+// v3: the legacy `rgb` key stays, always describing the primary stream (== rgbs[0]) so pre-v3
+// readers decode it unchanged; `rgbs[]` names every stream and is what v3 readers use.
+std::string buildMetadataJson(int W,int H,int N,int fps,const std::vector<RgbMeta>& rgbs,
+                              const std::vector<SignalMeta>& signals, bool streaming=false){
   // Built with std::string throughout — the document grows with signal count and id length,
   // so a fixed stack buffer would silently truncate (and emit invalid JSON) past some size.
   std::string sigs="[";
@@ -707,17 +744,32 @@ std::string buildMetadataJson(int W,int H,int N,int fps,bool hasRgb,const std::v
     sigs += "{\"id\":\""; sigs += jsonEscape(s.id); sigs += "\",\"tracks\":{"; sigs += nums;
     sigs += "},\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
             "\"dtype\":\"uint16\",\"invalidCode\":0,\"quant\":";
-    sigs += quantJson(s.quant); sigs += "}";
+    sigs += quantJson(s.quant);
+    if(!s.view.empty()){ sigs += ",\"view\":\""; sigs += jsonEscape(s.view); sigs += "\""; }
+    sigs += "}";
   }
   sigs+="]";
-  std::string rgb = hasRgb ? "{\"track\":1,\"codec\":\"vp09.00.10.08\"}" : "null";
+  std::string rgb="null", rgbsJson;
+  if(!rgbs.empty()){
+    char pb[64]; snprintf(pb,sizeof pb,"{\"track\":%d,\"codec\":\"vp09.00.10.08\"}", rgbs[0].track);
+    rgb=pb;
+    rgbsJson="[";
+    for(size_t i=0;i<rgbs.size();i++){
+      if(i) rgbsJson+=",";
+      char tb[48]; snprintf(tb,sizeof tb,"\",\"track\":%d,\"codec\":\"vp09.00.10.08\"}", rgbs[i].track);
+      rgbsJson += "{\"id\":\""; rgbsJson += jsonEscape(rgbs[i].id); rgbsJson += tb;
+    }
+    rgbsJson+="]";
+  }
   char head[192];
   if(streaming)
     snprintf(head,sizeof head,
-             "{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":null,\"streaming\":true,\"rgb\":",W,H,fps);
+             "{\"version\":3,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":null,\"streaming\":true,\"rgb\":",W,H,fps);
   else
-    snprintf(head,sizeof head,"{\"version\":2,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":",W,H,fps,N);
-  std::string out=head; out+=rgb; out+=",\"signals\":"; out+=sigs; out+="}";
+    snprintf(head,sizeof head,"{\"version\":3,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":",W,H,fps,N);
+  std::string out=head; out+=rgb;
+  if(!rgbs.empty()){ out+=",\"rgbs\":"; out+=rgbsJson; }
+  out+=",\"signals\":"; out+=sigs; out+="}";
   return out;
 }
 
@@ -725,13 +777,26 @@ struct SignalEncodeSpec {
   std::string id;
   const uint16_t* data=nullptr;
   SignalQuantMeta quant;
+  std::string view;   // optional, recorded verbatim in the metadata
 };
+
+struct RgbEncodeSpec { std::string id; int kbps=0; };
+
+// RGB streams take tracks 1..N in declaration order; the primary keeps the container name "rgb"
+// (the name pre-v3 readers and the cue-track choice scan for), secondaries are "rgb-{id}".
+std::vector<RgbMeta> planRgbTracks(const std::vector<RgbEncodeSpec>& specs){
+  std::vector<RgbMeta> out;
+  for(size_t i=0;i<specs.size();i++) out.push_back({specs[i].id, (int)i+1});
+  return out;
+}
 
 // Container track descriptors for a plan. Shared by the batch and streaming builders, so both
 // name and number their tracks identically.
-std::vector<Track> tracksForPlan(const std::vector<SignalMeta>& sigMeta, bool hasRgb, int W, int H){
+std::vector<Track> tracksForPlan(const std::vector<SignalMeta>& sigMeta,
+                                 const std::vector<RgbMeta>& rgbs, int W, int H){
   std::vector<Track> tracks;
-  if(hasRgb) tracks.push_back({1,"V_VP9","rgb",W,H});
+  for(size_t i=0;i<rgbs.size();i++)
+    tracks.push_back({rgbs[i].track,"V_VP9", i==0?std::string("rgb"):"rgb-"+rgbs[i].id, W,H});
   for(auto& sm : sigMeta){
     tracks.push_back({sm.track_hi,"V_VP9","signal-"+sm.id+"-hi",W,H});
     tracks.push_back({sm.track_lo,"V_VP9","signal-"+sm.id+"-lo",W,H});
@@ -739,14 +804,31 @@ std::vector<Track> tracksForPlan(const std::vector<SignalMeta>& sigMeta, bool ha
   return tracks;
 }
 
-std::vector<SignalMeta> planSignalTracks(const std::vector<SignalEncodeSpec>& specs, bool hasRgb){
+std::vector<SignalMeta> planSignalTracks(const std::vector<SignalEncodeSpec>& specs, size_t numRgb){
   std::vector<SignalMeta> out;
-  int next=hasRgb?2:1;
+  int next=(int)numRgb+1;
   for(auto& sp : specs){
-    SignalMeta s; s.id=sp.id; s.track_hi=next++; s.track_lo=next++; s.quant=sp.quant;
+    SignalMeta s; s.id=sp.id; s.track_hi=next++; s.track_lo=next++; s.quant=sp.quant; s.view=sp.view;
     out.push_back(s);
   }
   return out;
+}
+
+// Shared validation for the dc_rgb_spec_t list: ids must be unique and non-empty; NULL is
+// allowed only for a single stream, where it means the default id "rgb".
+bool normalizeRgbSpecs(const dc_rgb_spec_t* rgbs, int num_rgbs, std::vector<RgbEncodeSpec>& out){
+  if(num_rgbs<0) return false;
+  if(num_rgbs>0 && !rgbs) return false;
+  for(int i=0;i<num_rgbs;i++){
+    RgbEncodeSpec r;
+    if(rgbs[i].id && *rgbs[i].id) r.id=rgbs[i].id;
+    else if(!rgbs[i].id && num_rgbs==1) r.id="rgb";
+    else return false;
+    r.kbps=rgbs[i].kbps;
+    for(auto& prev : out) if(prev.id==r.id) return false;
+    out.push_back(r);
+  }
+  return true;
 }
 
 // ── triangle-fold 8+8 ──
@@ -977,22 +1059,26 @@ int decodeRGBTrack(std::vector<Frame>& frs, int W, int H, size_t maxFrames, std:
   vpx_codec_destroy(&c); return st;
 }
 
-// Build a full file from optional RGB and lossless signals.
-int buildFileMulti(const uint8_t* rgba, int kbps,
+// Build a full file from any number of RGB streams and lossless signals.
+int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>& rgbSpecs,
                    const std::vector<SignalEncodeSpec>& specs,
                    int W, int H, int N, int fps, Bytes& file){
-  if(specs.empty() && !rgba) return 1;
+  if(specs.empty() && rgbSpecs.empty()) return 1;
+  if(!rgbSpecs.empty() && !rgbas) return 1;
   if(!dimsUsable(W,H) || N<=0 || fps<=0) return 1;
   // Guard the per-frame strides used below ((size_t)i*W*H*4) against wrapping.
   if((size_t)N > SIZE_MAX/((size_t)W*(size_t)H*4)) return 1;
   std::vector<Frame> frames;
-  bool hasRgb=rgba!=nullptr;
-  auto sigMeta=planSignalTracks(specs, hasRgb);
-  std::vector<Bytes> rgbF; std::vector<bool> rgbK;
-  if(rgba){
-    std::vector<const uint8_t*> p(N); for(int i=0;i<N;i++) p[i]=rgba+(size_t)i*W*H*4;
-    if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbF,rgbK)) return 2;
-    if((int)rgbF.size()!=N) return 6;
+  auto rgbMeta=planRgbTracks(rgbSpecs);
+  auto sigMeta=planSignalTracks(specs, rgbSpecs.size());
+  struct RgbEnc { std::vector<Bytes> F; std::vector<bool> K; };
+  std::vector<RgbEnc> rgbEnc(rgbSpecs.size());
+  for(size_t ri=0; ri<rgbSpecs.size(); ri++){
+    if(!rgbas[ri]) return 1;
+    std::vector<const uint8_t*> p(N); for(int i=0;i<N;i++) p[i]=rgbas[ri]+(size_t)i*W*H*4;
+    int kbps=rgbSpecs[ri].kbps;
+    if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbEnc[ri].F,rgbEnc[ri].K)) return 2;
+    if((int)rgbEnc[ri].F.size()!=N) return 6;
   }
   size_t px=(size_t)W*(size_t)H;
   struct SigEnc { std::vector<Bytes> hiF, loF, hiP, loP; std::vector<bool> hiK, loK; };
@@ -1012,7 +1098,8 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
     if((int)se.hiF.size()!=N || (int)se.loF.size()!=N) return 7;
   }
   for(int i=0;i<N;i++){ int t=(int)(1000.0*i/fps);
-    if(rgba) frames.push_back({1,(bool)rgbK[i],t,rgbF[i].data(),rgbF[i].size()});
+    for(size_t ri=0; ri<rgbSpecs.size(); ri++)
+      frames.push_back({rgbMeta[ri].track,(bool)rgbEnc[ri].K[i],t,rgbEnc[ri].F[i].data(),rgbEnc[ri].F[i].size()});
     for(size_t si=0; si<specs.size(); si++){
       auto& se=enc[si]; auto& sm=sigMeta[si];
       frames.push_back({sm.track_hi,(bool)se.hiK[i],t,se.hiF[i].data(),se.hiF[i].size()});
@@ -1020,8 +1107,8 @@ int buildFileMulti(const uint8_t* rgba, int kbps,
     }
   }
   int durationMs = (int)llround(N * 1000.0 / (fps>0?fps:30));
-  file = mux(tracksForPlan(sigMeta, hasRgb, W, H), frames,
-             buildMetadataJson(W,H,N,fps,hasRgb,sigMeta), durationMs);
+  file = mux(tracksForPlan(sigMeta, rgbMeta, W, H), frames,
+             buildMetadataJson(W,H,N,fps,rgbMeta,sigMeta), durationMs);
   return 0;
 }
 // Every dc_* entry point allocates (std::vector/std::string sized from file or caller-supplied
@@ -1038,8 +1125,8 @@ int guard(F&& body) noexcept {
 
 // ── streaming encoder state (the opaque handle behind dc_stream_*) ──
 // One VP9 encoder per track, held open for the length of the recording, feeding an incremental
-// muxer. Slots are ordered RGB (when present) then hi/lo per signal — ascending track number, so
-// a frame's blocks reach the mux in the order the cluster rule expects.
+// muxer. Slots are ordered RGB streams (declaration order) then hi/lo per signal — ascending
+// track number, so a frame's blocks reach the mux in the order the cluster rule expects.
 //
 // Each slot timestamps from its own output counter rather than a shared frame index. With
 // g_lag_in_frames=0 every push yields exactly one packet, so the counters stay in lockstep and a
@@ -1052,7 +1139,8 @@ struct dc_stream_encoder {
     int emitted=0;              // packets already muxed from this track
   };
   int W=0, H=0, fps=30;
-  bool hasRgb=false, finished=false;
+  bool finished=false;
+  std::vector<RgbMeta> rgbMeta;   // every RGB stream, primary first (empty = no RGB)
   std::vector<SignalMeta> sigMeta;
   std::vector<Slot> slots;
   int textTrack=0;              // 0 when no metadata track was declared
@@ -1061,11 +1149,11 @@ struct dc_stream_encoder {
   std::vector<Packed> packed;   // per-signal packing scratch, reused across the take
 
   /**
-   * Drive every track through one round — a frame when `rgba`/`planes` are given, a flush when
+   * Drive every track through one round — a frame when `rgbas`/`planes` are given, a flush when
    * both are NULL — and mux whatever packets come back, appending any finished Cluster bytes to
    * `chunk`. Returns 0, or the error code named by whichever track failed.
    */
-  int round(const uint8_t* rgba, const uint16_t* const* planes, Bytes& chunk){
+  int round(const uint8_t* const* rgbas, const uint16_t* const* planes, Bytes& chunk){
     // Each track is an independent VP9 encoder, so the slots can run concurrently;
     // only the muxing has to stay ordered. Packing moves ahead of the encode and
     // into per-signal buffers — the old single hi/lo scratch pair was reused across
@@ -1083,7 +1171,7 @@ struct dc_stream_encoder {
     std::vector<const uint8_t*> src(slots.size(), nullptr);
     std::vector<int> errOf(slots.size(), 0);
     size_t idx=0;
-    if(hasRgb){ src[idx]=rgba; errOf[idx]=2; idx++; }
+    for(size_t i=0;i<rgbMeta.size();i++){ src[idx]=rgbas?rgbas[i]:nullptr; errOf[idx]=2; idx++; }
     for(size_t i=0;i<sigMeta.size();i++){
       src[idx]=planes?packed[i].hi.data():nullptr; errOf[idx]=3; idx++;
       src[idx]=planes?packed[i].lo.data():nullptr; errOf[idx]=3; idx++;
@@ -1163,16 +1251,28 @@ static int decStatusToRc(int st, int codecErr){
   }
 }
 
-int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgba_cap){
+int dc_decode_rgb_id(const uint8_t* webm, size_t len, const char* rgb_id,
+                     uint8_t* rgba_out, size_t rgba_cap){
   if(!webm || !len || !rgba_out) return 1;
   return guard([&]{
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
   FileMeta meta=parseMetadata(d.metadata);   // reads the keys once, with defaults when absent
-  if(!meta.has_rgb) return 6;                // structural, not a `"rgb":null` substring search
+  if(!meta.has_rgb) return rgb_id ? 8 : 6;   // structural, not a `"rgb":null` substring search
   int W=meta.width, H=meta.height;
   if(!dimsUsable(W,H)) return 2;
   size_t frameBytes=(size_t)W*H*4;
-  int rgbTrack=1; for(auto& t:d.tracks) if(t.name=="rgb") rgbTrack=t.number;
+  int rgbTrack;
+  if(!rgb_id){
+    // Primary stream. The container name is what pre-multi-RGB files were always resolved by,
+    // so it stays authoritative when present; the metadata's rgbs[0] covers files without it.
+    rgbTrack=meta.rgbs[0].track;
+    for(auto& t:d.tracks) if(t.name=="rgb") rgbTrack=t.number;
+  }else{
+    const RgbMeta* found=nullptr;
+    for(auto& r:meta.rgbs) if(r.id==rgb_id){ found=&r; break; }
+    if(!found) return 8;
+    rgbTrack=found->track;
+  }
   std::vector<Frame> frs; for(auto& f:d.frames) if(f.track==rgbTrack) frs.push_back(f);
   std::vector<Bytes> planes;
   int st=decodeRGBTrack(frs,W,H,rgba_cap/frameBytes,planes);
@@ -1180,6 +1280,10 @@ int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgb
   for(size_t i=0;i<planes.size();i++) memcpy(rgba_out+i*frameBytes, planes[i].data(), frameBytes);
   return 0;
   });
+}
+
+int dc_decode_rgb(const uint8_t* webm, size_t len, uint8_t* rgba_out, size_t rgba_cap){
+  return dc_decode_rgb_id(webm, len, NULL, rgba_out, rgba_cap);
 }
 
 int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
@@ -1203,7 +1307,7 @@ int dc_probe(const uint8_t* webm, size_t len, int* W, int* H, int* N, int* fps,
   }
   if(N) *N=n;
   if(fps) *fps=meta.fps;
-  if(has_rgb) *has_rgb = meta.has_rgb ? 1 : 0;
+  if(has_rgb) *has_rgb = (int)meta.rgbs.size();   // stream count; 0/1 for pre-v3 files
   const SignalMeta* depth = findSignal(meta, "depth");
   if(depth && depth->quant.inverse_depth){
     if(near_) *near_=depth->quant.near_;
@@ -1256,32 +1360,73 @@ int dc_get_metadata(const uint8_t* webm, size_t len, char** json_out, size_t* js
   });
 }
 
-int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
-                    const dc_signal_spec_t* signals, int num_signals,
-                    int W, int H, int N, int fps,
-                    uint8_t** out, size_t* out_len){
+// Shared spec conversion: the v1 struct is the v2 struct without `view`.
+static void signalSpecFrom(const dc_signal_spec_t& in, SignalEncodeSpec& s){
+  s.id=in.id; s.data=in.data;
+  if(in.inverse_depth){
+    s.quant.inverse_depth=true;
+    s.quant.near_=in.near_; s.quant.far_=in.far_;
+    s.quant.levels = in.levels<=0 ? 65536 : in.levels;
+  }
+}
+static void signalSpecFrom2(const dc_signal_spec2_t& in, SignalEncodeSpec& s){
+  s.id=in.id; s.data=in.data;
+  if(in.inverse_depth){
+    s.quant.inverse_depth=true;
+    s.quant.near_=in.near_; s.quant.far_=in.far_;
+    s.quant.levels = in.levels<=0 ? 65536 : in.levels;
+  }
+  if(in.view && *in.view) s.view=in.view;
+}
+
+int dc_encode_multi2(const uint8_t* const* rgbas,
+                     const dc_rgb_spec_t* rgbs, int num_rgbs,
+                     const dc_signal_spec2_t* signals, int num_signals,
+                     int W, int H, int N, int fps,
+                     uint8_t** out, size_t* out_len){
   // fps reaches the encoder timebase (g_timebase.den) and the block timestamps (1000*i/fps);
   // at 0 the first divides by zero and the second yields inf, which is UB when cast to int.
   // dimsUsable is the same bound the decoders enforce — here it also keeps the encoder's int
   // plane arithmetic from wrapping (W=H=65536 wraps W*H to 0, so the encoder would read rows
   // out of a zero-length plane).
   if(!out || !out_len || N<=0 || fps<=0 || !dimsUsable(W,H)) return 1;
+  if(num_signals<=0 && num_rgbs<=0) return 1;
+  if(num_signals>0 && !signals) return 1;
+  if(num_rgbs>0 && !rgbas) return 1;
+  return guard([&]{
+  std::vector<RgbEncodeSpec> rgbSpecs;
+  if(!normalizeRgbSpecs(rgbs, num_rgbs, rgbSpecs)) return 1;
+  std::vector<SignalEncodeSpec> specs;
+  for(int i=0;i<num_signals;i++){
+    if(!signals[i].id || !signals[i].data) return 1;
+    SignalEncodeSpec s; signalSpecFrom2(signals[i], s);
+    specs.push_back(s);
+  }
+  Bytes file; int rc=buildFileMulti(rgbas, rgbSpecs, specs, W, H, N, fps, file);
+  if(rc) return rc;
+  return finish(file, out, out_len);
+  });
+}
+
+int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
+                    const dc_signal_spec_t* signals, int num_signals,
+                    int W, int H, int N, int fps,
+                    uint8_t** out, size_t* out_len){
+  if(!out || !out_len || N<=0 || fps<=0 || !dimsUsable(W,H)) return 1;
   if(num_signals<=0 && !rgba) return 1;
   if(num_signals>0 && !signals) return 1;
   return guard([&]{
+  std::vector<RgbEncodeSpec> rgbSpecs;
+  if(rgba) rgbSpecs.push_back({"rgb", rgb_kbps});
   std::vector<SignalEncodeSpec> specs;
   for(int i=0;i<num_signals;i++){
     const dc_signal_spec_t& in=signals[i];
     if(!in.id || !in.data) return 1;
-    SignalEncodeSpec s; s.id=in.id; s.data=in.data;
-    if(in.inverse_depth){
-      s.quant.inverse_depth=true;
-      s.quant.near_=in.near_; s.quant.far_=in.far_;
-      s.quant.levels = in.levels<=0 ? 65536 : in.levels;
-    }
+    SignalEncodeSpec s; signalSpecFrom(in, s);
     specs.push_back(s);
   }
-  Bytes file; int rc=buildFileMulti(rgba, rgb_kbps, specs, W, H, N, fps, file);
+  const uint8_t* arr[1]={rgba};
+  Bytes file; int rc=buildFileMulti(rgba?arr:nullptr, rgbSpecs, specs, W, H, N, fps, file);
   if(rc) return rc;
   return finish(file, out, out_len);
   });
@@ -1297,29 +1442,47 @@ int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb, int em
                      const dc_signal_spec_t* signals, int num_signals,
                      const char* text_track_name,
                      dc_stream_encoder_t** out){
-  if(!out || num_signals<0 || fps<=0 || !dimsUsable(W,H)) return 1;
   if(num_signals>0 && !signals) return 1;
-  if(num_signals<=0 && !has_rgb) return 1;
   return guard([&]() -> int {
-  std::vector<SignalEncodeSpec> specs;
+  // The v1 struct is the v2 struct without `view`; widen and delegate.
+  std::vector<dc_signal_spec2_t> specs2(num_signals>0?num_signals:0);
   for(int i=0;i<num_signals;i++){
     const dc_signal_spec_t& in=signals[i];
-    if(!in.id) return 1;
-    SignalEncodeSpec s; s.id=in.id;   // .data is unused here: planes arrive per frame
-    if(in.inverse_depth){
-      s.quant.inverse_depth=true;
-      s.quant.near_=in.near_; s.quant.far_=in.far_;
-      s.quant.levels = in.levels<=0 ? 65536 : in.levels;
-    }
+    specs2[i]={in.id, in.data, in.inverse_depth, in.near_, in.far_, in.levels, NULL};
+  }
+  dc_rgb_spec_t rgb{NULL, rgb_kbps};
+  return dc_stream_create2(W,H,fps, has_rgb?&rgb:NULL, has_rgb?1:0, emit_cues,
+                           num_signals>0?specs2.data():NULL, num_signals, text_track_name, out);
+  });
+}
+
+int dc_stream_create2(int W, int H, int fps,
+                     const dc_rgb_spec_t* rgbs, int num_rgbs, int emit_cues,
+                     const dc_signal_spec2_t* signals, int num_signals,
+                     const char* text_track_name,
+                     dc_stream_encoder_t** out){
+  if(!out || num_signals<0 || fps<=0 || !dimsUsable(W,H)) return 1;
+  if(num_signals>0 && !signals) return 1;
+  if(num_signals<=0 && num_rgbs<=0) return 1;
+  return guard([&]() -> int {
+  std::vector<RgbEncodeSpec> rgbSpecs;
+  if(!normalizeRgbSpecs(rgbs, num_rgbs, rgbSpecs)) return 1;
+  std::vector<SignalEncodeSpec> specs;
+  for(int i=0;i<num_signals;i++){
+    if(!signals[i].id) return 1;
+    SignalEncodeSpec s; signalSpecFrom2(signals[i], s);
+    s.data=nullptr;   // unused here: planes arrive per frame
     specs.push_back(s);
   }
   std::unique_ptr<dc_stream_encoder> h(new dc_stream_encoder());
-  h->W=W; h->H=H; h->fps=fps; h->hasRgb=has_rgb!=0;
-  h->sigMeta=planSignalTracks(specs, h->hasRgb);
-  if(h->hasRgb){
+  h->W=W; h->H=H; h->fps=fps;
+  h->rgbMeta=planRgbTracks(rgbSpecs);
+  h->sigMeta=planSignalTracks(specs, rgbSpecs.size());
+  for(size_t i=0;i<rgbSpecs.size();i++){
     auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
-    if(enc->init(W,H,fps,/*lossless=*/false,rgb_kbps?rgb_kbps:2000,/*keyEvery=*/fps)) return 2;
-    h->slots.push_back({1, std::move(enc), 0});
+    int kbps=rgbSpecs[i].kbps;
+    if(enc->init(W,H,fps,/*lossless=*/false,kbps?kbps:2000,/*keyEvery=*/fps)) return 2;
+    h->slots.push_back({h->rgbMeta[i].track, std::move(enc), 0});
   }
   for(auto& sm : h->sigMeta){
     for(int track : {sm.track_hi, sm.track_lo}){
@@ -1335,7 +1498,7 @@ int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb, int em
   // 30 seconds of blocks open, would defeat the point of streaming.
   h->mux.clusterSpanMs=1000;
   h->mux.emitCues=emit_cues!=0;
-  std::vector<Track> tracks = tracksForPlan(h->sigMeta, h->hasRgb, W, H);
+  std::vector<Track> tracks = tracksForPlan(h->sigMeta, h->rgbMeta, W, H);
   if(text_track_name && *text_track_name){
     int next = 1; for(auto& t : tracks) next = std::max(next, t.number+1);
     // Appended last so existing track numbers are unchanged, and typed subtitle so
@@ -1349,7 +1512,7 @@ int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb, int em
     h->textTrack = next;
   }
   h->mux.start(tracks,
-               buildMetadataJson(W,H,0,fps,h->hasRgb,h->sigMeta,/*streaming=*/true));
+               buildMetadataJson(W,H,0,fps,h->rgbMeta,h->sigMeta,/*streaming=*/true));
   *out=h.release();
   return 0;
   });
@@ -1371,21 +1534,33 @@ int dc_stream_add_text(dc_stream_encoder_t* enc, int timestamp_ms, int duration_
   });
 }
 
-int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,
-                        const uint16_t* const* signal_planes,
-                        uint8_t** out, size_t* out_len){
+int dc_stream_add_frame2(dc_stream_encoder_t* enc, const uint8_t* const* rgbas,
+                         const uint16_t* const* signal_planes,
+                         uint8_t** out, size_t* out_len){
   if(!enc || !out || !out_len) return 1;
   if(enc->finished) return 6;
   // RGB presence is frozen by the track plan in the header that has already gone out, so a frame
   // that disagrees with it cannot be written to any track this file declares.
-  if(enc->hasRgb != (rgba!=nullptr)) return 1;
+  if(enc->rgbMeta.empty() != (rgbas==nullptr)) return 1;
   if(!enc->sigMeta.empty() && !signal_planes) return 1;
   return guard([&]() -> int {
+  for(size_t i=0;i<enc->rgbMeta.size();i++) if(!rgbas[i]) return 1;
   for(size_t i=0;i<enc->sigMeta.size();i++) if(!signal_planes[i]) return 1;
   Bytes chunk;
-  if(int rc=enc->round(rgba, signal_planes, chunk)) return rc;
+  if(int rc=enc->round(rgbas, signal_planes, chunk)) return rc;
   return emitChunk(chunk, out, out_len);
   });
+}
+
+int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,
+                        const uint16_t* const* signal_planes,
+                        uint8_t** out, size_t* out_len){
+  if(!enc) return 1;
+  // A multi-RGB stream cannot be fed through the single-pointer form: the array length is the
+  // contract, and one pointer is not two.
+  if(enc->rgbMeta.size()>1) return 1;
+  const uint8_t* arr[1]={rgba};
+  return dc_stream_add_frame2(enc, rgba?arr:NULL, signal_planes, out, out_len);
 }
 
 int dc_stream_finish(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len){

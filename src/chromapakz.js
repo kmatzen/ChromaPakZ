@@ -11,6 +11,8 @@ import {
 } from './chromapakz-core.js';
 import {
   planSignals,
+  planRgbs,
+  normalizeRgbSpecs,
   buildTracksFromPlan,
   buildFileMetadata,
   normalizeMetadata,
@@ -21,7 +23,8 @@ import {
   isSlotComplete,
   slotHasContent,
   collectFrameInputs,
-  RGB_TRACK,
+  rgbSlotKey,
+  DEFAULT_RGB_ID,
   SIGNAL_DEPTH,
   SIGNAL_RAW_U16,
 } from './signals.js';
@@ -50,8 +53,8 @@ function resolveSignalSpecs(signals){
 
 function makeFrameReader({ meta, W, H, blocks, getBackend }){
   let i=0, shut=false;
-  const rgbDec={};
-  const sigDec={}; // id → { hi, lo }
+  const rgbDec={}; // rgb stream id → decoder
+  const sigDec={}; // signal id → { hi, lo }
   const signals=meta.signals;
 
   // readFrame() claims a slot, pushes into stateful VP9 decoders and awaits their output, so
@@ -70,14 +73,19 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
     if(shut) throw new Error('decoder closed');
     if(i>=blocks.length) return null;
     const slot=blocks[i++];
-    const out={ rgb: null, signals: {} };
+    const out={ rgb: null, rgbs: {}, signals: {} };
     const be=await getBackend();
 
-    if(slot.rgb){
-      if(!rgbDec.dec) rgbDec.dec=be.createTrackDecoder({ kind:'rgba', W, H });
-      rgbDec.dec.push(slot.rgb);
-      out.rgb=await rgbDec.dec.next();
+    for(const r of meta.rgbs){
+      const block=slot[rgbSlotKey(r.id)];
+      if(!block) continue;
+      if(!rgbDec[r.id]) rgbDec[r.id]=be.createTrackDecoder({ kind:'rgba', W, H });
+      rgbDec[r.id].push(block);
+      const plane=await rgbDec[r.id].next();
+      if(plane) out.rgbs[r.id]=plane;
     }
+    // Legacy field: the primary stream (rgbs[0]), exactly what pre-multi-RGB callers read.
+    if(meta.rgbs.length) out.rgb=out.rgbs[meta.rgbs[0].id] ?? null;
 
     for(const s of signals){
       const hiKey=`${s.id}:hi`, loKey=`${s.id}:lo`;
@@ -104,7 +112,7 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
     async close(){
       if(shut) return;
       shut=true;
-      if(rgbDec.dec) await rgbDec.dec.close();
+      for(const d of Object.values(rgbDec)) await d.close();
       for(const d of Object.values(sigDec)){
         if(d.hi) await d.hi.close();
         if(d.lo) await d.lo.close();
@@ -124,18 +132,27 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
 // ── streaming encode ──
 /**
  * @param signals — e.g. [{ id:'depth', near, far }, { id:'objectId' }]
- * @param hasRgb — declare RGB presence up front (true/false). Left null, it is inferred from the
- *   first frame; a clip whose RGB starts later than frame 0 must declare `hasRgb:true`, because
- *   track numbers are frozen with the plan (see planSignals).
+ * @param hasRgb — declare a single default RGB stream up front (true/false). Left null (and with
+ *   no `rgbs`), it is inferred from the first frame; a clip whose RGB starts later than frame 0
+ *   must declare it, because track numbers are frozen with the plan (see planSignals).
+ * @param rgbs — declare multiple RGB streams (stereo / multi-camera): an array of stream ids or
+ *   `{ id, kbps? }` entries, order fixing track numbers. Mutually exclusive with hasRgb. Frames
+ *   then carry `rgbs: { id: plane }` (`rgb:` stays sugar for the first stream).
  */
-export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, textTrack=null }){
+export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, rgbs=null, textTrack=null }){
   const specList=resolveSignalSpecs(signals);
   if(hasRgb!==null && typeof hasRgb!=='boolean')
     throw new Error('createEncoder: hasRgb must be true, false, or omitted');
-  const declaredRgb=hasRgb;  // null → infer from the first frame
-  let n=0, sawRgb=false;
-  let signalPlan=null, plannedRgb=false;  // plannedRgb is frozen alongside signalPlan
-  let rgbEnc=null, rgbEncP=null;
+  if(rgbs!==null && hasRgb!==null)
+    throw new Error('createEncoder: pass rgbs or hasRgb, not both');
+  // null → infer a single default stream from the first frame; an array (possibly empty) is final.
+  const declaredRgbs = rgbs!==null ? normalizeRgbSpecs(rgbs)
+    : hasRgb===null ? null
+    : hasRgb ? [{ id: DEFAULT_RGB_ID, kbps: null }] : [];
+  let n=0, sawDefaultRgb=false;
+  let signalPlan=null, rgbPlan=null;  // frozen together: track numbers derive from both
+  const rgbEnc={};  // rgb stream id → encoder          (resolved; read synchronously by finish())
+  const rgbEncP={}; // rgb stream id → Promise<encoder> (in-flight guard)
   const sigEnc={};  // id → { hi, lo }          (resolved encoders; read synchronously by finish())
   const sigEncP={}; // id → Promise<{ hi, lo }> (in-flight guard, so concurrent callers share one)
   let streamMux=null, byteParts=null;
@@ -152,14 +169,14 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
 
   function ensurePlan(){
     if(signalPlan) return;
-    plannedRgb=declaredRgb ?? sawRgb;
-    signalPlan=planSignals(specList, plannedRgb);
+    rgbPlan=planRgbs(declaredRgbs ?? (sawDefaultRgb ? [{ id: DEFAULT_RGB_ID, kbps: null }] : []));
+    signalPlan=planSignals(specList, rgbPlan.length);
   }
 
   function ensureStreamMux(){
     if(streamMux) return;
     ensurePlan();
-    const tracks=buildTracksFromPlan(W, H, plannedRgb, signalPlan);
+    const tracks=buildTracksFromPlan(W, H, rgbPlan, signalPlan);
     if(textTrack){
       // Appended last so the video/signal track numbers are unchanged. WebM defines its
       // own WebVTT CodecIDs — Matroska's S_TEXT/WEBVTT demuxes as an unknown codec — and
@@ -168,7 +185,7 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
       textTrackNumber=tracks.reduce((m,t)=>Math.max(m, t.number), 0)+1;
       tracks.push({ number:textTrackNumber, codecID:'D_WEBVTT/SUBTITLES', name:String(textTrack), type:17 });
     }
-    const metadata=buildFileMetadata({ W, H, fps, n:0, hasRgb:plannedRgb, signals: signalPlan, streaming:true });
+    const metadata=buildFileMetadata({ W, H, fps, n:0, rgbs:rgbPlan, signals: signalPlan, streaming:true });
     streamMux=createStreamMux({ tracks, metadata, durationMs:0 });
     byteParts=[streamMux.header];
     if(onChunk) onChunk(streamMux.header);
@@ -188,11 +205,11 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     })();
   }
 
-  function getRgbEnc(){
-    return rgbEncP ??= (async()=>{
+  function getRgbEnc(r){
+    return rgbEncP[r.id] ??= (async()=>{
       const be=await lossyBackend();
-      return rgbEnc=be.createTrackEncoder({
-        kind:'rgba', lossless:false, W, H, fps, bitrate:rgbKbps, keyEvery:rgbKeyEvery });
+      return rgbEnc[r.id]=be.createTrackEncoder({
+        kind:'rgba', lossless:false, W, H, fps, bitrate: r.kbps ?? rgbKbps, keyEvery:rgbKeyEvery });
     })();
   }
 
@@ -213,19 +230,21 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   // written back at t=0 and land in the wrong frame slot. Every stream records the frame it
   // started on and shifts its chunks by that much. A stream that resumes *after* a gap can't be
   // repaired by any single offset, so it is refused rather than silently misaligned.
-  const streams={};   // 'rgb' | signal id → { start, last }
-  function checkStream(name){
-    const st=streams[name];
+  // Keys never collide across kinds: rgb streams use rgbSlotKey(id) (starts `rgb:"`), signals
+  // use `sig:${id}`.
+  const streams={};   // stream key → { start, last }
+  function checkStream(key, label){
+    const st=streams[key];
     if(st && n!==st.last+1)
-      throw new Error(`addFrame: "${name}" is absent on frame ${st.last+1} but present on frame ${n}; `
+      throw new Error(`addFrame: "${label}" is absent on frame ${st.last+1} but present on frame ${n}; `
         + 'once a stream starts it must be written on every frame');
   }
-  function markStream(name){
-    const st=streams[name];
-    if(st) st.last=n; else streams[name]={ start:n, last:n };
+  function markStream(key){
+    const st=streams[key];
+    if(st) st.last=n; else streams[key]={ start:n, last:n };
   }
-  function stamp(name, track, chunk){
-    const offsetMs=Math.round(streams[name].start*1000/fps);
+  function stamp(key, track, chunk){
+    const offsetMs=Math.round(streams[key].start*1000/fps);
     return { track, key:chunk.key, data:chunk.data, timeMs: chunk.timeMs+offsetMs };
   }
 
@@ -242,7 +261,10 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   // arrives. So read them off a throwaway plan instead of freezing the real one; only the quant
   // range is wanted here, and that does not depend on the track numbering.
   const depthQuant=()=>{
-    try{ return (signalPlan ?? planSignals(specList, declaredRgb ?? sawRgb)).find(s=>s.id==='depth')?.quant; }
+    try{
+      const nRgb=(declaredRgbs ?? (sawDefaultRgb ? [0] : [])).length;
+      return (signalPlan ?? planSignals(specList, nRgb)).find(s=>s.id==='depth')?.quant;
+    }
     catch{ return undefined; }
   };
 
@@ -284,25 +306,54 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
 
   async function addFrameImpl(frame){
     const writes=[];
-    if(frame.rgb){
-      // Plane geometry is checked before anything stateful: a wrong-length plane is a caller bug
-      // the codec backends cannot absorb (the WASM one copies it into a W*H*4 allocation on the
-      // libvpx heap), and it says nothing about how this encoder was configured.
-      const rgbBytes=frame.rgb.byteLength ?? frame.rgb.length;
-      if(rgbBytes!==pixels*4)
-        throw new Error(`addFrame: rgb plane has ${rgbBytes} bytes, expected ${pixels*4} (${W}x${H} RGBA)`);
+    // Plane geometry is checked before anything stateful: a wrong-length plane is a caller bug
+    // the codec backends cannot absorb (the WASM one copies it into a W*H*4 allocation on the
+    // libvpx heap), and it says nothing about how this encoder was configured.
+    const checkPlane=(plane, label)=>{
+      const bytes=plane.byteLength ?? plane.length;
+      if(bytes!==pixels*4)
+        throw new Error(`addFrame: ${label} plane has ${bytes} bytes, expected ${pixels*4} (${W}x${H} RGBA)`);
+    };
+    if(frame.rgbs!=null && typeof frame.rgbs!=='object')
+      throw new Error('addFrame: rgbs must be an object of { streamId: plane }');
+    const named=frame.rgbs ? Object.entries(frame.rgbs).filter(([,p])=>p!=null) : [];
+    if(frame.rgb!=null) checkPlane(frame.rgb, 'rgb');
+    for(const [id, plane] of named) checkPlane(plane, `rgb stream "${id}"`);
+
+    if(frame.rgb!=null){
       // Track numbers were frozen without an RGB track, so this frame's RGB would be written to
       // track 1 — already owned by signals[0].tracks.hi. Fail here rather than emit a file whose
       // RGB and first signal decode as the same track.
-      if(declaredRgb===false)
+      if(declaredRgbs!==null && !declaredRgbs.length)
         throw new Error('addFrame: frame carries rgb, but createEncoder({ hasRgb:false }) declared none');
-      if(signalPlan && !plannedRgb)
+      if(signalPlan && !rgbPlan.length)
         throw new Error('addFrame: rgb appeared after the track plan was frozen (frame 0 had none); '
           + 'pass createEncoder({ hasRgb:true }) to reserve the rgb track up front');
-      await getRgbEnc();
-      sawRgb=true;
+      if(declaredRgbs===null) sawDefaultRgb=true;
     }
+    // Named streams cannot be inferred: object key order is too weak a footing to freeze track
+    // numbers on, so they must have been declared (or the plan already frozen by earlier frames).
+    if(named.length && declaredRgbs===null && !signalPlan && !sawDefaultRgb)
+      throw new Error('addFrame: rgbs{} requires the streams to be declared up front — pass '
+        + 'createEncoder({ rgbs:[...] }) (or hasRgb:true for the single default stream)');
     ensurePlan();
+
+    // Map this frame's rgb payloads onto the planned streams; `rgb` is sugar for the primary.
+    const rgbIn={};
+    for(const [id, plane] of named){
+      if(!rgbPlan.some(r=>r.id===id))
+        throw new Error(`addFrame: unknown rgb stream "${id}" — this encoder's streams are `
+          + `[${rgbPlan.map(r=>r.id).join(', ')}]`);
+      rgbIn[id]=plane;
+    }
+    if(frame.rgb!=null){
+      const primary=rgbPlan[0];
+      if(rgbIn[primary.id]!=null)
+        throw new Error(`addFrame: rgb and rgbs["${primary.id}"] both name the primary stream`);
+      rgbIn[primary.id]=frame.rgb;
+    }
+    const rgbPresent=rgbPlan.filter(r=>rgbIn[r.id]!=null);
+
     const inputs=collectFrameInputs(frame, signalPlan);
     // Quantize, size-check and gap-check everything this frame carries *before* pushing any of it
     // into a stateful encoder, so a rejected frame leaves the encoders untouched.
@@ -311,23 +362,24 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
       const u16=u16FromFramePayload(inputs[s.id], s, pixels);
       if(u16) present.push({ s, u16 });
     }
-    if(!frame.rgb && !present.length) throw new Error('addFrame: pass rgb and/or signals');
-    if(frame.rgb) checkStream('rgb');
-    for(const { s } of present) checkStream(s.id);
+    if(!rgbPresent.length && !present.length) throw new Error('addFrame: pass rgb and/or signals');
+    for(const r of rgbPresent) checkStream(rgbSlotKey(r.id), `rgb "${r.id}"`);
+    for(const { s } of present) checkStream(`sig:${s.id}`, s.id);
 
     for(const { s, u16 } of present){
-      markStream(s.id);
+      markStream(`sig:${s.id}`);
       const enc=await getSigEnc(s.id);
       const { hi, lo }=triFoldPack(u16);
       const chi=await enc.hi.push(hi), clo=await enc.lo.push(lo);
-      writes.push(stamp(s.id, s.tracks.hi, chi), stamp(s.id, s.tracks.lo, clo));
+      writes.push(stamp(`sig:${s.id}`, s.tracks.hi, chi), stamp(`sig:${s.id}`, s.tracks.lo, clo));
     }
     if(onChunk) ensureStreamMux();
 
-    if(frame.rgb){
-      markStream('rgb');
-      const c=await rgbEnc.push(frame.rgb);
-      writes.push(stamp('rgb', RGB_TRACK, c));
+    for(const r of rgbPresent){
+      markStream(rgbSlotKey(r.id));
+      const enc=await getRgbEnc(r);
+      const c=await enc.push(rgbIn[r.id]);
+      writes.push(stamp(rgbSlotKey(r.id), r.track, c));
     }
     if(onChunk) emitMuxFrames(writes);
     else muxFrames.push(...writes);
@@ -339,25 +391,29 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     ensurePlan();
     // A reserved-but-empty RGB track advertises itself in the metadata while carrying no blocks,
     // which stalls the streaming decoder — every slot there waits on an rgb block.
-    if(plannedRgb && !sawRgb)
-      throw new Error('finish: createEncoder({ hasRgb:true }) reserved an rgb track, but no frame carried rgb');
+    for(const r of rgbPlan)
+      if(!streams[rgbSlotKey(r.id)])
+        throw new Error(`finish: createEncoder reserved rgb track "${r.id}", but no frame carried rgb for it`);
     if(onChunk){
       ensureStreamMux();
       const tailWrites=[];
-      if(sawRgb) (await rgbEnc.close()).forEach(c=>tailWrites.push(stamp('rgb', RGB_TRACK, c)));
+      for(const r of rgbPlan){
+        if(!rgbEnc[r.id]) continue;
+        (await rgbEnc[r.id].close()).forEach(c=>tailWrites.push(stamp(rgbSlotKey(r.id), r.track, c)));
+      }
       for(const s of signalPlan){
         if(!sigEnc[s.id]) continue;
-        (await sigEnc[s.id].hi.close()).forEach(c=>tailWrites.push(stamp(s.id, s.tracks.hi, c)));
-        (await sigEnc[s.id].lo.close()).forEach(c=>tailWrites.push(stamp(s.id, s.tracks.lo, c)));
+        (await sigEnc[s.id].hi.close()).forEach(c=>tailWrites.push(stamp(`sig:${s.id}`, s.tracks.hi, c)));
+        (await sigEnc[s.id].lo.close()).forEach(c=>tailWrites.push(stamp(`sig:${s.id}`, s.tracks.lo, c)));
       }
       emitMuxFrames(tailWrites);
       const tailBytes=streamMux.finish(Math.round(n*1000/fps));
       if(tailBytes.length){ byteParts.push(tailBytes); onChunk(tailBytes); }
       return concatChunks(byteParts);
     }
-    if(sawRgb) await rgbEnc.close();
+    for(const r of rgbPlan){ if(rgbEnc[r.id]) await rgbEnc[r.id].close(); }
     for(const s of signalPlan){ if(sigEnc[s.id]){ await sigEnc[s.id].hi.close(); await sigEnc[s.id].lo.close(); } }
-    const tracks=buildTracksFromPlan(W, H, plannedRgb, signalPlan);
+    const tracks=buildTracksFromPlan(W, H, rgbPlan, signalPlan);
     if(textTrack){
       // Appended last so the video/signal track numbers are unchanged. WebM defines its
       // own WebVTT CodecIDs — Matroska's S_TEXT/WEBVTT demuxes as an unknown codec — and
@@ -366,17 +422,20 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
       textTrackNumber=tracks.reduce((m,t)=>Math.max(m, t.number), 0)+1;
       tracks.push({ number:textTrackNumber, codecID:'D_WEBVTT/SUBTITLES', name:String(textTrack), type:17 });
     }
-    const metadata=buildFileMetadata({ W, H, fps, n, hasRgb:plannedRgb, signals: signalPlan });
+    const metadata=buildFileMetadata({ W, H, fps, n, rgbs:rgbPlan, signals: signalPlan });
     return mux({ tracks, frames:muxFrames, metadata, durationMs: Math.round(n*1000/fps) });
   }
 }
 
-export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000, onChunk=null }){
+export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000, rgbs=null, onChunk=null }){
   if(!signals?.length) throw new Error('encode: signals[] required');
   if(!frames?.length) throw new Error('encode: frames[] required');
+  if(rgbs===null && frames.some(f=>f.rgbs && Object.keys(f.rgbs).length))
+    throw new Error('encode: frames carry named rgb streams — declare them with encode({ rgbs:[...] })');
   // Every frame is known here, so RGB presence is declared rather than inferred from frame 0 —
   // a clip whose RGB starts mid-sequence plans its track numbers correctly.
-  const enc=createEncoder({ W, H, fps, signals, rgbKbps, onChunk, hasRgb: frames.some(f=>!!f.rgb) });
+  const enc=createEncoder({ W, H, fps, signals, rgbKbps, onChunk,
+    ...(rgbs!==null ? { rgbs } : { hasRgb: frames.some(f=>!!f.rgb) }) });
   for(const fr of frames) await enc.addFrame(fr);
   return enc.finish();
 }
@@ -432,7 +491,7 @@ function createNetworkDecoder({ backend='auto' }={}){
   function emitSlot(timeMs){
     const slot=slotPending.get(timeMs);
     slotPending.delete(timeMs);
-    if(slot && slotHasContent(slot, meta.signals)){ blockQueue.push(slot); return true; }
+    if(slot && slotHasContent(slot, meta)){ blockQueue.push(slot); return true; }
     return false;
   }
 
@@ -449,10 +508,9 @@ function createNetworkDecoder({ backend='auto' }={}){
 
   function onBlock(block){
     if(!meta) return;
-    const rgbT=meta.rgb?.track;
     let key=null;
-    if(block.track===rgbT) key='rgb';
-    else{
+    for(const r of meta.rgbs) if(block.track===r.track){ key=rgbSlotKey(r.id); break; }
+    if(!key){
       for(const s of meta.signals){
         if(block.track===s.tracks.hi) key=`${s.id}:hi`;
         else if(block.track===s.tracks.lo) key=`${s.id}:lo`;
@@ -532,9 +590,13 @@ function createNetworkDecoder({ backend='auto' }={}){
 
 export async function decode(bytes, opts={}){
   const dec=createDecoder(bytes, opts);
-  const rgb=[], signalSeries={};
+  const rgb=[], rgbSeries={}, signalSeries={};
   for await (const frame of dec){
     if(frame.rgb) rgb.push(frame.rgb);
+    for(const [id, plane] of Object.entries(frame.rgbs ?? {})){
+      if(!rgbSeries[id]) rgbSeries[id]=[];
+      rgbSeries[id].push(plane);
+    }
     for(const [id, sig] of Object.entries(frame.signals ?? {})){
       if(!signalSeries[id]) signalSeries[id]=[];
       signalSeries[id].push(sig);
@@ -543,8 +605,9 @@ export async function decode(bytes, opts={}){
   await dec.close();
   return { metadata:dec.metadata, width:dec.width, height:dec.height, signals:dec.signals,
     rgb: rgb.length ? rgb : null,
+    rgbs: Object.keys(rgbSeries).length ? rgbSeries : null,
     signalSeries: Object.keys(signalSeries).length ? signalSeries : null };
 }
 
 export { createStreamMux, createStreamDemux, concatChunks, WebMCorruptError } from './webm.js';
-export { normalizeMetadata, planSignals } from './signals.js';
+export { normalizeMetadata, planSignals, planRgbs, normalizeRgbSpecs } from './signals.js';
