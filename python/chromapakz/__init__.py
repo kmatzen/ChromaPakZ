@@ -1,4 +1,4 @@
-"""ChromaPakZ — lossless RGB + bit-exact auxiliary signals in one WebM.
+"""ChromaPakZ — viewable RGB + bit-exact auxiliary signals in one WebM.
 
     import chromapakz as cz
 
@@ -9,6 +9,11 @@
     )
     out = cz.decode(data)
     out["signals"]["depth"]
+
+The RGB track is the lossy, playable half; the signals are bit-exact. A file may carry several
+synchronized RGB streams (stereo / multi-camera) via `rgbs={"cam0": a, "cam1": b}`, and the
+display track may be HDR10/HLG via `hdr={"transfer": "pq", ...}` — 10-bit codes in, 10-bit codes
+back out of `decode_rgb`. See docs/FORMAT.md and docs/API.md.
 
 Live recording, one frame at a time, is `create_encoder()`:
 

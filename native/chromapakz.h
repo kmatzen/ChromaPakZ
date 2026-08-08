@@ -1,4 +1,4 @@
-// chromapakz native C ABI — VP9-lossless RGB + lossless signals in WebM.
+// chromapakz native C ABI — lossy VP9 RGB display track(s) + bit-exact lossless signals in WebM.
 // All functions return 0 on success, nonzero on error. Buffers returned via out-params are
 // malloc'd and must be released with dc_free().
 //
@@ -38,7 +38,8 @@
 // Error codes shared by the decode entry points (each also has its own; see below).
 #define DC_OK              0
 #define DC_ERR_CAPACITY    9   // the stream holds more frames than the output buffer can take
-#define DC_ERR_GEOMETRY   10   // a decoded frame is not the 8-bit I420 W*H the metadata promised
+#define DC_ERR_GEOMETRY   10   // a decoded frame is not the I420 W*H the metadata promised (8-bit for
+                               // the SDR entry points, 10-bit for dc_decode_rgb16)
 #define DC_ERR_INTERNAL   11   // unexpected internal failure — out of memory, or a caught exception
 #define DC_ERR_CODEC      12   // libvpx rejected a configuration required for correctness (lossless)
 
