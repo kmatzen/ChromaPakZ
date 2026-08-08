@@ -13,6 +13,12 @@ const ID = {
   Cluster:0x1F43B675, Timestamp:0xE7, SimpleBlock:0xA3, Duration:0x4489,
   BlockGroup:0xA0, Block:0xA1, BlockDuration:0x9B,
   Cues:0x1C53BB6B, CuePoint:0xBB, CueTime:0xB3, CueTrackPositions:0xB7, CueTrack:0xF7, CueClusterPosition:0xF1,
+  Colour:0x55B0, MatrixCoefficients:0x55B1, BitsPerChannel:0x55B2, Range:0x55B9,
+  TransferCharacteristics:0x55BA, Primaries:0x55BB, MaxCLL:0x55BC, MaxFALL:0x55BD,
+  MasteringMetadata:0x55D0, PrimaryRChromaticityX:0x55D1, PrimaryRChromaticityY:0x55D2,
+  PrimaryGChromaticityX:0x55D3, PrimaryGChromaticityY:0x55D4, PrimaryBChromaticityX:0x55D5,
+  PrimaryBChromaticityY:0x55D6, WhitePointChromaticityX:0x55D7, WhitePointChromaticityY:0x55D8,
+  LuminanceMax:0x55D9, LuminanceMin:0x55DA,
 };
 
 // ── encoders ──
@@ -46,11 +52,42 @@ function el(id, payload){ const i=idBytes(id); return cat([i, vint(payload.lengt
 const elU = (id,n) => el(id, uintBytes(n));
 const elS = (id,s) => el(id, strBytes(s));
 
-function trackEntry({number, codecID, name, width, height, type=1}){
+/**
+ * WebM Colour element — the container half of HDR signalling (HDR10 static metadata lives here,
+ * not in the VP9 bitstream). `colour` is
+ *   { matrix, bits, range, transfer, primaries, maxCLL?, maxFALL?,
+ *     mastering?: { rx, ry, gx, gy, bx, by, wx, wy, maxLum, minLum } }
+ * with the numeric values Matroska defines (PQ transfer = 16, HLG = 18, BT.2020 primaries = 9).
+ * Element order is fixed and mirrored by the C muxer, so identical descriptors mux to
+ * identical bytes.
+ */
+function colourElement(c){
+  const parts=[ elU(ID.MatrixCoefficients,c.matrix), elU(ID.BitsPerChannel,c.bits),
+    elU(ID.Range,c.range), elU(ID.TransferCharacteristics,c.transfer), elU(ID.Primaries,c.primaries) ];
+  if(c.maxCLL) parts.push(elU(ID.MaxCLL,c.maxCLL));
+  if(c.maxFALL) parts.push(elU(ID.MaxFALL,c.maxFALL));
+  if(c.mastering){
+    const m=c.mastering;
+    parts.push(el(ID.MasteringMetadata, cat([
+      el(ID.PrimaryRChromaticityX,f8(m.rx)), el(ID.PrimaryRChromaticityY,f8(m.ry)),
+      el(ID.PrimaryGChromaticityX,f8(m.gx)), el(ID.PrimaryGChromaticityY,f8(m.gy)),
+      el(ID.PrimaryBChromaticityX,f8(m.bx)), el(ID.PrimaryBChromaticityY,f8(m.by)),
+      el(ID.WhitePointChromaticityX,f8(m.wx)), el(ID.WhitePointChromaticityY,f8(m.wy)),
+      el(ID.LuminanceMax,f8(m.maxLum)), el(ID.LuminanceMin,f8(m.minLum)),
+    ])));
+  }
+  return el(ID.Colour, cat(parts));
+}
+
+function trackEntry({number, codecID, name, width, height, type=1, colour=null}){
   const parts=[ elU(ID.TrackNumber,number), elU(ID.TrackUID,number), elU(ID.TrackType,type),
     elU(ID.FlagLacing,0), elS(ID.CodecID,codecID) ];
   if(name) parts.push(elS(ID.Name,name));
-  if(type===1 && width&&height) parts.push(el(ID.Video, cat([elU(ID.PixelWidth,width), elU(ID.PixelHeight,height)])));
+  if(type===1 && width&&height){
+    const video=[ elU(ID.PixelWidth,width), elU(ID.PixelHeight,height) ];
+    if(colour) video.push(colourElement(colour));
+    parts.push(el(ID.Video, cat(video)));
+  }
   return el(ID.TrackEntry, cat(parts));
 }
 function simpleBlock(track, relTime, key, data){
@@ -248,6 +285,13 @@ function readSize(buf,p,end){
   return { size:v===max ? Infinity : v, len:L, unknown:v===max };
 }
 const readUint=(buf,s,e)=>{ let v=0; for(let k=s;k<e;k++) v=v*256+buf[k]; return v; };
+// EBML floats are 4 or 8 bytes, big-endian; anything else is malformed → NaN.
+const readFloat=(buf,s,e)=>{
+  const n=e-s;
+  if(n!==4 && n!==8) return NaN;
+  const dv=new DataView(buf.buffer, buf.byteOffset+s, n);
+  return n===4 ? dv.getFloat32(0,false) : dv.getFloat64(0,false);
+};
 
 // End of an unknown-size Cluster: scan its children until a level-1 element (the next Cluster,
 // Cues, …) starts. Live/foreign WebM writes clusters this way; the old code gave up at the first
@@ -306,6 +350,31 @@ function checkDocType(buf, hdr, ctx){
   return null;
 }
 
+function walkColour(buf, s, e, ctx){
+  const c={};
+  for(const f of children(buf,s,e,ctx)){
+    if(f.id===ID.MatrixCoefficients) c.matrix=readUint(buf,f.dStart,f.dEnd);
+    else if(f.id===ID.BitsPerChannel) c.bits=readUint(buf,f.dStart,f.dEnd);
+    else if(f.id===ID.Range) c.range=readUint(buf,f.dStart,f.dEnd);
+    else if(f.id===ID.TransferCharacteristics) c.transfer=readUint(buf,f.dStart,f.dEnd);
+    else if(f.id===ID.Primaries) c.primaries=readUint(buf,f.dStart,f.dEnd);
+    else if(f.id===ID.MaxCLL) c.maxCLL=readUint(buf,f.dStart,f.dEnd);
+    else if(f.id===ID.MaxFALL) c.maxFALL=readUint(buf,f.dStart,f.dEnd);
+    else if(f.id===ID.MasteringMetadata){
+      const m={};
+      const put={ [ID.PrimaryRChromaticityX]:'rx', [ID.PrimaryRChromaticityY]:'ry',
+        [ID.PrimaryGChromaticityX]:'gx', [ID.PrimaryGChromaticityY]:'gy',
+        [ID.PrimaryBChromaticityX]:'bx', [ID.PrimaryBChromaticityY]:'by',
+        [ID.WhitePointChromaticityX]:'wx', [ID.WhitePointChromaticityY]:'wy',
+        [ID.LuminanceMax]:'maxLum', [ID.LuminanceMin]:'minLum' };
+      for(const g of children(buf,f.dStart,f.dEnd,ctx))
+        if(put[g.id]) m[put[g.id]]=readFloat(buf,g.dStart,g.dEnd);
+      c.mastering=m;
+    }
+  }
+  return c;
+}
+
 function walkTracks(buf, tracks, s, e, ctx){
   for(const c of children(buf,s,e,ctx)) if(c.id===ID.TrackEntry){
     const t={}; for(const f of children(buf,c.dStart,c.dEnd,ctx)){
@@ -314,7 +383,8 @@ function walkTracks(buf, tracks, s, e, ctx){
       else if(f.id===ID.Name) t.name=new TextDecoder().decode(buf.subarray(f.dStart,f.dEnd));
       else if(f.id===ID.Video) for(const v of children(buf,f.dStart,f.dEnd,ctx)){
         if(v.id===ID.PixelWidth) t.width=readUint(buf,v.dStart,v.dEnd);
-        if(v.id===ID.PixelHeight) t.height=readUint(buf,v.dStart,v.dEnd); } }
+        if(v.id===ID.PixelHeight) t.height=readUint(buf,v.dStart,v.dEnd);
+        if(v.id===ID.Colour) t.colour=walkColour(buf,v.dStart,v.dEnd,ctx); } }
     if(t.number===undefined) continue;                 // TrackNumber not (yet) present
     t.frames=[]; tracks[t.number]=t; }
 }

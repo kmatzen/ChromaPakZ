@@ -104,6 +104,17 @@ and the batch `decode()` returns a per-stream `rgbs` series. All streams share t
 spec may carry `view: '<rgb id>'` — an informational hint (recorded in the metadata, interpreted
 by nothing) naming the camera frame the signal lives in.
 
+### HDR display tracks (read side only)
+
+The browser encoder is SDR-only — `createEncoder({ hdr })` throws; HDR files are written by the
+native/Python encoder, and a browser's job is to *play* them (`<video>` handles VP9 profile 2
+natively — that is the point of the display track). The JS decoder reads HDR files without
+choking: signals and any SDR streams decode as usual, HDR RGB streams are skipped (`frame.rgbs`
+omits them; there is no 10-bit WebCodecs output path yet), and their metadata — the
+`vp09.02.…` codec string and the `hdr` object — is available on `metadata.rgbs[i]`. The muxer
+and demuxer in `src/webm.js` fully support the WebM `Colour` element (`track.colour`),
+byte-compatible with the C muxer.
+
 ### Plane sizes
 
 Every plane handed to `addFrame()` must match the encoder's geometry exactly: `W*H` samples for a
@@ -182,6 +193,14 @@ numbering, the first stream being the primary one legacy readers decode; `rgb_kb
 `{id: kbps}` dict), then `add_frame(rgbs={"cam0": a, "cam1": b}, signals=…)` with every declared
 stream on every frame. A spec may carry `view: "<rgb id>"` — an informational hint naming the
 camera frame a signal lives in, recorded in the metadata and interpreted by nothing.
+
+`hdr=` makes every RGB stream an HDR display track (VP9 profile 2, 10-bit, BT.2020, WebM
+`Colour` element): `{"transfer": "pq"|"hlg", "max_cll"?, "max_fall"?, "mastering"?:
+{rx, ry, gx, gy, bx, by, wx, wy, max_lum, min_lum}}`. RGB arrays are then **uint16** planes of
+10-bit display codes (0..1023; out-of-range raises), on both `encode(rgbs=…, hdr=…)` and
+`create_encoder(hdr=…)`/`add_frame`. On the read side nothing extra is needed: `decode_rgb` /
+`decode()` return uint16 codes for an HDR stream (per its metadata `hdr` entry) and uint8 for
+SDR, and the 8/10-bit native entry points refuse each other's streams rather than truncate.
 
 The native core is loaded on first use, not at import — so `inverse_depth_spec`, the validation
 helpers and `chromapakz.webm_inspect` are usable (and unit-testable) without a compiled `_core`.
@@ -265,15 +284,18 @@ quantize float depth with `quantize_inverse()` first.
 
 | Function | Purpose |
 |---|---|
-| `dc_encode_multi` / `dc_encode_multi2` | RGB (one / N streams) + N signals |
-| `dc_stream_create` / `_create2` / `_header` / `_add_frame` / `_add_frame2` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording |
+| `dc_encode_multi` / `dc_encode_multi2` / `dc_encode_multi_hdr` | RGB (one / N streams / N HDR streams) + N signals |
+| `dc_stream_create` / `_create2` / `_create_hdr` / `_header` / `_add_frame` / `_add_frame2` / `_add_frame16` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording |
 | `dc_decode_signal` | Decode by id |
 | `dc_get_metadata` | CHROMAPAKZ JSON |
-| `dc_probe` / `dc_decode_rgb` / `dc_decode_rgb_id` | Header + RGB (primary / by stream id) |
+| `dc_probe` / `dc_decode_rgb` / `dc_decode_rgb_id` / `dc_decode_rgb16` | Header + RGB (primary / by stream id / 10-bit HDR) |
 
 The `*2` entry points (0.7.0) take `dc_rgb_spec_t` stream descriptors and `dc_signal_spec2_t`
 (the v1 struct plus `view`); the originals remain as single-stream forms — existing callers are
 untouched, and `dc_probe`'s `has_rgb` out-param now counts streams (still 0/1 for old files).
+The `*_hdr` / `*16` entry points (0.8.0) add the 10-bit HDR display path: `dc_hdr_meta_t`
+describes transfer/light-levels/ST 2086 mastering, RGB planes cross the ABI as uint16 10-bit
+codes, and the 8- and 10-bit forms refuse each other's streams (error 7 on decode, 1 on encode).
 
 Every entry point returns `0` on success and a nonzero code on failure — none of them throw, and
 none of them abort on NULL or degenerate arguments. Codes `1`–`8` are per-function, documented on
