@@ -90,7 +90,8 @@ export function normalizeMetadata(meta){
   const rgbs = Array.isArray(meta.rgbs) && meta.rgbs.length
     ? meta.rgbs.filter(r=>r && r.track).map((r, i)=>({
         id: typeof r.id === 'string' && r.id ? r.id : (i===0 ? DEFAULT_RGB_ID : `rgb${i}`),
-        track: r.track, codec: r.codec }))
+        track: r.track, codec: r.codec,
+        ...(r.hdr ? { hdr: r.hdr } : {}) }))
     : meta.rgb ? [{ id: DEFAULT_RGB_ID, track: meta.rgb.track ?? RGB_TRACK, codec: meta.rgb.codec }] : [];
   return { ...meta, rgbs, signals };
 }

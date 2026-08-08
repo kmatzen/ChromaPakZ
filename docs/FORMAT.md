@@ -54,6 +54,27 @@ writes every declared stream on every frame (the JS encoder additionally allows 
 *start* late, as signals always could, but never to gap). Rigs that are not frame-synchronized
 are out of scope — represent them as separate files.
 
+**HDR display tracks (0.8.0, optional).** An RGB stream may be an HDR10/HLG display track:
+VP9 **profile 2**, 10-bit, BT.2020 non-constant-luminance, broadcast range. Its `rgbs[]` entry
+then carries the full codec string (`vp09.02.10.10.01.09.16.09` for PQ, `…18.09` for HLG) and an
+`"hdr"` object:
+
+```json
+"hdr": { "bits": 10, "transfer": "pq", "maxCLL": 1000, "maxFALL": 400,
+         "mastering": { "rx": 0.708, "ry": 0.292, "gx": 0.170, "gy": 0.797,
+                        "bx": 0.131, "by": 0.046, "wx": 0.3127, "wy": 0.3290,
+                        "maxLum": 1000, "minLum": 0.005 } }
+```
+
+The same information is written where players actually read it: a WebM **`Colour`** element on
+each RGB TrackEntry (`MatrixCoefficients` 9, `BitsPerChannel` 10, `Range` 1,
+`TransferCharacteristics` 16/18, `Primaries` 9, optional `MaxCLL`/`MaxFALL` and the ST 2086
+`MasteringMetadata`) — HDR10 static metadata lives in the container, not the VP9 bitstream.
+Both muxers emit byte-identical Colour elements for the same description; SDR files carry no
+Colour element and are byte-unchanged. HDR applies to all of a file's RGB streams at once, and
+samples are 10-bit display codes (0..1023) — scene-referred data belongs in the lossless signal
+tracks, not here. Signal tracks are unaffected either way.
+
 **`view` (optional, informational).** A signal may name the RGB stream whose camera frame it
 lives in (e.g. disparity computed in `cam0`'s rectified frame). It is recorded verbatim and
 interpreted by nothing in ChromaPakZ; association semantics belong to wrapper formats.

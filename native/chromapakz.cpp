@@ -44,6 +44,12 @@ enum : uint32_t {
   ID_BlockGroup=0xA0, ID_Block=0xA1, ID_BlockDuration=0x9B,
   ID_Cues=0x1C53BB6B, ID_CuePoint=0xBB, ID_CueTime=0xB3, ID_CueTrackPositions=0xB7,
   ID_CueTrack=0xF7, ID_CueClusterPosition=0xF1,
+  ID_Colour=0x55B0, ID_MatrixCoefficients=0x55B1, ID_BitsPerChannel=0x55B2, ID_Range=0x55B9,
+  ID_TransferCharacteristics=0x55BA, ID_Primaries=0x55BB, ID_MaxCLL=0x55BC, ID_MaxFALL=0x55BD,
+  ID_MasteringMetadata=0x55D0, ID_PrimaryRChromaticityX=0x55D1, ID_PrimaryRChromaticityY=0x55D2,
+  ID_PrimaryGChromaticityX=0x55D3, ID_PrimaryGChromaticityY=0x55D4, ID_PrimaryBChromaticityX=0x55D5,
+  ID_PrimaryBChromaticityY=0x55D6, ID_WhitePointChromaticityX=0x55D7, ID_WhitePointChromaticityY=0x55D8,
+  ID_LuminanceMax=0x55D9, ID_LuminanceMin=0x55DA,
 };
 
 void append(Bytes& a, const Bytes& b){ a.insert(a.end(), b.begin(), b.end()); }
@@ -67,8 +73,43 @@ Bytes el(uint32_t id, const Bytes& payload){
 Bytes elU(uint32_t id, uint64_t n){ return el(id, uintBytes(n)); }
 Bytes elS(uint32_t id, const std::string& s){ return el(id, strBytes(s)); }
 
-struct Track { int number; std::string codecID, name; int width, height; int type=1; };
+// HDR display-track description: what the WebM Colour element and the VP9 profile-2 encoder
+// need. `enabled` false ⇒ the track is the classic 8-bit SDR one and no Colour is written.
+struct HdrMeta {
+  bool enabled=false;
+  int transfer=16;                 // WebM TransferCharacteristics: 16 = PQ, 18 = HLG
+  int maxCll=0, maxFall=0;         // 0 = unset
+  bool hasMastering=false;         // ST 2086 mastering display, below
+  double rx=0, ry=0, gx=0, gy=0, bx=0, by=0, wx=0, wy=0;
+  double lumMax=0, lumMin=0;
+};
+
+struct Track { int number; std::string codecID, name; int width, height; int type=1; HdrMeta colour{}; };
 struct Frame { int track; bool key; int timeMs; const uint8_t* data; size_t len; };
+
+// The container half of HDR signalling — HDR10 static metadata lives here, not in the VP9
+// bitstream. Element order is fixed and mirrored by src/webm.js's colourElement(), so identical
+// descriptors mux to identical bytes.
+Bytes colourElement(const HdrMeta& c){
+  Bytes p;
+  append(p, elU(ID_MatrixCoefficients, 9));       // BT.2020 non-constant luminance
+  append(p, elU(ID_BitsPerChannel, 10));
+  append(p, elU(ID_Range, 1));                    // broadcast ("studio") range, the HDR10 convention
+  append(p, elU(ID_TransferCharacteristics, c.transfer));
+  append(p, elU(ID_Primaries, 9));                // BT.2020
+  if(c.maxCll) append(p, elU(ID_MaxCLL, c.maxCll));
+  if(c.maxFall) append(p, elU(ID_MaxFALL, c.maxFall));
+  if(c.hasMastering){
+    Bytes m;
+    append(m, el(ID_PrimaryRChromaticityX, f8(c.rx))); append(m, el(ID_PrimaryRChromaticityY, f8(c.ry)));
+    append(m, el(ID_PrimaryGChromaticityX, f8(c.gx))); append(m, el(ID_PrimaryGChromaticityY, f8(c.gy)));
+    append(m, el(ID_PrimaryBChromaticityX, f8(c.bx))); append(m, el(ID_PrimaryBChromaticityY, f8(c.by)));
+    append(m, el(ID_WhitePointChromaticityX, f8(c.wx))); append(m, el(ID_WhitePointChromaticityY, f8(c.wy)));
+    append(m, el(ID_LuminanceMax, f8(c.lumMax))); append(m, el(ID_LuminanceMin, f8(c.lumMin)));
+    append(p, el(ID_MasteringMetadata, m));
+  }
+  return el(ID_Colour, p);
+}
 
 Bytes trackEntry(const Track& t){
   Bytes p;
@@ -77,6 +118,7 @@ Bytes trackEntry(const Track& t){
   append(p, elS(ID_CodecID, t.codecID));
   if(!t.name.empty()) append(p, elS(ID_Name, t.name));
   if(t.type==1 && t.width && t.height){ Bytes v; append(v, elU(ID_PixelWidth, t.width)); append(v, elU(ID_PixelHeight, t.height));
+    if(t.colour.enabled) append(v, colourElement(t.colour));
     append(p, el(ID_Video, v)); }
   return el(ID_TrackEntry, p);
 }
@@ -554,7 +596,7 @@ bool jNumberValue(const std::string& j, size_t& p, int depth, double& out, bool&
 
 struct SignalQuantMeta { bool inverse_depth=false; double near_=0, far_=0; int levels=65536; };
 struct SignalMeta { std::string id; int track_hi=0, track_lo=0; SignalQuantMeta quant; std::string view; };
-struct RgbMeta { std::string id; int track=1; };
+struct RgbMeta { std::string id; int track=1; int bits=8; };   // bits: 8 = SDR, 10 = HDR profile 2
 struct FileMeta {
   int version=1, width=0, height=0, fps=30, frames=0;
   bool has_rgb=false; int rgb_track=1;
@@ -660,6 +702,20 @@ void parseRgbsV3(const std::string& j, size_t at, FileMeta& m){
       }
       double v=0;
       if(k=="track"){ if(jNumberValue(j,vp,3,v,ok)) r.track=clampToInt(v); return ok; }
+      if(k=="hdr"){
+        // Only the bit depth matters to this core (it decides the decode path); the rest of the
+        // hdr object is display metadata that readers take from the raw JSON.
+        jWs(j,vp);
+        if(vp<j.size() && j[vp]=='{'){
+          r.bits=10;   // an hdr object without an explicit "bits" still means the profile-2 track
+          return jEachMember(j,vp,3,[&](const std::string& hk, size_t& hp)->bool{
+            double hv=0;
+            if(hk=="bits"){ if(jNumberValue(j,hp,4,hv,ok)){ int b=clampToInt(hv); r.bits = b>0?b:10; } return ok; }
+            return jSkipValue(j,hp,4);
+          });
+        }
+        return jSkipValue(j,vp,3);
+      }
       return jSkipValue(j,vp,3);
     });
     if(!wf || !ok) return false;
@@ -726,6 +782,37 @@ std::string quantJson(const SignalQuantMeta& q){
   return buf;
 }
 
+// Codec string for one RGB stream. SDR keeps the short historical form; HDR uses the full form
+// (profile.level.depth.chroma.primaries.transfer.matrix) WebCodecs needs to configure an HDR
+// decode: profile 2, 10-bit, 4:2:0 colocated, BT.2020 primaries/matrix, PQ or HLG transfer.
+std::string rgbCodecString(const HdrMeta& hdr){
+  if(!hdr.enabled) return "vp09.00.10.08";
+  char buf[40]; snprintf(buf,sizeof buf,"vp09.02.10.10.01.09.%02d.09", hdr.transfer);
+  return buf;
+}
+
+// The `"hdr"` object of one rgbs[] entry. Key order matches the JS writer's.
+std::string hdrJson(const HdrMeta& h){
+  std::string out="{\"bits\":10,\"transfer\":\"";
+  out += h.transfer==18 ? "hlg" : "pq"; out += "\"";
+  char buf[64];
+  if(h.maxCll){ snprintf(buf,sizeof buf,",\"maxCLL\":%d",h.maxCll); out+=buf; }
+  if(h.maxFall){ snprintf(buf,sizeof buf,",\"maxFALL\":%d",h.maxFall); out+=buf; }
+  if(h.hasMastering){
+    // %.17g round-trips an IEEE double exactly, as for quant near/far.
+    const std::pair<const char*,double> kv[]={{"rx",h.rx},{"ry",h.ry},{"gx",h.gx},{"gy",h.gy},
+      {"bx",h.bx},{"by",h.by},{"wx",h.wx},{"wy",h.wy},{"maxLum",h.lumMax},{"minLum",h.lumMin}};
+    out += ",\"mastering\":{";
+    for(size_t i=0;i<10;i++){
+      snprintf(buf,sizeof buf,"%s\"%s\":%.17g", i?",":"", kv[i].first, kv[i].second);
+      out += buf;
+    }
+    out += "}";
+  }
+  out += "}";
+  return out;
+}
+
 // `streaming` writes "frames":null,"streaming":true in place of a count, matching what the JS
 // stream muxer emits: when the header goes out the take has not happened yet, and a reader
 // recovers the count by counting blocks (see the note in dc_probe).
@@ -733,7 +820,8 @@ std::string quantJson(const SignalQuantMeta& q){
 // v3: the legacy `rgb` key stays, always describing the primary stream (== rgbs[0]) so pre-v3
 // readers decode it unchanged; `rgbs[]` names every stream and is what v3 readers use.
 std::string buildMetadataJson(int W,int H,int N,int fps,const std::vector<RgbMeta>& rgbs,
-                              const std::vector<SignalMeta>& signals, bool streaming=false){
+                              const std::vector<SignalMeta>& signals, bool streaming=false,
+                              const HdrMeta& hdr=HdrMeta{}){
   // Built with std::string throughout — the document grows with signal count and id length,
   // so a fixed stack buffer would silently truncate (and emit invalid JSON) past some size.
   std::string sigs="[";
@@ -751,13 +839,17 @@ std::string buildMetadataJson(int W,int H,int N,int fps,const std::vector<RgbMet
   sigs+="]";
   std::string rgb="null", rgbsJson;
   if(!rgbs.empty()){
-    char pb[64]; snprintf(pb,sizeof pb,"{\"track\":%d,\"codec\":\"vp09.00.10.08\"}", rgbs[0].track);
+    const std::string codec=rgbCodecString(hdr);
+    const std::string hdrObj=hdr.enabled ? hdrJson(hdr) : "";
+    char pb[80]; snprintf(pb,sizeof pb,"{\"track\":%d,\"codec\":\"%s\"}", rgbs[0].track, codec.c_str());
     rgb=pb;
     rgbsJson="[";
     for(size_t i=0;i<rgbs.size();i++){
       if(i) rgbsJson+=",";
-      char tb[48]; snprintf(tb,sizeof tb,"\",\"track\":%d,\"codec\":\"vp09.00.10.08\"}", rgbs[i].track);
+      char tb[80]; snprintf(tb,sizeof tb,"\",\"track\":%d,\"codec\":\"%s\"", rgbs[i].track, codec.c_str());
       rgbsJson += "{\"id\":\""; rgbsJson += jsonEscape(rgbs[i].id); rgbsJson += tb;
+      if(hdr.enabled){ rgbsJson += ",\"hdr\":"; rgbsJson += hdrObj; }
+      rgbsJson += "}";
     }
     rgbsJson+="]";
   }
@@ -791,12 +883,17 @@ std::vector<RgbMeta> planRgbTracks(const std::vector<RgbEncodeSpec>& specs){
 }
 
 // Container track descriptors for a plan. Shared by the batch and streaming builders, so both
-// name and number their tracks identically.
+// name and number their tracks identically. An enabled `hdr` puts a Colour element on every
+// RGB track; signal tracks never carry one (their "video" is packed data, not colour).
 std::vector<Track> tracksForPlan(const std::vector<SignalMeta>& sigMeta,
-                                 const std::vector<RgbMeta>& rgbs, int W, int H){
+                                 const std::vector<RgbMeta>& rgbs, int W, int H,
+                                 const HdrMeta& hdr=HdrMeta{}){
   std::vector<Track> tracks;
-  for(size_t i=0;i<rgbs.size();i++)
-    tracks.push_back({rgbs[i].track,"V_VP9", i==0?std::string("rgb"):"rgb-"+rgbs[i].id, W,H});
+  for(size_t i=0;i<rgbs.size();i++){
+    Track t{rgbs[i].track,"V_VP9", i==0?std::string("rgb"):"rgb-"+rgbs[i].id, W,H};
+    t.colour=hdr;
+    tracks.push_back(t);
+  }
   for(auto& sm : sigMeta){
     tracks.push_back({sm.track_hi,"V_VP9","signal-"+sm.id+"-hi",W,H});
     tracks.push_back({sm.track_lo,"V_VP9","signal-"+sm.id+"-lo",W,H});
@@ -869,6 +966,11 @@ enum DecStatus { DEC_OK=0, DEC_CODEC=1, DEC_GEOMETRY=2, DEC_CAPACITY=3 };
 bool imageMatches(const vpx_image_t* img, int W, int H){
   return img && img->fmt==VPX_IMG_FMT_I420 && (int)img->d_w==W && (int)img->d_h==H;
 }
+// The 10-bit HDR display track's counterpart: 16-bit I420 storage carrying 10-bit samples.
+bool imageMatches16(const vpx_image_t* img, int W, int H){
+  return img && img->fmt==VPX_IMG_FMT_I42016 && (int)img->d_w==W && (int)img->d_h==H
+      && img->bit_depth==10;
+}
 
 // Decode a VP9 track's packets (in order) → luma planes (W*H each), at most maxFrames of them.
 int decodePlaneTrack(std::vector<Frame>& frs, int W, int H, size_t maxFrames,
@@ -916,6 +1018,48 @@ void i420ToRGBA(const vpx_image_t* img, int W, int H, uint8_t* rgba){
     p[0]=clamp8(Y+1.5748*Cr); p[1]=clamp8(Y-0.1873*Cb-0.4681*Cr); p[2]=clamp8(Y+1.8556*Cb); p[3]=255; }
 }
 
+// ── 10-bit RGB ↔ 16-bit I420, BT.2020 non-constant luminance, broadcast range ──
+// The HDR10 convention: PQ/HLG-encoded 10-bit display codes (0..1023), YCbCr with BT.2020
+// coefficients (Kr 0.2627, Kb 0.0593), limited-range quantization (Y 64..940, C 64..960).
+// Both range and colour space are also signalled in the bitstream and the container's Colour
+// element, so a player reconstructs exactly these codes.
+inline uint16_t clamp10(double v){ return (uint16_t)(v<0?0:(v>1023?1023:v+0.5)); }
+
+void rgba16ToI42016(const uint16_t* rgba, int W, int H, vpx_image_t* img){
+  auto ey=[](double R,double G,double B){ return (0.2627*R+0.6780*G+0.0593*B)/1023.0; };
+  uint16_t* yp=(uint16_t*)img->planes[0]; int ys=img->stride[0]/2;
+  for(int r=0;r<H;r++) for(int c=0;c<W;c++){
+    const uint16_t* p=rgba+((size_t)r*W+c)*4;
+    double R=p[0]>1023?1023:p[0], G=p[1]>1023?1023:p[1], B=p[2]>1023?1023:p[2];
+    yp[r*ys+c]=clamp10(64.0+876.0*ey(R,G,B));
+  }
+  int cW=(W+1)/2, cH=(H+1)/2;
+  uint16_t* up=(uint16_t*)img->planes[1]; int us=img->stride[1]/2;
+  uint16_t* vp=(uint16_t*)img->planes[2]; int vs=img->stride[2]/2;
+  for(int r=0;r<cH;r++) for(int c=0;c<cW;c++){
+    int r0=r*2,c0=c*2,r1=(r0+1<H)?r0+1:r0,c1=(c0+1<W)?c0+1:c0; double R=0,G=0,B=0;
+    int pts[4][2]={{r0,c0},{r0,c1},{r1,c0},{r1,c1}};
+    for(auto&t:pts){ const uint16_t* p=rgba+((size_t)t[0]*W+t[1])*4;
+      R+=p[0]>1023?1023:p[0]; G+=p[1]>1023?1023:p[1]; B+=p[2]>1023?1023:p[2]; }
+    R/=4;G/=4;B/=4; double Ey=ey(R,G,B);
+    up[r*us+c]=clamp10(512.0+896.0*(B/1023.0-Ey)/1.8814);
+    vp[r*vs+c]=clamp10(512.0+896.0*(R/1023.0-Ey)/1.4746);
+  }
+}
+void i42016ToRGBA16(const vpx_image_t* img, int W, int H, uint16_t* rgba){
+  const uint16_t* yp=(const uint16_t*)img->planes[0]; int ys=img->stride[0]/2;
+  const uint16_t* up=(const uint16_t*)img->planes[1]; int us=img->stride[1]/2;
+  const uint16_t* vp=(const uint16_t*)img->planes[2]; int vs=img->stride[2]/2;
+  for(int r=0;r<H;r++) for(int c=0;c<W;c++){
+    double Ey=((double)yp[r*ys+c]-64.0)/876.0;
+    double Cb=((double)up[(r/2)*us+(c/2)]-512.0)/896.0;
+    double Cr=((double)vp[(r/2)*vs+(c/2)]-512.0)/896.0;
+    double Bn=Ey+1.8814*Cb, Rn=Ey+1.4746*Cr;
+    double Gn=(Ey-0.2627*Rn-0.0593*Bn)/0.6780;
+    uint16_t* p=rgba+((size_t)r*W+c)*4;
+    p[0]=clamp10(Rn*1023.0); p[1]=clamp10(Gn*1023.0); p[2]=clamp10(Bn*1023.0); p[3]=1023; }
+}
+
 // ── one VP9 track encoder, held open across frames ──
 // Both the batch helpers below and the streaming ABI drive this; the difference is only how long
 // it lives. Kept open for the length of a recording, it is what lets a frame's blocks be emitted
@@ -928,7 +1072,7 @@ void i420ToRGBA(const vpx_image_t* img, int W, int H, uint8_t* rgba){
 struct TrackEncoder {
   vpx_codec_ctx_t ctx{};
   vpx_image_t img{};
-  bool haveCtx=false, haveImg=false, rgba=false;
+  bool haveCtx=false, haveImg=false, rgba=false, hdr10=false;
   int W=0, H=0;
   int keyEvery=0;      // force a keyframe every N frames; 0 = only the first frame
   int64_t pushed=0;    // frames handed to libvpx, including the terminating flush
@@ -938,12 +1082,20 @@ struct TrackEncoder {
   TrackEncoder& operator=(const TrackEncoder&)=delete;
   ~TrackEncoder(){ if(haveImg) vpx_img_free(&img); if(haveCtx) vpx_codec_destroy(&ctx); }
 
-  EncStatus init(int W_, int H_, int fps, bool lossless, int kbps, int keyEvery_){
-    W=W_; H=H_; rgba=!lossless; keyEvery=keyEvery_;
+  EncStatus init(int W_, int H_, int fps, bool lossless, int kbps, int keyEvery_, bool hdr10_=false){
+    W=W_; H=H_; rgba=!lossless; keyEvery=keyEvery_; hdr10=hdr10_;
     vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
     vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return ENC_FAIL;
     cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps;
     cfg.g_profile=0; cfg.g_lag_in_frames=0; cfg.kf_mode=VPX_KF_DISABLED;
+    if(hdr10){
+      // VP9 profile 2: 10-bit samples in 16-bit I420 storage. The init flag is required —
+      // without it libvpx rejects a high-bit-depth config outright, which is also the failure
+      // mode on a libvpx built without --enable-vp9-highbitdepth (reported as ENC_FAIL).
+      cfg.g_profile=2;
+      cfg.g_bit_depth=VPX_BITS_10;
+      cfg.g_input_bit_depth=10;
+    }
     // Row multithreading, below. Four threads is where this plateaus for the small
     // frames here (256x192): 2 threads 53.3 ms, 4 threads 51.0, 8 threads 51.1.
     // Encoders run one at a time on the write queue, so they do not contend.
@@ -959,7 +1111,7 @@ struct TrackEncoder {
     }else{
       cfg.rc_end_usage=VPX_VBR; cfg.rc_target_bitrate=kbps;
     }
-    if(vpx_codec_enc_init(&ctx,iface,&cfg,0)) return ENC_FAIL;
+    if(vpx_codec_enc_init(&ctx,iface,&cfg, hdr10?VPX_CODEC_USE_HIGHBITDEPTH:0)) return ENC_FAIL;
     haveCtx=true;
     if(lossless){
       // Gate on the lossless control: an old or misbuilt libvpx that rejects it would encode the
@@ -981,9 +1133,12 @@ struct TrackEncoder {
       // colour reference beside bit-exact depth, so the milliseconds win. Past 4 is
       // pointless — cpu-used=6 measured both slower and worse.
       vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 4);
-      vpx_codec_control(&ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
+      vpx_codec_control(&ctx, VP9E_SET_COLOR_SPACE, hdr10?VPX_CS_BT_2020:VPX_CS_BT_709);
     }
-    vpx_codec_control(&ctx, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
+    // SDR/signal tracks are full-range on purpose (packed luma must not be rescaled); the HDR
+    // display track follows the HDR10 broadcast-range convention instead, and says so both here
+    // (bitstream) and in the container's Colour element.
+    vpx_codec_control(&ctx, VP9E_SET_COLOR_RANGE, hdr10?VPX_CR_STUDIO_RANGE:VPX_CR_FULL_RANGE);
     // On failure vpx_img_alloc returns NULL and leaves img.planes unset — the copy below would
     // then memcpy through wild pointers.
     // g_threads alone buys nothing (59.5 -> 58.7 ms): VP9 only spreads work across
@@ -991,9 +1146,11 @@ struct TrackEncoder {
     // a 256-wide frame cannot give more than one of. Row-mt is width-independent
     // and is the whole gain: 59.5 -> 51.0 ms, identical bytes, still bit-exact.
     vpx_codec_control(&ctx, VP9E_SET_ROW_MT, 1);
-    if(!vpx_img_alloc(&img, VPX_IMG_FMT_I420, W, H, 1)) return ENC_FAIL;
+    if(!vpx_img_alloc(&img, hdr10?VPX_IMG_FMT_I42016:VPX_IMG_FMT_I420, W, H, 1)) return ENC_FAIL;
     haveImg=true;
-    img.cs = VPX_CS_BT_709; img.range = VPX_CR_FULL_RANGE;
+    img.cs = hdr10?VPX_CS_BT_2020:VPX_CS_BT_709;
+    img.range = hdr10?VPX_CR_STUDIO_RANGE:VPX_CR_FULL_RANGE;
+    if(hdr10) img.bit_depth = 10;
     return ENC_OK;
   }
 
@@ -1001,11 +1158,15 @@ struct TrackEncoder {
    * Encode one frame, or flush the encoder when `src` is NULL. Appends whatever packets libvpx
    * hands back — with g_lag_in_frames=0 that is exactly one per frame, which is what keeps every
    * track of a streamed recording in lockstep.
+   *
+   * An hdr10 track's `src` is really `const uint16_t*` (W*H*4 samples of 10-bit RGBA codes),
+   * passed through the same byte-pointer plumbing every slot shares.
    */
   bool encode(const uint8_t* src, std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
     vpx_image_t* in=nullptr;
     if(src){
-      if(rgba) rgbaToI420(src, W, H, &img);
+      if(rgba && hdr10) rgba16ToI42016((const uint16_t*)src, W, H, &img);
+      else if(rgba) rgbaToI420(src, W, H, &img);
       else{
         for(int r=0;r<H;r++) memcpy(img.planes[0]+r*img.stride[0], src+(size_t)r*W, W);
         for(int p=1;p<3;p++) for(int r=0;r<(H+1)/2;r++) memset(img.planes[p]+r*img.stride[p],128,(W+1)/2);
@@ -1036,10 +1197,11 @@ EncStatus encodePlaneSeq(const std::vector<const uint8_t*>& planes, int W, int H
 }
 
 // Lossy VP9 RGB track (~1s keyframe interval → seekable RGB via Cues, matching the browser path).
+// `hdr10` selects the profile-2 path, where each plane pointer is really `const uint16_t*`.
 bool encodeRGBSeq(const std::vector<const uint8_t*>& rgba, int W, int H, int fps, int kbps,
-                  std::vector<Bytes>& outFrames, std::vector<bool>& outKey){
+                  std::vector<Bytes>& outFrames, std::vector<bool>& outKey, bool hdr10=false){
   TrackEncoder te;
-  if(te.init(W,H,fps,/*lossless=*/false,kbps,/*keyEvery=*/fps>0?fps:30)) return false;
+  if(te.init(W,H,fps,/*lossless=*/false,kbps,/*keyEvery=*/fps>0?fps:30,hdr10)) return false;
   for(size_t i=0;i<=rgba.size();i++)
     if(!te.encode(i<rgba.size()?rgba[i]:nullptr, outFrames, outKey)) return false;
   return true;
@@ -1058,16 +1220,33 @@ int decodeRGBTrack(std::vector<Frame>& frs, int W, int H, size_t maxFrames, std:
     if(st) break; }
   vpx_codec_destroy(&c); return st;
 }
+// 10-bit variant: each output Bytes is W*H*4 uint16 samples (10-bit codes).
+int decodeRGBTrack16(std::vector<Frame>& frs, int W, int H, size_t maxFrames, std::vector<Bytes>& out){
+  std::stable_sort(frs.begin(),frs.end(),[](const Frame&a,const Frame&b){return a.timeMs<b.timeMs;});
+  vpx_codec_ctx_t c{}; if(vpx_codec_dec_init(&c,vpx_codec_vp9_dx(),nullptr,0)) return DEC_CODEC;
+  int st=DEC_OK;
+  for(auto& f : frs){ if(vpx_codec_decode(&c,f.data,(unsigned)f.len,nullptr,0)){ st=DEC_CODEC; break; }
+    vpx_image_t* img; vpx_codec_iter_t it=nullptr;
+    while((img=vpx_codec_get_frame(&c,&it))){
+      if(!imageMatches16(img,W,H)){ st=DEC_GEOMETRY; break; }
+      if(out.size()>=maxFrames){ st=DEC_CAPACITY; break; }
+      Bytes rgba((size_t)W*H*4*2); i42016ToRGBA16(img,W,H,(uint16_t*)rgba.data()); out.push_back(std::move(rgba)); }
+    if(st) break; }
+  vpx_codec_destroy(&c); return st;
+}
 
-// Build a full file from any number of RGB streams and lossless signals.
+// Build a full file from any number of RGB streams and lossless signals. An enabled `hdr`
+// makes every RGB stream a 10-bit profile-2 track whose `rgbas` pointers are really
+// `const uint16_t*` planes of 10-bit codes.
 int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>& rgbSpecs,
                    const std::vector<SignalEncodeSpec>& specs,
-                   int W, int H, int N, int fps, Bytes& file){
+                   int W, int H, int N, int fps, Bytes& file, const HdrMeta& hdr=HdrMeta{}){
   if(specs.empty() && rgbSpecs.empty()) return 1;
   if(!rgbSpecs.empty() && !rgbas) return 1;
   if(!dimsUsable(W,H) || N<=0 || fps<=0) return 1;
-  // Guard the per-frame strides used below ((size_t)i*W*H*4) against wrapping.
-  if((size_t)N > SIZE_MAX/((size_t)W*(size_t)H*4)) return 1;
+  const size_t rgbFrameBytes=(size_t)W*(size_t)H*4*(hdr.enabled?2:1);
+  // Guard the per-frame strides used below against wrapping.
+  if((size_t)N > SIZE_MAX/rgbFrameBytes) return 1;
   std::vector<Frame> frames;
   auto rgbMeta=planRgbTracks(rgbSpecs);
   auto sigMeta=planSignalTracks(specs, rgbSpecs.size());
@@ -1075,9 +1254,9 @@ int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>
   std::vector<RgbEnc> rgbEnc(rgbSpecs.size());
   for(size_t ri=0; ri<rgbSpecs.size(); ri++){
     if(!rgbas[ri]) return 1;
-    std::vector<const uint8_t*> p(N); for(int i=0;i<N;i++) p[i]=rgbas[ri]+(size_t)i*W*H*4;
+    std::vector<const uint8_t*> p(N); for(int i=0;i<N;i++) p[i]=rgbas[ri]+(size_t)i*rgbFrameBytes;
     int kbps=rgbSpecs[ri].kbps;
-    if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbEnc[ri].F,rgbEnc[ri].K)) return 2;
+    if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbEnc[ri].F,rgbEnc[ri].K,hdr.enabled)) return 2;
     if((int)rgbEnc[ri].F.size()!=N) return 6;
   }
   size_t px=(size_t)W*(size_t)H;
@@ -1107,8 +1286,8 @@ int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>
     }
   }
   int durationMs = (int)llround(N * 1000.0 / (fps>0?fps:30));
-  file = mux(tracksForPlan(sigMeta, rgbMeta, W, H), frames,
-             buildMetadataJson(W,H,N,fps,rgbMeta,sigMeta), durationMs);
+  file = mux(tracksForPlan(sigMeta, rgbMeta, W, H, hdr), frames,
+             buildMetadataJson(W,H,N,fps,rgbMeta,sigMeta,/*streaming=*/false,hdr), durationMs);
   return 0;
 }
 // Every dc_* entry point allocates (std::vector/std::string sized from file or caller-supplied
@@ -1140,6 +1319,7 @@ struct dc_stream_encoder {
   };
   int W=0, H=0, fps=30;
   bool finished=false;
+  HdrMeta hdr;                    // enabled ⇒ every RGB slot is the 10-bit profile-2 track
   std::vector<RgbMeta> rgbMeta;   // every RGB stream, primary first (empty = no RGB)
   std::vector<SignalMeta> sigMeta;
   std::vector<Slot> slots;
@@ -1251,33 +1431,66 @@ static int decStatusToRc(int st, int codecErr){
   }
 }
 
+// Shared stream lookup for the RGB decode entry points. Returns 0 and fills track/bits, or the
+// caller's error code. `want10` selects which bit depth the caller's buffer can hold; the
+// opposite depth is error 7 — a 10-bit code does not fit uint8, and silently truncating would
+// corrupt the one track that exists to be looked at.
+static int findRgbStream(const Demuxed& d, const FileMeta& meta, const char* rgb_id, bool want10,
+                         int& track){
+  if(!meta.has_rgb) return rgb_id ? 8 : 6;   // structural, not a `"rgb":null` substring search
+  const RgbMeta* found=nullptr;
+  if(!rgb_id){
+    found=&meta.rgbs[0];
+  }else{
+    for(auto& r:meta.rgbs) if(r.id==rgb_id){ found=&r; break; }
+    if(!found) return 8;
+  }
+  if((found->bits==10) != want10) return 7;
+  track=found->track;
+  if(!rgb_id){
+    // Primary stream. The container name is what pre-multi-RGB files were always resolved by,
+    // so it stays authoritative when present; the metadata's rgbs[0] covers files without it.
+    for(auto& t:d.tracks) if(t.name=="rgb") track=t.number;
+  }
+  return 0;
+}
+
 int dc_decode_rgb_id(const uint8_t* webm, size_t len, const char* rgb_id,
                      uint8_t* rgba_out, size_t rgba_cap){
   if(!webm || !len || !rgba_out) return 1;
   return guard([&]{
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
   FileMeta meta=parseMetadata(d.metadata);   // reads the keys once, with defaults when absent
-  if(!meta.has_rgb) return rgb_id ? 8 : 6;   // structural, not a `"rgb":null` substring search
+  int rgbTrack=0;
+  if(int rc=findRgbStream(d,meta,rgb_id,/*want10=*/false,rgbTrack)) return rc;
   int W=meta.width, H=meta.height;
   if(!dimsUsable(W,H)) return 2;
   size_t frameBytes=(size_t)W*H*4;
-  int rgbTrack;
-  if(!rgb_id){
-    // Primary stream. The container name is what pre-multi-RGB files were always resolved by,
-    // so it stays authoritative when present; the metadata's rgbs[0] covers files without it.
-    rgbTrack=meta.rgbs[0].track;
-    for(auto& t:d.tracks) if(t.name=="rgb") rgbTrack=t.number;
-  }else{
-    const RgbMeta* found=nullptr;
-    for(auto& r:meta.rgbs) if(r.id==rgb_id){ found=&r; break; }
-    if(!found) return 8;
-    rgbTrack=found->track;
-  }
   std::vector<Frame> frs; for(auto& f:d.frames) if(f.track==rgbTrack) frs.push_back(f);
   std::vector<Bytes> planes;
   int st=decodeRGBTrack(frs,W,H,rgba_cap/frameBytes,planes);
   if(st) return decStatusToRc(st,3);
   for(size_t i=0;i<planes.size();i++) memcpy(rgba_out+i*frameBytes, planes[i].data(), frameBytes);
+  return 0;
+  });
+}
+
+int dc_decode_rgb16(const uint8_t* webm, size_t len, const char* rgb_id,
+                    uint16_t* out, size_t out_cap){
+  if(!webm || !len || !out) return 1;
+  return guard([&]{
+  Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
+  FileMeta meta=parseMetadata(d.metadata);
+  int rgbTrack=0;
+  if(int rc=findRgbStream(d,meta,rgb_id,/*want10=*/true,rgbTrack)) return rc;
+  int W=meta.width, H=meta.height;
+  if(!dimsUsable(W,H)) return 2;
+  size_t frameElems=(size_t)W*H*4;
+  std::vector<Frame> frs; for(auto& f:d.frames) if(f.track==rgbTrack) frs.push_back(f);
+  std::vector<Bytes> planes;   // each W*H*4 uint16 samples
+  int st=decodeRGBTrack16(frs,W,H,out_cap/frameElems,planes);
+  if(st) return decStatusToRc(st,3);
+  for(size_t i=0;i<planes.size();i++) memcpy(out+i*frameElems, planes[i].data(), frameElems*2);
   return 0;
   });
 }
@@ -1408,6 +1621,49 @@ int dc_encode_multi2(const uint8_t* const* rgbas,
   });
 }
 
+// Validate and widen the ABI's hdr description. False = unusable (error 1 at the caller).
+static bool hdrFromAbi(const dc_hdr_meta_t* in, HdrMeta& out){
+  if(!in) return false;
+  if(in->transfer!=16 && in->transfer!=18) return false;
+  out.enabled=true;
+  out.transfer=in->transfer;
+  out.maxCll=in->max_cll>0?in->max_cll:0;
+  out.maxFall=in->max_fall>0?in->max_fall:0;
+  if(in->has_mastering){
+    out.hasMastering=true;
+    out.rx=in->rx; out.ry=in->ry; out.gx=in->gx; out.gy=in->gy; out.bx=in->bx; out.by=in->by;
+    out.wx=in->wx; out.wy=in->wy; out.lumMax=in->luminance_max; out.lumMin=in->luminance_min;
+  }
+  return true;
+}
+
+int dc_encode_multi_hdr(const uint16_t* const* rgbas,
+                        const dc_rgb_spec_t* rgbs, int num_rgbs,
+                        const dc_hdr_meta_t* hdr,
+                        const dc_signal_spec2_t* signals, int num_signals,
+                        int W, int H, int N, int fps,
+                        uint8_t** out, size_t* out_len){
+  if(!out || !out_len || N<=0 || fps<=0 || !dimsUsable(W,H)) return 1;
+  if(num_rgbs<=0 || !rgbas) return 1;      // HDR describes the display track; there must be one
+  if(num_signals>0 && !signals) return 1;
+  return guard([&]{
+  HdrMeta h;
+  if(!hdrFromAbi(hdr,h)) return 1;
+  std::vector<RgbEncodeSpec> rgbSpecs;
+  if(!normalizeRgbSpecs(rgbs, num_rgbs, rgbSpecs)) return 1;
+  std::vector<SignalEncodeSpec> specs;
+  for(int i=0;i<num_signals;i++){
+    if(!signals[i].id || !signals[i].data) return 1;
+    SignalEncodeSpec s; signalSpecFrom2(signals[i], s);
+    specs.push_back(s);
+  }
+  Bytes file;
+  int rc=buildFileMulti((const uint8_t* const*)rgbas, rgbSpecs, specs, W, H, N, fps, file, h);
+  if(rc) return rc;
+  return finish(file, out, out_len);
+  });
+}
+
 int dc_encode_multi(const uint8_t* rgba, int rgb_kbps,
                     const dc_signal_spec_t* signals, int num_signals,
                     int W, int H, int N, int fps,
@@ -1456,8 +1712,8 @@ int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb, int em
   });
 }
 
-int dc_stream_create2(int W, int H, int fps,
-                     const dc_rgb_spec_t* rgbs, int num_rgbs, int emit_cues,
+static int streamCreateImpl(int W, int H, int fps,
+                     const dc_rgb_spec_t* rgbs, int num_rgbs, const HdrMeta& hdr, int emit_cues,
                      const dc_signal_spec2_t* signals, int num_signals,
                      const char* text_track_name,
                      dc_stream_encoder_t** out){
@@ -1475,13 +1731,13 @@ int dc_stream_create2(int W, int H, int fps,
     specs.push_back(s);
   }
   std::unique_ptr<dc_stream_encoder> h(new dc_stream_encoder());
-  h->W=W; h->H=H; h->fps=fps;
+  h->W=W; h->H=H; h->fps=fps; h->hdr=hdr;
   h->rgbMeta=planRgbTracks(rgbSpecs);
   h->sigMeta=planSignalTracks(specs, rgbSpecs.size());
   for(size_t i=0;i<rgbSpecs.size();i++){
     auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
     int kbps=rgbSpecs[i].kbps;
-    if(enc->init(W,H,fps,/*lossless=*/false,kbps?kbps:2000,/*keyEvery=*/fps)) return 2;
+    if(enc->init(W,H,fps,/*lossless=*/false,kbps?kbps:2000,/*keyEvery=*/fps,hdr.enabled)) return 2;
     h->slots.push_back({h->rgbMeta[i].track, std::move(enc), 0});
   }
   for(auto& sm : h->sigMeta){
@@ -1498,7 +1754,7 @@ int dc_stream_create2(int W, int H, int fps,
   // 30 seconds of blocks open, would defeat the point of streaming.
   h->mux.clusterSpanMs=1000;
   h->mux.emitCues=emit_cues!=0;
-  std::vector<Track> tracks = tracksForPlan(h->sigMeta, h->rgbMeta, W, H);
+  std::vector<Track> tracks = tracksForPlan(h->sigMeta, h->rgbMeta, W, H, hdr);
   if(text_track_name && *text_track_name){
     int next = 1; for(auto& t : tracks) next = std::max(next, t.number+1);
     // Appended last so existing track numbers are unchanged, and typed subtitle so
@@ -1512,10 +1768,32 @@ int dc_stream_create2(int W, int H, int fps,
     h->textTrack = next;
   }
   h->mux.start(tracks,
-               buildMetadataJson(W,H,0,fps,h->rgbMeta,h->sigMeta,/*streaming=*/true));
+               buildMetadataJson(W,H,0,fps,h->rgbMeta,h->sigMeta,/*streaming=*/true,hdr));
   *out=h.release();
   return 0;
   });
+}
+
+int dc_stream_create2(int W, int H, int fps,
+                     const dc_rgb_spec_t* rgbs, int num_rgbs, int emit_cues,
+                     const dc_signal_spec2_t* signals, int num_signals,
+                     const char* text_track_name,
+                     dc_stream_encoder_t** out){
+  return streamCreateImpl(W,H,fps,rgbs,num_rgbs,HdrMeta{},emit_cues,
+                          signals,num_signals,text_track_name,out);
+}
+
+int dc_stream_create_hdr(int W, int H, int fps,
+                         const dc_rgb_spec_t* rgbs, int num_rgbs,
+                         const dc_hdr_meta_t* hdr, int emit_cues,
+                         const dc_signal_spec2_t* signals, int num_signals,
+                         const char* text_track_name,
+                         dc_stream_encoder_t** out){
+  HdrMeta h;
+  if(!hdrFromAbi(hdr,h)) return 1;
+  if(num_rgbs<=0) return 1;   // HDR describes the display track; there must be one
+  return streamCreateImpl(W,H,fps,rgbs,num_rgbs,h,emit_cues,
+                          signals,num_signals,text_track_name,out);
 }
 
 int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len){
@@ -1534,9 +1812,11 @@ int dc_stream_add_text(dc_stream_encoder_t* enc, int timestamp_ms, int duration_
   });
 }
 
-int dc_stream_add_frame2(dc_stream_encoder_t* enc, const uint8_t* const* rgbas,
-                         const uint16_t* const* signal_planes,
-                         uint8_t** out, size_t* out_len){
+// Shared body of the 8- and 16-bit add_frame forms; the caller has already checked that its
+// bit depth matches the encoder's, so `rgbas` pointers are whatever the slots expect.
+static int streamAddFrameImpl(dc_stream_encoder_t* enc, const uint8_t* const* rgbas,
+                              const uint16_t* const* signal_planes,
+                              uint8_t** out, size_t* out_len){
   if(!enc || !out || !out_len) return 1;
   if(enc->finished) return 6;
   // RGB presence is frozen by the track plan in the header that has already gone out, so a frame
@@ -1550,6 +1830,24 @@ int dc_stream_add_frame2(dc_stream_encoder_t* enc, const uint8_t* const* rgbas,
   if(int rc=enc->round(rgbas, signal_planes, chunk)) return rc;
   return emitChunk(chunk, out, out_len);
   });
+}
+
+int dc_stream_add_frame2(dc_stream_encoder_t* enc, const uint8_t* const* rgbas,
+                         const uint16_t* const* signal_planes,
+                         uint8_t** out, size_t* out_len){
+  if(!enc) return 1;
+  // The bit depth was fixed by the header: an HDR encoder's RGB slots read uint16 planes, so an
+  // 8-bit frame here would be reinterpreted, not converted.
+  if(enc->hdr.enabled && !enc->rgbMeta.empty()) return 1;
+  return streamAddFrameImpl(enc, rgbas, signal_planes, out, out_len);
+}
+
+int dc_stream_add_frame16(dc_stream_encoder_t* enc, const uint16_t* const* rgbas,
+                          const uint16_t* const* signal_planes,
+                          uint8_t** out, size_t* out_len){
+  if(!enc) return 1;
+  if(!enc->hdr.enabled) return 1;
+  return streamAddFrameImpl(enc, (const uint8_t* const*)rgbas, signal_planes, out, out_len);
 }
 
 int dc_stream_add_frame(dc_stream_encoder_t* enc, const uint8_t* rgba,

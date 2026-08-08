@@ -4,6 +4,45 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.8.0 — 2026-08-08
+
+### Added — HDR10/HLG display track: VP9 profile 2 + WebM Colour signalling — #51
+
+The lossy display track can now be HDR: **VP9 profile 2, 10-bit, BT.2020
+non-constant-luminance, broadcast range**, with the part that actually makes a
+player treat it as HDR — the WebM **`Colour`** element (`TransferCharacteristics`
+PQ 16 / HLG 18, `Primaries` 9, `MatrixCoefficients` 9, `Range`, optional
+`MaxCLL`/`MaxFALL` and ST 2086 `MasteringMetadata`) — written by **both** muxers,
+byte-identically. The metadata's rgbs entries carry the full WebCodecs codec
+string (`vp09.02.10.10.01.09.16.09`) plus an `"hdr"` object mirroring the Colour
+element. HDR applies to all of a file's RGB streams; pixels cross every API as
+uint16 planes of 10-bit display codes (0..1023). Scene-referred HDR is
+explicitly not this — scene-linear data belongs in the lossless signal tracks.
+
+- **C ABI**: `dc_hdr_meta_t`, `dc_encode_multi_hdr`, `dc_stream_create_hdr`,
+  `dc_stream_add_frame16`, `dc_decode_rgb16`. The 8-bit and 10-bit forms refuse
+  each other's streams (decode error 7) instead of truncating or reinterpreting.
+- **Python**: `encode(..., hdr={'transfer': 'pq', 'max_cll', 'max_fall',
+  'mastering'})`, `create_encoder(hdr=...)`; `decode_rgb`/`decode()` return
+  uint16 codes for HDR streams automatically, uint8 for SDR as before.
+- **JS**: the muxer/demuxer in `src/webm.js` read and write the Colour element
+  (byte-compatible with the C muxer); the decoder reads HDR files — signals and
+  SDR streams decode, HDR RGB streams are skipped (no 10-bit WebCodecs output
+  path yet) with their metadata exposed; `createEncoder({ hdr })` throws rather
+  than writing 8-bit data under an HDR label. Browsers play HDR files natively
+  in `<video>`, which is the display track's job.
+
+### Compatibility
+
+SDR files are byte-unchanged (no Colour element, same codec string). HDR files
+are a new capability: pre-0.8.0 readers fail loudly on the profile-2 stream
+(geometry error) rather than mis-decoding it; their signals still decode.
+Verified in Chrome 148: `mediaCapabilities.decodingInfo` reports the exact
+HDR10 configuration supported/smooth/power-efficient, and a `VideoDecoder`
+configured from the file's own codec string decodes every packet. Interactive
+HDR-display rendering (and Safari, where VP9 support is narrower) still wants a
+human eye — see #51.
+
 ## 0.7.0 — 2026-08-08
 
 ### Added — multiple RGB tracks (stereo / multi-camera) — #47
