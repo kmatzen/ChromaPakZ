@@ -6,6 +6,34 @@ registry means the same commit on the other.
 
 ## Unreleased
 
+### Changed — the batch encoder runs its tracks concurrently — #59
+
+`buildFileMulti` encoded each track in turn: RGB, then every signal's high plane,
+then its low plane. The streaming path was made concurrent when multi-track
+landed; the batch path was not, and it is the one every converter uses.
+
+The tracks were already independent — separate VP9 contexts writing separate
+buffers — so this is a scheduling change, not a rewrite. Packing moved ahead of
+the encodes, which is what the streaming path also had to do: a shared hi/lo
+scratch pair is exactly what forces encodes to be serial.
+
+Lossless coding dominates, which is why it pays. At 752x480 with RGB + depth:
+RGB 8.7 ms/frame, depth 82.5 ms, total 91.2 ms.
+
+|      size | before | after |
+|-----------|--------|-------|
+|   256x192 |  20.1  | 13.0  |
+|   752x480 |  90.4  | 59.9  |
+|  1280x720 | 166.1  | 126.8 |
+
+End to end on a real TUM `freiburg1_desk` conversion: 106 s -> 87 s.
+
+Output is **byte-identical** — same sha256 on a two-signal file, and the TUM
+conversions above compare equal byte for byte. Only the scheduling changed.
+
+A file with no lossless signal gains little (real EuRoC stereo: 26 s -> 25 s),
+since lossy RGB was never the expensive part.
+
 ### Fixed — a partial decode sized its buffers from the header — #57
 
 Cluster independence (#45) exists so a caller can splice one Cluster onto a
