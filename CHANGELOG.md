@@ -4,7 +4,20 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
-## Unreleased
+## 0.9.0 — 2026-08-09
+
+Two changes to how the batch path behaves, neither of which alters a byte of
+output for a whole-file encode or decode.
+
+`decode()` now sizes its buffers from the data rather than the header, so a
+partial decode returns the frames it actually decoded instead of a
+whole-sequence array padded with black ones — and costs 14.7 MB per Cluster
+where it cost 277 MB. New `frames_present(data)` answers "how many frames are in
+these bytes", which `probe()["frames"]` deliberately does not.
+
+The batch encoder runs its tracks concurrently, as the streaming path already
+did: 1.3-1.5x faster wherever a lossless signal is present, byte-identical
+output.
 
 ### Changed — the batch encoder runs its tracks concurrently — #59
 
