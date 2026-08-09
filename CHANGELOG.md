@@ -4,6 +4,36 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## Unreleased
+
+### Fixed — a partial decode sized its buffers from the header — #57
+
+Cluster independence (#45) exists so a caller can splice one Cluster onto a
+file's header and decode just that. `probe()["frames"]` reports what the header
+*declares* — the whole sequence — and the decoders sized their output from it,
+with two consequences. The second is the sharper one:
+
+- Every partial decode allocated for the entire sequence: **277 MB per Cluster**
+  on a 600-frame 320x240 file with depth, against **14.7 MB** now. Fetching a
+  single frame cost 279 MB and now costs 16.4 MB.
+- The returned array was padded with zeroed frames that were never decoded, and
+  nothing distinguished them from genuinely black ones. Splicing one 30-frame
+  Cluster of a 600-frame file returned 600 rows, 570 of them silently black. A
+  caller who did not already know the Cluster's count could not tell.
+
+Buffers are now sized by counting the blocks actually present, clamped to what
+the header declares so a file carrying *more* blocks than it claims behaves as
+before. `decode()["frames"]` reports what came back, so it always equals
+`len(result["rgb"])`; `metadata` still carries the declared length.
+
+`probe()["frames"]` is unchanged and still reports the header's value — that is
+the sequence's declared length, and a partial decode legitimately differs from
+it. New `frames_present(data)` answers the other question. Counting costs a walk
+of the Cluster headers: ~4 ms on a 13 MB 600-frame file, against a decode of the
+same file measured in seconds.
+
+Whole-file decode is unaffected: same rows, same bytes, same peak.
+
 ## 0.8.0 — 2026-08-08
 
 ### Added — HDR10/HLG display track: VP9 profile 2 + WebM Colour signalling — #51

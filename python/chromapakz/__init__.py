@@ -903,10 +903,48 @@ def _out_buffer(shape, dtype):
     return np.zeros(shape, dtype=dtype)
 
 
-def decode_signal(data, signal_id):
-    """Decode one signal by id to (N, H, W) uint16."""
+def frames_present(data):
+    """How many frames the file actually carries.
+
+    ``probe()["frames"]`` reports what the header *declares*, which is the
+    sequence's length. That is not the same number when the bytes hold a subset
+    of it — most often a single Cluster spliced onto its header, which is how
+    partial decode works (cluster independence, #45). Sizing output buffers from
+    the declared length then allocates for the whole sequence and pads the
+    result with frames that were never decoded, and a caller cannot tell those
+    from genuinely black ones.
+
+    Counting blocks costs a walk of the Cluster headers: ~4 ms on a 13 MB
+    600-frame file, against a decode of the same file measured in seconds.
+    """
+    from .webm_inspect import track_sizes          # local: keeps import cost off the hot path
+
+    counts = [t["frames"] for t in track_sizes(data).values() if t["frames"]]
+    return max(counts) if counts else 0
+
+
+def _decode_frames(info, data, n_frames=None):
+    """Rows to allocate: what is present, never more than the header declares.
+
+    A file carrying *more* blocks than its header claims is malformed in the
+    other direction; clamping keeps that case behaving as it did rather than
+    trusting the larger number.
+    """
+    if n_frames is not None:
+        return n_frames
+    present = frames_present(data)
+    return min(info["frames"], present) if present else info["frames"]
+
+
+def decode_signal(data, signal_id, _n_frames=None):
+    """Decode one signal by id to (N, H, W) uint16.
+
+    N is the number of frames the data carries, which for a partial decode is
+    fewer than ``probe()["frames"]``.
+    """
     info = probe(data)
-    N, H, W = info["frames"], info["height"], info["width"]
+    N = _decode_frames(info, data, _n_frames)
+    H, W = info["height"], info["width"]
     out = _out_buffer((N, H, W), np.uint16)
     buf = _buf(data)
     sid = signal_id.encode("utf-8")
@@ -916,7 +954,7 @@ def decode_signal(data, signal_id):
     return out
 
 
-def decode_rgb(data, stream=None):
+def decode_rgb(data, stream=None, _n_frames=None):
     """Decode one RGB stream to a (N, H, W, 4) RGBA array.
 
     ``stream`` is the stream id of a multi-camera (v3) file; None means the primary stream —
@@ -925,7 +963,8 @@ def decode_rgb(data, stream=None):
     info = probe(data)
     if not info["has_rgb"]:
         raise RuntimeError("file has no RGB track")
-    N, H, W = info["frames"], info["height"], info["width"]
+    N = _decode_frames(info, data, _n_frames)
+    H, W = info["height"], info["width"]
     entry = (info["rgbs"][0] if stream is None
              else next((r for r in info["rgbs"] if r.get("id") == stream), None))
     buf = _buf(data)
@@ -955,16 +994,21 @@ def decode(data, signal_ids=None):
     ``rgb`` is the primary stream, as always; a multi-camera file additionally yields
     ``rgbs`` — ``{id: (N, H, W, 4) array}`` for every stream, primary included."""
     info = probe(data)
+    # Counted once and threaded through: every decode below would otherwise walk
+    # the Cluster headers again for the same answer.
+    n = _decode_frames(info, data)
     ids = signal_ids if signal_ids is not None else [s["id"] for s in info["signals"]]
+    # "frames" reports what came back, so it always matches len(out["rgb"]).
+    # info["metadata"] still carries the header's declared length.
     out = {"metadata": info["metadata"], "signals": {}, "width": info["width"],
-           "height": info["height"], "frames": info["frames"], "fps": info["fps"]}
+           "height": info["height"], "frames": n, "fps": info["fps"]}
     for sid in ids:
-        out["signals"][sid] = decode_signal(data, sid)
+        out["signals"][sid] = decode_signal(data, sid, _n_frames=n)
     if info["has_rgb"]:
-        out["rgb"] = decode_rgb(data)
+        out["rgb"] = decode_rgb(data, _n_frames=n)
         out["rgbs"] = {info["rgbs"][0]["id"]: out["rgb"]}
         for r in info["rgbs"][1:]:
-            out["rgbs"][r["id"]] = decode_rgb(data, stream=r["id"])
+            out["rgbs"][r["id"]] = decode_rgb(data, stream=r["id"], _n_frames=n)
     return out
 
 
