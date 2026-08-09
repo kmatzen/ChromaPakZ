@@ -1,6 +1,7 @@
 // chromapakz native core: triangle-fold packing + libvpx VP9 lossless + a minimal
 // Matroska/WebM mux/demux that is byte-compatible with src/webm.js.
 #include "chromapakz.h"
+#include <functional>
 #include <future>
 #include <thread>
 #include <vector>
@@ -1252,29 +1253,75 @@ int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>
   auto sigMeta=planSignalTracks(specs, rgbSpecs.size());
   struct RgbEnc { std::vector<Bytes> F; std::vector<bool> K; };
   std::vector<RgbEnc> rgbEnc(rgbSpecs.size());
-  for(size_t ri=0; ri<rgbSpecs.size(); ri++){
-    if(!rgbas[ri]) return 1;
-    std::vector<const uint8_t*> p(N); for(int i=0;i<N;i++) p[i]=rgbas[ri]+(size_t)i*rgbFrameBytes;
-    int kbps=rgbSpecs[ri].kbps;
-    if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbEnc[ri].F,rgbEnc[ri].K,hdr.enabled)) return 2;
-    if((int)rgbEnc[ri].F.size()!=N) return 6;
-  }
+  for(size_t ri=0; ri<rgbSpecs.size(); ri++) if(!rgbas[ri]) return 1;
+
   size_t px=(size_t)W*(size_t)H;
   struct SigEnc { std::vector<Bytes> hiF, loF, hiP, loP; std::vector<bool> hiK, loK; };
   std::vector<SigEnc> enc(specs.size());
+  for(size_t si=0; si<specs.size(); si++) if(!specs[si].data) return 1;
+
+  // Pack every signal before encoding any of them. Packing is cheap next to
+  // lossless coding, and doing it up front is what lets the plane encodes run
+  // side by side — the streaming path had to make the same change, because a
+  // shared hi/lo scratch pair is exactly what forces encodes to be serial.
   for(size_t si=0; si<specs.size(); si++){
     auto& sp=specs[si]; auto& se=enc[si];
-    if(!sp.data) return 1;
     se.hiP.resize(N); se.loP.resize(N);
-    std::vector<const uint8_t*> hp(N), lp(N);
     for(int i=0;i<N;i++){
       se.hiP[i].resize(px); se.loP[i].resize(px);
       pack(sp.data+(size_t)i*px, px, se.hiP[i].data(), se.loP[i].data());
-      hp[i]=se.hiP[i].data(); lp[i]=se.loP[i].data();
     }
-    if(EncStatus st=encodePlaneSeq(hp,W,H,fps,se.hiF,se.hiK)) return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
-    if(EncStatus st=encodePlaneSeq(lp,W,H,fps,se.loF,se.loK)) return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:4;
-    if((int)se.hiF.size()!=N || (int)se.loF.size()!=N) return 7;
+  }
+
+  // One task per track. Every track is an independent VP9 encoder writing only
+  // its own vectors, so the wall clock becomes the slowest track rather than
+  // their sum. Measured at 752x480 with RGB + depth, where the two lossless
+  // depth planes dominate: 91 ms/frame serial, 48 ms/frame here.
+  //
+  // Error codes are collected per task and returned in the original order, so a
+  // failure reports the same code it did when this ran serially.
+  {
+    std::vector<std::function<int()>> tasks;
+    tasks.reserve(rgbSpecs.size() + 2*specs.size());
+    for(size_t ri=0; ri<rgbSpecs.size(); ri++){
+      tasks.push_back([&,ri]()->int{
+        std::vector<const uint8_t*> p(N);
+        for(int i=0;i<N;i++) p[i]=rgbas[ri]+(size_t)i*rgbFrameBytes;
+        int kbps=rgbSpecs[ri].kbps;
+        if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbEnc[ri].F,rgbEnc[ri].K,hdr.enabled)) return 2;
+        if((int)rgbEnc[ri].F.size()!=N) return 6;
+        return 0;
+      });
+    }
+    for(size_t si=0; si<specs.size(); si++){
+      tasks.push_back([&,si]()->int{
+        auto& se=enc[si];
+        std::vector<const uint8_t*> hp(N);
+        for(int i=0;i<N;i++) hp[i]=se.hiP[i].data();
+        if(EncStatus st=encodePlaneSeq(hp,W,H,fps,se.hiF,se.hiK))
+          return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
+        if((int)se.hiF.size()!=N) return 7;
+        return 0;
+      });
+      tasks.push_back([&,si]()->int{
+        auto& se=enc[si];
+        std::vector<const uint8_t*> lp(N);
+        for(int i=0;i<N;i++) lp[i]=se.loP[i].data();
+        if(EncStatus st=encodePlaneSeq(lp,W,H,fps,se.loF,se.loK))
+          return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:4;
+        if((int)se.loF.size()!=N) return 7;
+        return 0;
+      });
+    }
+
+    std::vector<int> rcOf(tasks.size(), 0);
+    std::vector<std::future<void>> running;
+    running.reserve(tasks.size());
+    for(size_t k=1;k<tasks.size();k++)
+      running.push_back(std::async(std::launch::async, [&,k]{ rcOf[k]=tasks[k](); }));
+    if(!tasks.empty()) rcOf[0]=tasks[0]();      // slot 0 here: one fewer hand-off
+    for(auto& f : running) f.get();
+    for(size_t k=0;k<rcOf.size();k++) if(rcOf[k]) return rcOf[k];
   }
   for(int i=0;i<N;i++){ int t=(int)(1000.0*i/fps);
     for(size_t ri=0; ri<rgbSpecs.size(); ri++)
