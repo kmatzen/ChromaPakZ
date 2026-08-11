@@ -76,7 +76,13 @@ export const SIGNAL_RAW_U16 = {
 
 export function normalizeMetadata(meta){
   if(!meta) throw new Error('missing CHROMAPAKZ metadata');
-  if(!Array.isArray(meta.signals) || !meta.signals.length)
+  // `signals` must be present and an array — that is the v2 shape — but it is
+  // allowed to be empty. planSignals() calls an RGB-only take (video plus
+  // wrapper metadata, no aux planes) a valid plan and the encoder writes
+  // `signals: []` for it, so refusing to read one here made the decoder reject
+  // files this library itself produces. The real emptiness check is below, once
+  // rgbs[] has been resolved: neither signals nor RGB means nothing to decode.
+  if(!Array.isArray(meta.signals))
     throw new Error('metadata must include signals[] (v2)');
   const signals=meta.signals.map(s=>{
     const quant=s.quant && typeof s.quant === 'object'
@@ -93,6 +99,8 @@ export function normalizeMetadata(meta){
         track: r.track, codec: r.codec,
         ...(r.hdr ? { hdr: r.hdr } : {}) }))
     : meta.rgb ? [{ id: DEFAULT_RGB_ID, track: meta.rgb.track ?? RGB_TRACK, codec: meta.rgb.codec }] : [];
+  if(!signals.length && !rgbs.length)
+    throw new Error('metadata declares neither signals[] nor an rgb stream');
   return { ...meta, rgbs, signals };
 }
 
