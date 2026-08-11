@@ -4,10 +4,27 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
-## Unreleased
+## 0.9.1 — 2026-08-11
+
+Two browser-side fixes, both cases where the library rejected or discarded
+something it had told the caller was fine.
 
 ### Fixed
 
+- **The JS decoder refused RGB-only files.** `normalizeMetadata` treated an empty
+  `signals[]` as malformed, so `createDecoder` threw `metadata must include
+  signals[] (v2)` on files this library itself writes — `planSignals` has always
+  called an RGB-only take a valid plan ("video plus wrapper metadata, no aux
+  planes") and both writers emit `signals: []` for one. Encoder and decoder
+  disagreed about whether such a file was legal, and the decoder lost.
+
+  Found from the outside: dropping an RGB-only capture into the wurld web viewer
+  did nothing at all, because the throw escaped into an unhandled rejection.
+
+  `signals` must still be present and an array — that is the v2 shape — but
+  emptiness is only an error when there is no RGB stream either, which is the
+  genuine nothing-to-decode case. That check now runs after `rgbs[]` is resolved.
+  Nothing that decoded before decodes differently.
 - **`addText` on a buffered browser encoder silently dropped the cue.** Timed text is written
   through the incremental muxer, but the buffered path builds its file from `muxFrames` via
   `mux()`, which emits SimpleBlocks and has nowhere to put a cue's duration — so the finished
