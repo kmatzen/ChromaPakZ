@@ -4,7 +4,7 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
-## Unreleased
+## 0.10.0 — 2026-08-12
 
 ### Added — per-stream resolution (format v4)
 
