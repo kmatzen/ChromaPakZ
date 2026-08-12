@@ -25,8 +25,10 @@ class SpecValidation(unittest.TestCase):
             cz.encode({})
         with self.assertRaises(ValueError, msg="2-D signal"):
             cz.encode({"d": self.depth[0]})
-        with self.assertRaises(ValueError, msg="shape mismatch"):
-            cz.encode({"a": self.depth, "b": self.ids[:, :-2, :]})
+        # Differing H/W is per-stream resolution (format v4), no longer an error — but the
+        # frame grid is still shared, so a differing N must raise.
+        with self.assertRaises(ValueError, msg="frame count mismatch"):
+            cz.encode({"a": self.depth, "b": self.ids[:-1]})
 
     def test_encode_rejects_bad_quant_specs(self):
         with self.assertRaises(ValueError, msg="inverse_depth without near/far"):
@@ -53,8 +55,8 @@ class SpecValidation(unittest.TestCase):
     def test_rgb_shape_validation(self):
         with self.assertRaises(ValueError, msg="RGB (not RGBA)"):
             cz.encode({"d": self.depth}, rgb=np.zeros((N, H, W, 3), np.uint8))
-        with self.assertRaises(ValueError, msg="rgb/signal shape mismatch"):
-            cz.encode({"d": self.depth}, rgb=np.zeros((N, H + 1, W, 4), np.uint8))
+        with self.assertRaises(ValueError, msg="rgb/signal frame count mismatch"):
+            cz.encode({"d": self.depth}, rgb=np.zeros((N + 1, H, W, 4), np.uint8))
 
     def test_levels_beyond_uint16_are_rejected(self):
         """A levels count past 65536 must fail, not wrap codes mod 65536."""

@@ -1,4 +1,4 @@
-# ChromaPakZ file format (v3)
+# ChromaPakZ file format (v4)
 
 One Matroska/WebM file with **M lossy RGB streams** (M ≥ 0; tracks 1..M, stereo / multi-camera
 rigs store one per camera) and **N lossless signal pairs** (two VP9 lossless luma tracks each,
@@ -10,7 +10,7 @@ JSON in a Matroska `SimpleTag` named `CHROMAPAKZ`:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "width": 320,
   "height": 240,
   "fps": 30,
@@ -24,6 +24,8 @@ JSON in a Matroska `SimpleTag` named `CHROMAPAKZ`:
     {
       "id": "depth",
       "tracks": { "hi": 3, "lo": 4 },
+      "width": 160,
+      "height": 120,
       "codec": "vp09.00.10.08",
       "lossless": true,
       "scheme": "tri-fold-8+8",
@@ -49,10 +51,26 @@ after all of them. The **primary** stream is `rgbs[0]`: it always sits on **trac
 container name **`rgb`**, and the legacy `rgb` key always duplicates it — that pair is what
 pre-v3 readers key on, so they decode the primary exactly as a v2 file and simply ignore the
 extra streams. A v2 file (no `rgbs`) reads in v3 readers as a single stream with the default id
-`"rgb"`. All streams share the file's one `width`×`height` and its frame grid: an encoder
-writes every declared stream on every frame (the JS encoder additionally allows a stream to
-*start* late, as signals always could, but never to gap). Rigs that are not frame-synchronized
-are out of scope — represent them as separate files.
+`"rgb"`. All streams share the file's frame grid: an encoder writes every declared stream on
+every frame (the JS encoder additionally allows a stream to *start* late, as signals always
+could, but never to gap). Rigs that are not frame-synchronized are out of scope — represent
+them as separate files.
+
+**Per-stream resolution (v4).** Any `rgbs[]` or `signals[]` entry may carry its own
+`width`/`height` — always both, always positive — for a stream at a different resolution than
+the file: a 256×192 LiDAR depth map beside 1920×1440 video, a low-res guide camera in a rig.
+An entry without them rides at the file's top-level `width`×`height`, exactly as every stream
+did before v4; the top-level pair remains the **primary display resolution** (the primary RGB
+stream's — the first signal's in a file with no RGB), which is what `probe` reports and plain
+players show. The keys are written only where the resolution actually differs, and
+`"version": 4` only when at least one entry carries them — a file whose streams all share the
+file resolution is byte-identical v3 output, so nothing written before v4 changes. Each video
+`TrackEntry`'s `PixelWidth`/`PixelHeight` states its own track's geometry (pre-v4 these merely
+repeated the file's). Frames still align one-to-one across streams; nothing in ChromaPakZ
+resamples or aligns pixels between geometries — that mapping (intrinsics, crop, scale) belongs
+to wrapper formats, as `view` does. Pre-v4 readers handed a v4 file fail loudly on the streams
+that differ (their decoded frames don't match the geometry such readers assume) and read
+everything else as before.
 
 **HDR display tracks (0.8.0, optional).** An RGB stream may be an HDR10/HLG display track:
 VP9 **profile 2**, 10-bit, BT.2020 non-constant-luminance, broadcast range. Its `rgbs[]` entry

@@ -596,8 +596,13 @@ bool jNumberValue(const std::string& j, size_t& p, int depth, double& out, bool&
 }
 
 struct SignalQuantMeta { bool inverse_depth=false; double near_=0, far_=0; int levels=65536; };
-struct SignalMeta { std::string id; int track_hi=0, track_lo=0; SignalQuantMeta quant; std::string view; };
-struct RgbMeta { std::string id; int track=1; int bits=8; };   // bits: 8 = SDR, 10 = HDR profile 2
+// width/height 0 = the stream rides at the file's W/H (every pre-v4 file); positive = its own
+// geometry (v4). Resolve with dimOr() — nothing below reads these fields raw.
+struct SignalMeta { std::string id; int track_hi=0, track_lo=0; SignalQuantMeta quant; std::string view;
+                    int width=0, height=0; };
+struct RgbMeta { std::string id; int track=1; int bits=8;      // bits: 8 = SDR, 10 = HDR profile 2
+                 int width=0, height=0; };
+int dimOr(int v, int dflt){ return v>0 ? v : dflt; }
 struct FileMeta {
   int version=1, width=0, height=0, fps=30, frames=0;
   bool has_rgb=false; int rgb_track=1;
@@ -667,10 +672,15 @@ bool parseSignalEntry(const std::string& j, size_t& p, int depth, SignalMeta& s,
     if(k=="near"){   if(jNumberValue(j,vp,depth+1,v,ok)) sibling.near_=v; return ok; }
     if(k=="far"){    if(jNumberValue(j,vp,depth+1,v,ok)) sibling.far_ =v; return ok; }
     if(k=="levels"){ if(jNumberValue(j,vp,depth+1,v,ok)){ int l=clampToInt(v); sibling.levels = l>0?l:65536; } return ok; }
+    if(k=="width"){  if(jNumberValue(j,vp,depth+1,v,ok)) s.width =clampToInt(v); return ok; }
+    if(k=="height"){ if(jNumberValue(j,vp,depth+1,v,ok)) s.height=clampToInt(v); return ok; }
     return jSkipValue(j,vp,depth+1);
   });
   if(!wf || !ok) return false;
   if(quantIsInverseString){ s.quant=sibling; s.quant.inverse_depth=true; }
+  // A half-declared geometry (or a negative one) cannot size a plane; fall back to the file's,
+  // the same shape every pre-v4 reader would assume.
+  if(s.width<=0 || s.height<=0){ s.width=0; s.height=0; }
   return true;
 }
 
@@ -703,6 +713,8 @@ void parseRgbsV3(const std::string& j, size_t at, FileMeta& m){
       }
       double v=0;
       if(k=="track"){ if(jNumberValue(j,vp,3,v,ok)) r.track=clampToInt(v); return ok; }
+      if(k=="width"){  if(jNumberValue(j,vp,3,v,ok)) r.width =clampToInt(v); return ok; }
+      if(k=="height"){ if(jNumberValue(j,vp,3,v,ok)) r.height=clampToInt(v); return ok; }
       if(k=="hdr"){
         // Only the bit depth matters to this core (it decides the decode path); the rest of the
         // hdr object is display metadata that readers take from the raw JSON.
@@ -720,6 +732,7 @@ void parseRgbsV3(const std::string& j, size_t at, FileMeta& m){
       return jSkipValue(j,vp,3);
     });
     if(!wf || !ok) return false;
+    if(r.width<=0 || r.height<=0){ r.width=0; r.height=0; }   // as for signals: whole or default
     if(haveId && r.track>0) m.rgbs.push_back(r);
     return true;
   });
@@ -820,18 +833,27 @@ std::string hdrJson(const HdrMeta& h){
 //
 // v3: the legacy `rgb` key stays, always describing the primary stream (== rgbs[0]) so pre-v3
 // readers decode it unchanged; `rgbs[]` names every stream and is what v3 readers use.
+//
+// v4: an entry with its own geometry carries "width"/"height" beside its tracks; the version is
+// bumped to 4 only then, so a file every stream of which rides at the file W/H — everything
+// written before this existed — stays byte-identical v3 output. (Encoders zero spec dims equal
+// to the file's before this runs, so "has own geometry" and "carries the keys" coincide.)
 std::string buildMetadataJson(int W,int H,int N,int fps,const std::vector<RgbMeta>& rgbs,
                               const std::vector<SignalMeta>& signals, bool streaming=false,
                               const HdrMeta& hdr=HdrMeta{}){
   // Built with std::string throughout — the document grows with signal count and id length,
   // so a fixed stack buffer would silently truncate (and emit invalid JSON) past some size.
+  bool anyDims=false;
+  for(auto& r : rgbs) if(r.width>0) anyDims=true;
+  for(auto& s : signals) if(s.width>0) anyDims=true;
   std::string sigs="[";
   for(size_t i=0;i<signals.size();i++){
     if(i) sigs+=",";
     const auto& s=signals[i];
     char nums[64]; snprintf(nums,sizeof nums,"\"hi\":%d,\"lo\":%d", s.track_hi, s.track_lo);
-    sigs += "{\"id\":\""; sigs += jsonEscape(s.id); sigs += "\",\"tracks\":{"; sigs += nums;
-    sigs += "},\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
+    sigs += "{\"id\":\""; sigs += jsonEscape(s.id); sigs += "\",\"tracks\":{"; sigs += nums; sigs += "}";
+    if(s.width>0){ char wb[48]; snprintf(wb,sizeof wb,",\"width\":%d,\"height\":%d", s.width, s.height); sigs+=wb; }
+    sigs += ",\"codec\":\"vp09.00.10.08\",\"lossless\":true,\"scheme\":\"tri-fold-8+8\","
             "\"dtype\":\"uint16\",\"invalidCode\":0,\"quant\":";
     sigs += quantJson(s.quant);
     if(!s.view.empty()){ sigs += ",\"view\":\""; sigs += jsonEscape(s.view); sigs += "\""; }
@@ -847,19 +869,21 @@ std::string buildMetadataJson(int W,int H,int N,int fps,const std::vector<RgbMet
     rgbsJson="[";
     for(size_t i=0;i<rgbs.size();i++){
       if(i) rgbsJson+=",";
-      char tb[80]; snprintf(tb,sizeof tb,"\",\"track\":%d,\"codec\":\"%s\"", rgbs[i].track, codec.c_str());
+      char tb[128]; snprintf(tb,sizeof tb,"\",\"track\":%d,\"codec\":\"%s\"", rgbs[i].track, codec.c_str());
       rgbsJson += "{\"id\":\""; rgbsJson += jsonEscape(rgbs[i].id); rgbsJson += tb;
+      if(rgbs[i].width>0){ char wb[48]; snprintf(wb,sizeof wb,",\"width\":%d,\"height\":%d", rgbs[i].width, rgbs[i].height); rgbsJson+=wb; }
       if(hdr.enabled){ rgbsJson += ",\"hdr\":"; rgbsJson += hdrObj; }
       rgbsJson += "}";
     }
     rgbsJson+="]";
   }
+  int version = anyDims ? 4 : 3;
   char head[192];
   if(streaming)
     snprintf(head,sizeof head,
-             "{\"version\":3,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":null,\"streaming\":true,\"rgb\":",W,H,fps);
+             "{\"version\":%d,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":null,\"streaming\":true,\"rgb\":",version,W,H,fps);
   else
-    snprintf(head,sizeof head,"{\"version\":3,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":",W,H,fps,N);
+    snprintf(head,sizeof head,"{\"version\":%d,\"width\":%d,\"height\":%d,\"fps\":%d,\"frames\":%d,\"rgb\":",version,W,H,fps,N);
   std::string out=head; out+=rgb;
   if(!rgbs.empty()){ out+=",\"rgbs\":"; out+=rgbsJson; }
   out+=",\"signals\":"; out+=sigs; out+="}";
@@ -871,33 +895,37 @@ struct SignalEncodeSpec {
   const uint16_t* data=nullptr;
   SignalQuantMeta quant;
   std::string view;   // optional, recorded verbatim in the metadata
+  int width=0, height=0;   // 0 = the file default W/H (as in SignalMeta)
 };
 
-struct RgbEncodeSpec { std::string id; int kbps=0; };
+struct RgbEncodeSpec { std::string id; int kbps=0; int width=0, height=0; };
 
 // RGB streams take tracks 1..N in declaration order; the primary keeps the container name "rgb"
 // (the name pre-v3 readers and the cue-track choice scan for), secondaries are "rgb-{id}".
 std::vector<RgbMeta> planRgbTracks(const std::vector<RgbEncodeSpec>& specs){
   std::vector<RgbMeta> out;
-  for(size_t i=0;i<specs.size();i++) out.push_back({specs[i].id, (int)i+1});
+  for(size_t i=0;i<specs.size();i++) out.push_back({specs[i].id, (int)i+1, 8, specs[i].width, specs[i].height});
   return out;
 }
 
 // Container track descriptors for a plan. Shared by the batch and streaming builders, so both
 // name and number their tracks identically. An enabled `hdr` puts a Colour element on every
 // RGB track; signal tracks never carry one (their "video" is packed data, not colour).
+// PixelWidth/PixelHeight were always written per TrackEntry; v4 is where they can first differ.
 std::vector<Track> tracksForPlan(const std::vector<SignalMeta>& sigMeta,
                                  const std::vector<RgbMeta>& rgbs, int W, int H,
                                  const HdrMeta& hdr=HdrMeta{}){
   std::vector<Track> tracks;
   for(size_t i=0;i<rgbs.size();i++){
-    Track t{rgbs[i].track,"V_VP9", i==0?std::string("rgb"):"rgb-"+rgbs[i].id, W,H};
+    Track t{rgbs[i].track,"V_VP9", i==0?std::string("rgb"):"rgb-"+rgbs[i].id,
+            dimOr(rgbs[i].width,W), dimOr(rgbs[i].height,H)};
     t.colour=hdr;
     tracks.push_back(t);
   }
   for(auto& sm : sigMeta){
-    tracks.push_back({sm.track_hi,"V_VP9","signal-"+sm.id+"-hi",W,H});
-    tracks.push_back({sm.track_lo,"V_VP9","signal-"+sm.id+"-lo",W,H});
+    int sw=dimOr(sm.width,W), sh=dimOr(sm.height,H);
+    tracks.push_back({sm.track_hi,"V_VP9","signal-"+sm.id+"-hi",sw,sh});
+    tracks.push_back({sm.track_lo,"V_VP9","signal-"+sm.id+"-lo",sw,sh});
   }
   return tracks;
 }
@@ -907,9 +935,25 @@ std::vector<SignalMeta> planSignalTracks(const std::vector<SignalEncodeSpec>& sp
   int next=(int)numRgb+1;
   for(auto& sp : specs){
     SignalMeta s; s.id=sp.id; s.track_hi=next++; s.track_lo=next++; s.quant=sp.quant; s.view=sp.view;
+    s.width=sp.width; s.height=sp.height;
     out.push_back(s);
   }
   return out;
+}
+
+bool dimsUsable(int W, int H);   // defined with the decode bounds below
+
+// Per-stream geometry from an ABI spec: both zero = the file default, both positive = its own
+// (normalized to "default" when it merely restates the file's, so only a real difference is
+// recorded and the version bumped). Anything else is the caller's bug — refuse it.
+bool adoptSpecDims(int specW, int specH, int fileW, int fileH, int& outW, int& outH){
+  outW=0; outH=0;
+  if(specW==0 && specH==0) return true;
+  if(specW<=0 || specH<=0) return false;      // half-specified or negative
+  if(!dimsUsable(specW,specH)) return false;  // same bound the file W/H must meet
+  if(specW==fileW && specH==fileH) return true;
+  outW=specW; outH=specH;
+  return true;
 }
 
 // Shared validation for the dc_rgb_spec_t list: ids must be unique and non-empty; NULL is
@@ -923,6 +967,24 @@ bool normalizeRgbSpecs(const dc_rgb_spec_t* rgbs, int num_rgbs, std::vector<RgbE
     else if(!rgbs[i].id && num_rgbs==1) r.id="rgb";
     else return false;
     r.kbps=rgbs[i].kbps;
+    for(auto& prev : out) if(prev.id==r.id) return false;
+    out.push_back(r);
+  }
+  return true;
+}
+
+// The dc_rgb_spec2_t form: identical id rules, plus per-stream geometry.
+bool normalizeRgbSpecs2(const dc_rgb_spec2_t* rgbs, int num_rgbs, int W, int H,
+                        std::vector<RgbEncodeSpec>& out){
+  if(num_rgbs<0) return false;
+  if(num_rgbs>0 && !rgbs) return false;
+  for(int i=0;i<num_rgbs;i++){
+    RgbEncodeSpec r;
+    if(rgbs[i].id && *rgbs[i].id) r.id=rgbs[i].id;
+    else if(!rgbs[i].id && num_rgbs==1) r.id="rgb";
+    else return false;
+    r.kbps=rgbs[i].kbps;
+    if(!adoptSpecDims(rgbs[i].width, rgbs[i].height, W, H, r.width, r.height)) return false;
     for(auto& prev : out) if(prev.id==r.id) return false;
     out.push_back(r);
   }
@@ -1245,9 +1307,15 @@ int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>
   if(specs.empty() && rgbSpecs.empty()) return 1;
   if(!rgbSpecs.empty() && !rgbas) return 1;
   if(!dimsUsable(W,H) || N<=0 || fps<=0) return 1;
-  const size_t rgbFrameBytes=(size_t)W*(size_t)H*4*(hdr.enabled?2:1);
-  // Guard the per-frame strides used below against wrapping.
-  if((size_t)N > SIZE_MAX/rgbFrameBytes) return 1;
+  // Per-stream geometry: a spec's own width/height when it has one, the file's otherwise.
+  // Spec dims were validated (dimsUsable) where they entered; the file W/H just above.
+  std::vector<size_t> rgbFrameBytesOf(rgbSpecs.size());
+  for(size_t ri=0; ri<rgbSpecs.size(); ri++){
+    size_t rw=(size_t)dimOr(rgbSpecs[ri].width,W), rh=(size_t)dimOr(rgbSpecs[ri].height,H);
+    rgbFrameBytesOf[ri]=rw*rh*4*(hdr.enabled?2:1);
+    // Guard the per-frame strides used below against wrapping.
+    if((size_t)N > SIZE_MAX/rgbFrameBytesOf[ri]) return 1;
+  }
   std::vector<Frame> frames;
   auto rgbMeta=planRgbTracks(rgbSpecs);
   auto sigMeta=planSignalTracks(specs, rgbSpecs.size());
@@ -1255,8 +1323,7 @@ int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>
   std::vector<RgbEnc> rgbEnc(rgbSpecs.size());
   for(size_t ri=0; ri<rgbSpecs.size(); ri++) if(!rgbas[ri]) return 1;
 
-  size_t px=(size_t)W*(size_t)H;
-  struct SigEnc { std::vector<Bytes> hiF, loF, hiP, loP; std::vector<bool> hiK, loK; };
+  struct SigEnc { std::vector<Bytes> hiF, loF, hiP, loP; std::vector<bool> hiK, loK; size_t px=0; };
   std::vector<SigEnc> enc(specs.size());
   for(size_t si=0; si<specs.size(); si++) if(!specs[si].data) return 1;
 
@@ -1266,10 +1333,12 @@ int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>
   // shared hi/lo scratch pair is exactly what forces encodes to be serial.
   for(size_t si=0; si<specs.size(); si++){
     auto& sp=specs[si]; auto& se=enc[si];
+    se.px=(size_t)dimOr(sp.width,W)*(size_t)dimOr(sp.height,H);
+    if((size_t)N > SIZE_MAX/(se.px*2)) return 1;   // sp.data stride, in bytes
     se.hiP.resize(N); se.loP.resize(N);
     for(int i=0;i<N;i++){
-      se.hiP[i].resize(px); se.loP[i].resize(px);
-      pack(sp.data+(size_t)i*px, px, se.hiP[i].data(), se.loP[i].data());
+      se.hiP[i].resize(se.px); se.loP[i].resize(se.px);
+      pack(sp.data+(size_t)i*se.px, se.px, se.hiP[i].data(), se.loP[i].data());
     }
   }
 
@@ -1286,28 +1355,30 @@ int buildFileMulti(const uint8_t* const* rgbas, const std::vector<RgbEncodeSpec>
     for(size_t ri=0; ri<rgbSpecs.size(); ri++){
       tasks.push_back([&,ri]()->int{
         std::vector<const uint8_t*> p(N);
-        for(int i=0;i<N;i++) p[i]=rgbas[ri]+(size_t)i*rgbFrameBytes;
+        for(int i=0;i<N;i++) p[i]=rgbas[ri]+(size_t)i*rgbFrameBytesOf[ri];
         int kbps=rgbSpecs[ri].kbps;
-        if(!encodeRGBSeq(p,W,H,fps,kbps?kbps:2000,rgbEnc[ri].F,rgbEnc[ri].K,hdr.enabled)) return 2;
+        if(!encodeRGBSeq(p,dimOr(rgbSpecs[ri].width,W),dimOr(rgbSpecs[ri].height,H),fps,
+                         kbps?kbps:2000,rgbEnc[ri].F,rgbEnc[ri].K,hdr.enabled)) return 2;
         if((int)rgbEnc[ri].F.size()!=N) return 6;
         return 0;
       });
     }
     for(size_t si=0; si<specs.size(); si++){
-      tasks.push_back([&,si]()->int{
+      int sw=dimOr(specs[si].width,W), sh=dimOr(specs[si].height,H);
+      tasks.push_back([&,si,sw,sh]()->int{
         auto& se=enc[si];
         std::vector<const uint8_t*> hp(N);
         for(int i=0;i<N;i++) hp[i]=se.hiP[i].data();
-        if(EncStatus st=encodePlaneSeq(hp,W,H,fps,se.hiF,se.hiK))
+        if(EncStatus st=encodePlaneSeq(hp,sw,sh,fps,se.hiF,se.hiK))
           return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
         if((int)se.hiF.size()!=N) return 7;
         return 0;
       });
-      tasks.push_back([&,si]()->int{
+      tasks.push_back([&,si,sw,sh]()->int{
         auto& se=enc[si];
         std::vector<const uint8_t*> lp(N);
         for(int i=0;i<N;i++) lp[i]=se.loP[i].data();
-        if(EncStatus st=encodePlaneSeq(lp,W,H,fps,se.loF,se.loK))
+        if(EncStatus st=encodePlaneSeq(lp,sw,sh,fps,se.loF,se.loK))
           return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:4;
         if((int)se.loF.size()!=N) return 7;
         return 0;
@@ -1385,10 +1456,10 @@ struct dc_stream_encoder {
     // only the muxing has to stay ordered. Packing moves ahead of the encode and
     // into per-signal buffers — the old single hi/lo scratch pair was reused across
     // signals, which is exactly what forced the encodes to be serial.
-    size_t px=(size_t)W*(size_t)H;
     if(planes){
       packed.resize(sigMeta.size());
       for(size_t i=0;i<sigMeta.size();i++){
+        size_t px=(size_t)dimOr(sigMeta[i].width,W)*(size_t)dimOr(sigMeta[i].height,H);
         packed[i].hi.resize(px); packed[i].lo.resize(px);
         pack(planes[i], px, packed[i].hi.data(), packed[i].lo.data());
       }
@@ -1483,7 +1554,7 @@ static int decStatusToRc(int st, int codecErr){
 // opposite depth is error 7 — a 10-bit code does not fit uint8, and silently truncating would
 // corrupt the one track that exists to be looked at.
 static int findRgbStream(const Demuxed& d, const FileMeta& meta, const char* rgb_id, bool want10,
-                         int& track){
+                         int& track, int& W, int& H){
   if(!meta.has_rgb) return rgb_id ? 8 : 6;   // structural, not a `"rgb":null` substring search
   const RgbMeta* found=nullptr;
   if(!rgb_id){
@@ -1494,6 +1565,8 @@ static int findRgbStream(const Demuxed& d, const FileMeta& meta, const char* rgb
   }
   if((found->bits==10) != want10) return 7;
   track=found->track;
+  // The stream's own geometry (v4) when it declares one, the file's otherwise.
+  W=dimOr(found->width, meta.width); H=dimOr(found->height, meta.height);
   if(!rgb_id){
     // Primary stream. The container name is what pre-multi-RGB files were always resolved by,
     // so it stays authoritative when present; the metadata's rgbs[0] covers files without it.
@@ -1508,9 +1581,8 @@ int dc_decode_rgb_id(const uint8_t* webm, size_t len, const char* rgb_id,
   return guard([&]{
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
   FileMeta meta=parseMetadata(d.metadata);   // reads the keys once, with defaults when absent
-  int rgbTrack=0;
-  if(int rc=findRgbStream(d,meta,rgb_id,/*want10=*/false,rgbTrack)) return rc;
-  int W=meta.width, H=meta.height;
+  int rgbTrack=0, W=0, H=0;
+  if(int rc=findRgbStream(d,meta,rgb_id,/*want10=*/false,rgbTrack,W,H)) return rc;
   if(!dimsUsable(W,H)) return 2;
   size_t frameBytes=(size_t)W*H*4;
   std::vector<Frame> frs; for(auto& f:d.frames) if(f.track==rgbTrack) frs.push_back(f);
@@ -1528,9 +1600,8 @@ int dc_decode_rgb16(const uint8_t* webm, size_t len, const char* rgb_id,
   return guard([&]{
   Demuxed d=demux(webm,len); if(d.metadata.empty()) return 1;
   FileMeta meta=parseMetadata(d.metadata);
-  int rgbTrack=0;
-  if(int rc=findRgbStream(d,meta,rgb_id,/*want10=*/true,rgbTrack)) return rc;
-  int W=meta.width, H=meta.height;
+  int rgbTrack=0, W=0, H=0;
+  if(int rc=findRgbStream(d,meta,rgb_id,/*want10=*/true,rgbTrack,W,H)) return rc;
   if(!dimsUsable(W,H)) return 2;
   size_t frameElems=(size_t)W*H*4;
   std::vector<Frame> frs; for(auto& f:d.frames) if(f.track==rgbTrack) frs.push_back(f);
@@ -1588,7 +1659,8 @@ int dc_decode_signal(const uint8_t* webm, size_t len, const char* signal_id,
   FileMeta meta = parseMetadata(d.metadata);
   const SignalMeta* sig = findSignal(meta, signal_id);
   if(!sig) return 8;
-  int W=meta.width, H=meta.height;
+  // The signal's own geometry (v4) when it declares one, the file's otherwise.
+  int W=dimOr(sig->width, meta.width), H=dimOr(sig->height, meta.height);
   if(!dimsUsable(W,H)) return 2;
   size_t px=(size_t)W*H;
   size_t maxFrames=out_cap/px;
@@ -1638,6 +1710,12 @@ static void signalSpecFrom2(const dc_signal_spec2_t& in, SignalEncodeSpec& s){
   }
   if(in.view && *in.view) s.view=in.view;
 }
+// The v3 struct adds per-signal geometry; false = an unusable one (error 1 at the caller).
+static bool signalSpecFrom3(const dc_signal_spec3_t& in, int W, int H, SignalEncodeSpec& s){
+  dc_signal_spec2_t base{in.id, in.data, in.inverse_depth, in.near_, in.far_, in.levels, in.view};
+  signalSpecFrom2(base, s);
+  return adoptSpecDims(in.width, in.height, W, H, s.width, s.height);
+}
 
 int dc_encode_multi2(const uint8_t* const* rgbas,
                      const dc_rgb_spec_t* rgbs, int num_rgbs,
@@ -1660,6 +1738,31 @@ int dc_encode_multi2(const uint8_t* const* rgbas,
   for(int i=0;i<num_signals;i++){
     if(!signals[i].id || !signals[i].data) return 1;
     SignalEncodeSpec s; signalSpecFrom2(signals[i], s);
+    specs.push_back(s);
+  }
+  Bytes file; int rc=buildFileMulti(rgbas, rgbSpecs, specs, W, H, N, fps, file);
+  if(rc) return rc;
+  return finish(file, out, out_len);
+  });
+}
+
+int dc_encode_multi3(const uint8_t* const* rgbas,
+                     const dc_rgb_spec2_t* rgbs, int num_rgbs,
+                     const dc_signal_spec3_t* signals, int num_signals,
+                     int W, int H, int N, int fps,
+                     uint8_t** out, size_t* out_len){
+  if(!out || !out_len || N<=0 || fps<=0 || !dimsUsable(W,H)) return 1;
+  if(num_signals<=0 && num_rgbs<=0) return 1;
+  if(num_signals>0 && !signals) return 1;
+  if(num_rgbs>0 && !rgbas) return 1;
+  return guard([&]{
+  std::vector<RgbEncodeSpec> rgbSpecs;
+  if(!normalizeRgbSpecs2(rgbs, num_rgbs, W, H, rgbSpecs)) return 1;
+  std::vector<SignalEncodeSpec> specs;
+  for(int i=0;i<num_signals;i++){
+    if(!signals[i].id || !signals[i].data) return 1;
+    SignalEncodeSpec s;
+    if(!signalSpecFrom3(signals[i], W, H, s)) return 1;
     specs.push_back(s);
   }
   Bytes file; int rc=buildFileMulti(rgbas, rgbSpecs, specs, W, H, N, fps, file);
@@ -1702,6 +1805,34 @@ int dc_encode_multi_hdr(const uint16_t* const* rgbas,
   for(int i=0;i<num_signals;i++){
     if(!signals[i].id || !signals[i].data) return 1;
     SignalEncodeSpec s; signalSpecFrom2(signals[i], s);
+    specs.push_back(s);
+  }
+  Bytes file;
+  int rc=buildFileMulti((const uint8_t* const*)rgbas, rgbSpecs, specs, W, H, N, fps, file, h);
+  if(rc) return rc;
+  return finish(file, out, out_len);
+  });
+}
+
+int dc_encode_multi_hdr3(const uint16_t* const* rgbas,
+                         const dc_rgb_spec2_t* rgbs, int num_rgbs,
+                         const dc_hdr_meta_t* hdr,
+                         const dc_signal_spec3_t* signals, int num_signals,
+                         int W, int H, int N, int fps,
+                         uint8_t** out, size_t* out_len){
+  if(!out || !out_len || N<=0 || fps<=0 || !dimsUsable(W,H)) return 1;
+  if(num_rgbs<=0 || !rgbas) return 1;      // HDR describes the display track; there must be one
+  if(num_signals>0 && !signals) return 1;
+  return guard([&]{
+  HdrMeta h;
+  if(!hdrFromAbi(hdr,h)) return 1;
+  std::vector<RgbEncodeSpec> rgbSpecs;
+  if(!normalizeRgbSpecs2(rgbs, num_rgbs, W, H, rgbSpecs)) return 1;
+  std::vector<SignalEncodeSpec> specs;
+  for(int i=0;i<num_signals;i++){
+    if(!signals[i].id || !signals[i].data) return 1;
+    SignalEncodeSpec s;
+    if(!signalSpecFrom3(signals[i], W, H, s)) return 1;
     specs.push_back(s);
   }
   Bytes file;
@@ -1760,23 +1891,14 @@ int dc_stream_create_ex(int W, int H, int fps, int rgb_kbps, int has_rgb, int em
 }
 
 static int streamCreateImpl(int W, int H, int fps,
-                     const dc_rgb_spec_t* rgbs, int num_rgbs, const HdrMeta& hdr, int emit_cues,
-                     const dc_signal_spec2_t* signals, int num_signals,
+                     std::vector<RgbEncodeSpec> rgbSpecs, const HdrMeta& hdr, int emit_cues,
+                     std::vector<SignalEncodeSpec> specs,
                      const char* text_track_name,
                      dc_stream_encoder_t** out){
-  if(!out || num_signals<0 || fps<=0 || !dimsUsable(W,H)) return 1;
-  if(num_signals>0 && !signals) return 1;
-  if(num_signals<=0 && num_rgbs<=0) return 1;
+  if(!out || fps<=0 || !dimsUsable(W,H)) return 1;
+  if(specs.empty() && rgbSpecs.empty()) return 1;
   return guard([&]() -> int {
-  std::vector<RgbEncodeSpec> rgbSpecs;
-  if(!normalizeRgbSpecs(rgbs, num_rgbs, rgbSpecs)) return 1;
-  std::vector<SignalEncodeSpec> specs;
-  for(int i=0;i<num_signals;i++){
-    if(!signals[i].id) return 1;
-    SignalEncodeSpec s; signalSpecFrom2(signals[i], s);
-    s.data=nullptr;   // unused here: planes arrive per frame
-    specs.push_back(s);
-  }
+  for(auto& s : specs) s.data=nullptr;   // unused here: planes arrive per frame
   std::unique_ptr<dc_stream_encoder> h(new dc_stream_encoder());
   h->W=W; h->H=H; h->fps=fps; h->hdr=hdr;
   h->rgbMeta=planRgbTracks(rgbSpecs);
@@ -1784,13 +1906,15 @@ static int streamCreateImpl(int W, int H, int fps,
   for(size_t i=0;i<rgbSpecs.size();i++){
     auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
     int kbps=rgbSpecs[i].kbps;
-    if(enc->init(W,H,fps,/*lossless=*/false,kbps?kbps:2000,/*keyEvery=*/fps,hdr.enabled)) return 2;
+    if(enc->init(dimOr(rgbSpecs[i].width,W),dimOr(rgbSpecs[i].height,H),fps,
+                 /*lossless=*/false,kbps?kbps:2000,/*keyEvery=*/fps,hdr.enabled)) return 2;
     h->slots.push_back({h->rgbMeta[i].track, std::move(enc), 0});
   }
   for(auto& sm : h->sigMeta){
+    int sw=dimOr(sm.width,W), sh=dimOr(sm.height,H);
     for(int track : {sm.track_hi, sm.track_lo}){
       auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
-      if(EncStatus st=enc->init(W,H,fps,/*lossless=*/true,0,/*keyEvery=*/fps>0?fps:30))
+      if(EncStatus st=enc->init(sw,sh,fps,/*lossless=*/true,0,/*keyEvery=*/fps>0?fps:30))
         return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
       h->slots.push_back({track, std::move(enc), 0});
     }
@@ -1821,13 +1945,49 @@ static int streamCreateImpl(int W, int H, int fps,
   });
 }
 
+// Shared spec conversion for the dc_stream_create* family — the ABI structs become the internal
+// vectors streamCreateImpl runs on. False = an invalid spec (error 1 at the caller).
+static bool streamSpecsFrom2(const dc_rgb_spec_t* rgbs, int num_rgbs,
+                             const dc_signal_spec2_t* signals, int num_signals,
+                             std::vector<RgbEncodeSpec>& rgbSpecs,
+                             std::vector<SignalEncodeSpec>& specs){
+  if(num_signals<0) return false;
+  if(num_signals>0 && !signals) return false;
+  if(!normalizeRgbSpecs(rgbs, num_rgbs, rgbSpecs)) return false;
+  for(int i=0;i<num_signals;i++){
+    if(!signals[i].id) return false;
+    SignalEncodeSpec s; signalSpecFrom2(signals[i], s);
+    specs.push_back(s);
+  }
+  return true;
+}
+static bool streamSpecsFrom3(const dc_rgb_spec2_t* rgbs, int num_rgbs,
+                             const dc_signal_spec3_t* signals, int num_signals, int W, int H,
+                             std::vector<RgbEncodeSpec>& rgbSpecs,
+                             std::vector<SignalEncodeSpec>& specs){
+  if(num_signals<0) return false;
+  if(num_signals>0 && !signals) return false;
+  if(!normalizeRgbSpecs2(rgbs, num_rgbs, W, H, rgbSpecs)) return false;
+  for(int i=0;i<num_signals;i++){
+    if(!signals[i].id) return false;
+    SignalEncodeSpec s;
+    if(!signalSpecFrom3(signals[i], W, H, s)) return false;
+    specs.push_back(s);
+  }
+  return true;
+}
+
 int dc_stream_create2(int W, int H, int fps,
                      const dc_rgb_spec_t* rgbs, int num_rgbs, int emit_cues,
                      const dc_signal_spec2_t* signals, int num_signals,
                      const char* text_track_name,
                      dc_stream_encoder_t** out){
-  return streamCreateImpl(W,H,fps,rgbs,num_rgbs,HdrMeta{},emit_cues,
-                          signals,num_signals,text_track_name,out);
+  return guard([&]() -> int {
+  std::vector<RgbEncodeSpec> rgbSpecs; std::vector<SignalEncodeSpec> specs;
+  if(!streamSpecsFrom2(rgbs,num_rgbs,signals,num_signals,rgbSpecs,specs)) return 1;
+  return streamCreateImpl(W,H,fps,std::move(rgbSpecs),HdrMeta{},emit_cues,
+                          std::move(specs),text_track_name,out);
+  });
 }
 
 int dc_stream_create_hdr(int W, int H, int fps,
@@ -1839,8 +1999,44 @@ int dc_stream_create_hdr(int W, int H, int fps,
   HdrMeta h;
   if(!hdrFromAbi(hdr,h)) return 1;
   if(num_rgbs<=0) return 1;   // HDR describes the display track; there must be one
-  return streamCreateImpl(W,H,fps,rgbs,num_rgbs,h,emit_cues,
-                          signals,num_signals,text_track_name,out);
+  return guard([&]() -> int {
+  std::vector<RgbEncodeSpec> rgbSpecs; std::vector<SignalEncodeSpec> specs;
+  if(!streamSpecsFrom2(rgbs,num_rgbs,signals,num_signals,rgbSpecs,specs)) return 1;
+  return streamCreateImpl(W,H,fps,std::move(rgbSpecs),h,emit_cues,
+                          std::move(specs),text_track_name,out);
+  });
+}
+
+int dc_stream_create3(int W, int H, int fps,
+                     const dc_rgb_spec2_t* rgbs, int num_rgbs, int emit_cues,
+                     const dc_signal_spec3_t* signals, int num_signals,
+                     const char* text_track_name,
+                     dc_stream_encoder_t** out){
+  if(!dimsUsable(W,H)) return 1;   // spec dims are validated against these in the conversion
+  return guard([&]() -> int {
+  std::vector<RgbEncodeSpec> rgbSpecs; std::vector<SignalEncodeSpec> specs;
+  if(!streamSpecsFrom3(rgbs,num_rgbs,signals,num_signals,W,H,rgbSpecs,specs)) return 1;
+  return streamCreateImpl(W,H,fps,std::move(rgbSpecs),HdrMeta{},emit_cues,
+                          std::move(specs),text_track_name,out);
+  });
+}
+
+int dc_stream_create_hdr3(int W, int H, int fps,
+                          const dc_rgb_spec2_t* rgbs, int num_rgbs,
+                          const dc_hdr_meta_t* hdr, int emit_cues,
+                          const dc_signal_spec3_t* signals, int num_signals,
+                          const char* text_track_name,
+                          dc_stream_encoder_t** out){
+  HdrMeta h;
+  if(!hdrFromAbi(hdr,h)) return 1;
+  if(num_rgbs<=0) return 1;   // HDR describes the display track; there must be one
+  if(!dimsUsable(W,H)) return 1;
+  return guard([&]() -> int {
+  std::vector<RgbEncodeSpec> rgbSpecs; std::vector<SignalEncodeSpec> specs;
+  if(!streamSpecsFrom3(rgbs,num_rgbs,signals,num_signals,W,H,rgbSpecs,specs)) return 1;
+  return streamCreateImpl(W,H,fps,std::move(rgbSpecs),h,emit_cues,
+                          std::move(specs),text_track_name,out);
+  });
 }
 
 int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out_len){

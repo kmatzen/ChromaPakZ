@@ -4,6 +4,39 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## Unreleased
+
+### Added — per-stream resolution (format v4)
+
+Streams no longer have to share the file's one `width`×`height` — only its frame grid. The
+motivating case: depth at sensor resolution (a 256×192 LiDAR map) riding beside full-resolution
+RGB, instead of upsampling the depth to the video size and paying to code pixels that carry no
+information. Any `rgbs[]` or `signals[]` entry may now declare its own `width`/`height`.
+
+- **Format.** An entry carries the keys only when its resolution actually differs, and the file
+  says `"version": 4` only when at least one entry does — a file whose streams all share the
+  file resolution is **byte-identical v3 output**, so nothing written before this changes and
+  the committed fixtures stand. The top-level `width`/`height` remain the primary display
+  resolution (the primary RGB stream's; the first signal's in an RGB-less file). Each video
+  TrackEntry's `PixelWidth`/`PixelHeight` now states its own track's geometry. Pre-v4 readers
+  fail loudly (`DC_ERR_GEOMETRY` / a geometry mismatch, never silent corruption) on the streams
+  that differ, and read everything else as before. Nothing resamples: pixel alignment across
+  geometries belongs to wrapper formats, as `view` always did.
+- **Python.** Batch `encode()` simply accepts what it used to reject: each signal/stream array
+  brings its own `(H, W)`, and only the frame count must agree. `create_encoder()` declares
+  geometry per spec — `width`/`height` on a signal spec, dict entries in `rgbs`
+  (`rgbs=["cam0", {"id": "guide", "width": 320, "height": 240}]`). Decoders size every buffer
+  from the stream's own metadata entry, so each comes back at its own shape;
+  `chromapakz-ingest` now takes depth and RGB of different sizes.
+- **Browser.** Same shape: `width`/`height` on signal specs and `rgbs` entries; per-frame plane
+  checks, the codec tracks, and both decoders (buffered and streaming) run at each stream's own
+  geometry. The two writers emit identical metadata for identical configurations, as ever.
+- **C ABI.** New `dc_rgb_spec2_t` / `dc_signal_spec3_t` (the old structs plus `width`/`height`;
+  0,0 = the file default) with `dc_encode_multi3` / `dc_encode_multi_hdr3` /
+  `dc_stream_create3` / `dc_stream_create_hdr3`, following the `*2` precedent — every existing
+  entry point is untouched. Decode entry points need no new forms: they resolve each stream's
+  geometry from the metadata, and their capacity contract already bounds the writes.
+
 ## 0.9.1 — 2026-08-11
 
 Two browser-side fixes, both cases where the library rejected or discarded

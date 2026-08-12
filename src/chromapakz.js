@@ -84,7 +84,8 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
       if(r.hdr) continue;
       const block=slot[rgbSlotKey(r.id)];
       if(!block) continue;
-      if(!rgbDec[r.id]) rgbDec[r.id]=be.createTrackDecoder({ kind:'rgba', W, H });
+      // The stream's own geometry (v4) when it declares one, the file's otherwise.
+      if(!rgbDec[r.id]) rgbDec[r.id]=be.createTrackDecoder({ kind:'rgba', W: r.width ?? W, H: r.height ?? H });
       rgbDec[r.id].push(block);
       const plane=await rgbDec[r.id].next();
       if(plane) out.rgbs[r.id]=plane;
@@ -98,7 +99,10 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
       // or corrupt file may carry hi without lo — both skip, rather than pushing undefined at a
       // decoder that would then desync every later frame on the track.
       if(!slot[hiKey] || !slot[loKey]) continue;
-      if(!sigDec[s.id]) sigDec[s.id]={ hi: be.createTrackDecoder({ kind:'luma', W, H }), lo: be.createTrackDecoder({ kind:'luma', W, H }) };
+      if(!sigDec[s.id]){
+        const sw=s.width ?? W, sh=s.height ?? H;   // per-signal geometry (v4), file default else
+        sigDec[s.id]={ hi: be.createTrackDecoder({ kind:'luma', W: sw, H: sh }), lo: be.createTrackDecoder({ kind:'luma', W: sw, H: sh }) };
+      }
       sigDec[s.id].hi.push(slot[hiKey]);
       sigDec[s.id].lo.push(slot[loKey]);
       const hi=await sigDec[s.id].hi.next();
@@ -167,7 +171,13 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   const muxFrames=[];
   const rgbKeyEvery=Math.max(1, Math.round(fps));
   let textTrackNumber=0;   // 0 when no metadata track was declared
-  const pixels=W*H;   // samples per signal plane; rgb is pixels*4 bytes (RGBA)
+  // Samples per plane: each stream's own geometry (v4) when its spec declares one, W*H else.
+  const pixelsOf=s=>(s.width ?? W)*(s.height ?? H);
+  // RGB stream dims by id, readable before the plan freezes (the plan entry wins once it exists).
+  const rgbDimsOf=id=>{
+    const e=(rgbPlan ?? declaredRgbs)?.find(r=>r.id===id);
+    return { w: e?.width ?? W, h: e?.height ?? H };
+  };
 
   // Backends are picked once per encoder, lazily, on first frame. Lossless (signals) and
   // lossy (rgb) probe independently — a browser may have native lossy but need WASM lossless.
@@ -203,12 +213,13 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   // concurrent caller past the guard before any of them assigns, so each would build its own pair
   // of track encoders and encode its frame as that encoder's frame 0 — every block a keyframe at
   // t=0, and all but the last encoder leaked unclosed.
-  function getSigEnc(id){
-    return sigEncP[id] ??= (async()=>{
+  function getSigEnc(s){
+    return sigEncP[s.id] ??= (async()=>{
       const be=await losslessBackend();
-      return sigEnc[id]={
-        hi: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps, keyEvery:rgbKeyEvery }),
-        lo: be.createTrackEncoder({ kind:'luma', lossless:true, W, H, fps, keyEvery:rgbKeyEvery }),
+      const sw=s.width ?? W, sh=s.height ?? H;
+      return sigEnc[s.id]={
+        hi: be.createTrackEncoder({ kind:'luma', lossless:true, W: sw, H: sh, fps, keyEvery:rgbKeyEvery }),
+        lo: be.createTrackEncoder({ kind:'luma', lossless:true, W: sw, H: sh, fps, keyEvery:rgbKeyEvery }),
       };
     })();
   }
@@ -217,7 +228,8 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     return rgbEncP[r.id] ??= (async()=>{
       const be=await lossyBackend();
       return rgbEnc[r.id]=be.createTrackEncoder({
-        kind:'rgba', lossless:false, W, H, fps, bitrate: r.kbps ?? rgbKbps, keyEvery:rgbKeyEvery });
+        kind:'rgba', lossless:false, W: r.width ?? W, H: r.height ?? H, fps,
+        bitrate: r.kbps ?? rgbKbps, keyEvery:rgbKeyEvery });
     })();
   }
 
@@ -325,16 +337,25 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     // Plane geometry is checked before anything stateful: a wrong-length plane is a caller bug
     // the codec backends cannot absorb (the WASM one copies it into a W*H*4 allocation on the
     // libvpx heap), and it says nothing about how this encoder was configured.
-    const checkPlane=(plane, label)=>{
+    const checkPlane=(plane, label, w, h)=>{
       const bytes=plane.byteLength ?? plane.length;
-      if(bytes!==pixels*4)
-        throw new Error(`addFrame: ${label} plane has ${bytes} bytes, expected ${pixels*4} (${W}x${H} RGBA)`);
+      if(bytes!==w*h*4)
+        throw new Error(`addFrame: ${label} plane has ${bytes} bytes, expected ${w*h*4} (${w}x${h} RGBA)`);
     };
     if(frame.rgbs!=null && typeof frame.rgbs!=='object')
       throw new Error('addFrame: rgbs must be an object of { streamId: plane }');
     const named=frame.rgbs ? Object.entries(frame.rgbs).filter(([,p])=>p!=null) : [];
-    if(frame.rgb!=null) checkPlane(frame.rgb, 'rgb');
-    for(const [id, plane] of named) checkPlane(plane, `rgb stream "${id}"`);
+    if(frame.rgb!=null){
+      // `rgb` is sugar for the primary stream, whose geometry the file's W/H is by definition —
+      // but a declared primary may still carry its own (v4), so resolve it like any stream.
+      const primaryId=(rgbPlan ?? declaredRgbs)?.[0]?.id ?? DEFAULT_RGB_ID;
+      const { w, h }=rgbDimsOf(primaryId);
+      checkPlane(frame.rgb, 'rgb', w, h);
+    }
+    for(const [id, plane] of named){
+      const { w, h }=rgbDimsOf(id);
+      checkPlane(plane, `rgb stream "${id}"`, w, h);
+    }
 
     if(frame.rgb!=null){
       // Track numbers were frozen without an RGB track, so this frame's RGB would be written to
@@ -375,7 +396,7 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
     // into a stateful encoder, so a rejected frame leaves the encoders untouched.
     const present=[];
     for(const s of signalPlan){
-      const u16=u16FromFramePayload(inputs[s.id], s, pixels);
+      const u16=u16FromFramePayload(inputs[s.id], s, pixelsOf(s));
       if(u16) present.push({ s, u16 });
     }
     if(!rgbPresent.length && !present.length) throw new Error('addFrame: pass rgb and/or signals');
@@ -384,7 +405,7 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
 
     for(const { s, u16 } of present){
       markStream(`sig:${s.id}`);
-      const enc=await getSigEnc(s.id);
+      const enc=await getSigEnc(s);
       const { hi, lo }=triFoldPack(u16);
       const chi=await enc.hi.push(hi), clo=await enc.lo.push(lo);
       writes.push(stamp(`sig:${s.id}`, s.tracks.hi, chi), stamp(`sig:${s.id}`, s.tracks.lo, clo));
