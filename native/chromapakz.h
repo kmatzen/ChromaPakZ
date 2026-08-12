@@ -111,6 +111,29 @@ typedef struct {
   const char* view;
 } dc_signal_spec2_t;
 
+// dc_rgb_spec_t plus per-stream geometry (format v4). width/height both 0 means "the file's
+// W/H"; both positive gives this stream its own frame size (its `data`/plane pointers are then
+// width*height-sized). One zero and one positive is error 1 — a half-specified geometry is
+// always a bug at the call site, never a wish for a default.
+typedef struct {
+  const char* id;
+  int kbps;
+  int width, height;   // 0,0 = the file default W/H
+} dc_rgb_spec2_t;
+
+// dc_signal_spec2_t plus per-signal geometry, under the same rules as dc_rgb_spec2_t. This is
+// what lets a depth map ride at a lower resolution than the RGB stream: `data` is then
+// N*width*height samples.
+typedef struct {
+  const char* id;
+  const uint16_t* data;
+  int inverse_depth;
+  double near_, far_;
+  int levels;
+  const char* view;
+  int width, height;   // 0,0 = the file default W/H
+} dc_signal_spec3_t;
+
 // HDR10/HLG description of the display track(s): VP9 profile 2, 10-bit, BT.2020, broadcast
 // range. Applies to every RGB stream of the file. `transfer` uses the WebM
 // TransferCharacteristics values: 16 = PQ (HDR10), 18 = HLG — anything else is error 1.
@@ -162,6 +185,27 @@ DC_API int dc_encode_multi_hdr(const uint16_t* const* rgbas,
                                const dc_signal_spec2_t* signals, int num_signals,
                                int W, int H, int N, int fps,
                                uint8_t** out, size_t* out_len);
+
+// As dc_encode_multi2 with per-stream geometry (format v4): each rgbas[i] is N*width*height*4
+// bytes and each signal's data N*width*height samples, at that spec's own width/height (0,0 =
+// the file default W/H, which every stream shared before v4). W/H remain the file-level
+// default and the primary display resolution readers see in `probe`. A spec whose geometry is
+// half-specified, or unusable under the same bound as W/H, is error 1. Streams with distinct
+// geometries still share the one frame grid — every stream carries all N frames.
+DC_API int dc_encode_multi3(const uint8_t* const* rgbas,
+                            const dc_rgb_spec2_t* rgbs, int num_rgbs,
+                            const dc_signal_spec3_t* signals, int num_signals,
+                            int W, int H, int N, int fps,
+                            uint8_t** out, size_t* out_len);
+
+// dc_encode_multi3's HDR form (see dc_encode_multi_hdr): each rgbas[i] is N*width*height*4
+// uint16 samples of 10-bit display codes at that stream's own geometry.
+DC_API int dc_encode_multi_hdr3(const uint16_t* const* rgbas,
+                                const dc_rgb_spec2_t* rgbs, int num_rgbs,
+                                const dc_hdr_meta_t* hdr,
+                                const dc_signal_spec3_t* signals, int num_signals,
+                                int W, int H, int N, int fps,
+                                uint8_t** out, size_t* out_len);
 
 // ── streaming (live-recording) encode ──
 // dc_encode_multi needs the whole take up front. These entry points encode it frame by frame and
@@ -230,6 +274,23 @@ DC_API int dc_stream_create_hdr(int W, int H, int fps,
                                 const char* text_track_name,
                                 dc_stream_encoder_t** out);
 
+// As dc_stream_create2 with per-stream geometry (see dc_encode_multi3): each frame's rgbas[i] /
+// signal_planes[i] is then sized by that spec's own width/height (0,0 = the file default W/H).
+// Same errors as dc_stream_create2; a half-specified or unusable geometry is error 1.
+DC_API int dc_stream_create3(int W, int H, int fps,
+                             const dc_rgb_spec2_t* rgbs, int num_rgbs, int emit_cues,
+                             const dc_signal_spec3_t* signals, int num_signals,
+                             const char* text_track_name,
+                             dc_stream_encoder_t** out);
+
+// dc_stream_create3's HDR form — dc_stream_create_hdr with per-stream geometry.
+DC_API int dc_stream_create_hdr3(int W, int H, int fps,
+                                 const dc_rgb_spec2_t* rgbs, int num_rgbs,
+                                 const dc_hdr_meta_t* hdr, int emit_cues,
+                                 const dc_signal_spec3_t* signals, int num_signals,
+                                 const char* text_track_name,
+                                 dc_stream_encoder_t** out);
+
 // Append one timed-text cue to the metadata track. Cues ride inside the cluster the
 // surrounding frames are already filling and never drive cluster boundaries, so this
 // usually returns an empty chunk. Fails if no text track was declared.
@@ -240,8 +301,10 @@ DC_API int dc_stream_header(dc_stream_encoder_t* enc, uint8_t** out, size_t* out
 
 // Encode one frame. `rgba` is W*H*4 bytes and required exactly when the stream declared RGB;
 // `signal_planes` is an array of num_signals pointers to W*H uint16 samples, in the order given
-// at create time. Every declared stream must be present on every frame — a track that stops and
-// resumes cannot be realigned, since each carries its own frame counter.
+// at create time. (For an encoder opened with dc_stream_create3/_hdr3, each plane is sized by
+// that stream's own width/height instead, when its spec declared one.) Every declared stream
+// must be present on every frame — a track that stops and resumes cannot be realigned, since
+// each carries its own frame counter.
 // *out receives whatever became final (zero or more whole Cluster elements) and may come back
 // NULL with *out_len 0, which is normal: most frames only extend the open cluster. Release a
 // non-NULL *out with dc_free().

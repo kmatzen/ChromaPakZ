@@ -152,8 +152,11 @@ def encode_clip(depth=None, rgb=None, near=None, far=None, fps=30, rgb_kbps=2000
         rgba = rgb if rgb.shape[-1] == 4 else np.concatenate(
             [rgb, np.full(rgb.shape[:-1] + (1,), 255, np.uint8)], axis=-1)
 
-    if codes is not None and rgba is not None and codes.shape != rgba.shape[:3]:
-        raise ValueError(f"depth {codes.shape} vs rgb {rgba.shape[:3]} dimension mismatch")
+    # Depth may ride at its own resolution beside the RGB (format v4) — only the frame
+    # count has to agree, because every stream shares the one frame grid.
+    if codes is not None and rgba is not None and codes.shape[0] != rgba.shape[0]:
+        raise ValueError(f"depth has {codes.shape[0]} frames vs rgb {rgba.shape[0]} — "
+                         "streams may differ in resolution but not in frame count")
 
     data = dc.encode(
         {"depth": codes} if codes is not None else {},
@@ -163,7 +166,9 @@ def encode_clip(depth=None, rgb=None, near=None, far=None, fps=30, rgb_kbps=2000
         rgb_kbps=rgb_kbps,
     )
 
-    shape = (codes if codes is not None else rgba).shape
+    # The file's header resolution: the display stream's when there is one (matching what
+    # encode() records), the depth's otherwise. Per-pixel stats are relative to it.
+    shape = (rgba if rgba is not None else codes).shape
     N, H, W = shape[0], shape[1], shape[2]
     stats = {"bytes": len(data), "N": N, "W": W, "H": H, "fps": fps,
              "near": near if quant else None, "far": far if quant else None,

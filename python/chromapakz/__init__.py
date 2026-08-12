@@ -72,6 +72,16 @@ class _RgbSpec(ctypes.Structure):
     _fields_ = [("id", ctypes.c_char_p), ("kbps", ctypes.c_int)]
 
 
+class _RgbSpec2(ctypes.Structure):
+    """dc_rgb_spec2_t — _RgbSpec plus per-stream geometry (0,0 = the file default)."""
+    _fields_ = _RgbSpec._fields_ + [("width", ctypes.c_int), ("height", ctypes.c_int)]
+
+
+class _SignalSpec3(ctypes.Structure):
+    """dc_signal_spec3_t — _SignalSpec2 plus per-signal geometry (0,0 = the file default)."""
+    _fields_ = _SignalSpec2._fields_ + [("width", ctypes.c_int), ("height", ctypes.c_int)]
+
+
 class _HdrMeta(ctypes.Structure):
     """dc_hdr_meta_t — HDR10/HLG description of the display track(s)."""
     _fields_ = [
@@ -199,6 +209,45 @@ def _load_multi_rgb():
     for fn in (enc2, dec_id, create2, add2):
         fn.restype = ctypes.c_int
     _multi_rgb_bound = True
+    return lib
+
+
+# The per-stream-geometry entry points (format v4), gated exactly like the multi-RGB ones above.
+_mixres_bound = False
+
+
+def _load_mixres():
+    """Load the core and bind the *3 entry points. OSError if this core predates them."""
+    global _mixres_bound
+    lib = _load()
+    if _mixres_bound:
+        return lib
+    try:
+        enc3, enc_hdr3 = lib.dc_encode_multi3, lib.dc_encode_multi_hdr3
+        create3, create_hdr3 = lib.dc_stream_create3, lib.dc_stream_create_hdr3
+    except AttributeError as e:
+        raise OSError(
+            f"this ChromaPakZ native core has no per-stream resolution support ({e}) — it was "
+            "built before format v4; rebuild it with `pip install .` or `cmake --build build`."
+        ) from e
+    enc3.argtypes = [
+        ctypes.POINTER(u8p), ctypes.POINTER(_RgbSpec2), _I,
+        ctypes.POINTER(_SignalSpec3), _I, _I, _I, _I, _I,
+        ctypes.POINTER(u8p), ctypes.POINTER(_Z),
+    ]
+    enc_hdr3.argtypes = [
+        ctypes.POINTER(u16p), ctypes.POINTER(_RgbSpec2), _I, ctypes.POINTER(_HdrMeta),
+        ctypes.POINTER(_SignalSpec3), _I, _I, _I, _I, _I,
+        ctypes.POINTER(u8p), ctypes.POINTER(_Z),
+    ]
+    create3.argtypes = [_I, _I, _I, ctypes.POINTER(_RgbSpec2), _I, _I,
+                        ctypes.POINTER(_SignalSpec3), _I, ctypes.c_char_p, ctypes.POINTER(_P)]
+    create_hdr3.argtypes = [_I, _I, _I, ctypes.POINTER(_RgbSpec2), _I, ctypes.POINTER(_HdrMeta),
+                            _I, ctypes.POINTER(_SignalSpec3), _I, ctypes.c_char_p,
+                            ctypes.POINTER(_P)]
+    for fn in (enc3, enc_hdr3, create3, create_hdr3):
+        fn.restype = ctypes.c_int
+    _mixres_bound = True
     return lib
 
 
@@ -364,6 +413,11 @@ def encode(signals=None, specs=None, rgb=None, rgbs=None, fps=30, rgb_kbps=2000,
     Signals must be integer codes in [0, 65535] and rgb uint8 RGBA — a lossy cast
     (float depth, out-of-range ints) is an error, not a silent wraparound.
 
+    Streams need not share a resolution (format v4): a ``(N, 24, 32)`` depth beside a
+    ``(N, 480, 640, 4)`` rgb records the depth at its own 32x24. Every stream still carries
+    the same N frames — the frame grid is shared even where the geometry is not. The file's
+    header resolution is the primary RGB stream's (the first signal's when there is no RGB).
+
     ``rgbs`` stores multiple synchronized RGB streams (stereo / multi-camera): a ``{id: array}``
     dict (or ``[(id, array)]`` pairs), each ``(N, H, W, 4)``, order fixing the track numbering.
     The first stream is the primary — the one legacy readers and plain players see. Mutually
@@ -394,19 +448,17 @@ def encode(signals=None, specs=None, rgb=None, rgbs=None, fps=30, rgb_kbps=2000,
     specs = dict(specs or {})
     ids = list(signals.keys())
     arrays = []
-    dims = None
-    N = H = W = None
-    if ids:
-        for sid in ids:
-            arr = _as_u16(signals[sid], f"signal {sid!r}")
-            if arr.ndim != 3:
-                raise ValueError(f"signal {sid!r} must be (N, H, W)")
-            if dims is None:
-                dims = arr.shape
-            elif dims != arr.shape:
-                raise ValueError(f"signal {sid!r} shape {arr.shape} != {dims}")
-            arrays.append(arr)
-        N, H, W = dims
+    N = None
+    for sid in ids:
+        arr = _as_u16(signals[sid], f"signal {sid!r}")
+        if arr.ndim != 3:
+            raise ValueError(f"signal {sid!r} must be (N, H, W)")
+        if N is None:
+            N = arr.shape[0]
+        elif arr.shape[0] != N:
+            raise ValueError(f"signal {sid!r} has {arr.shape[0]} frames, expected {N} — streams "
+                             "may differ in resolution but share the one frame grid")
+        arrays.append(arr)
 
     rgb_items = None   # [(id, array)] when the multi-stream form is in play
     if rgbs is not None:
@@ -416,11 +468,11 @@ def encode(signals=None, specs=None, rgb=None, rgbs=None, fps=30, rgb_kbps=2000,
             a = (_as_u10 if c_hdr is not None else _as_u8)(arr, f"rgb stream {sid!r}")
             if a.ndim != 4 or a.shape[3] != 4:
                 raise ValueError(f"rgb stream {sid!r} must be (N, H, W, 4) RGBA")
-            if dims is None:
-                dims = a.shape[:3]
-                N, H, W = dims
-            elif a.shape[:3] != (N, H, W):
-                raise ValueError(f"rgb stream {sid!r} {a.shape[:3]} != {(N, H, W)}")
+            if N is None:
+                N = a.shape[0]
+            elif a.shape[0] != N:
+                raise ValueError(f"rgb stream {sid!r} has {a.shape[0]} frames, expected {N} — "
+                                 "streams may differ in resolution but share the one frame grid")
             rgb_items.append((sid, a))
         if not rgb_items and not ids:
             raise ValueError("need at least one signal or rgb")
@@ -430,11 +482,25 @@ def encode(signals=None, specs=None, rgb=None, rgbs=None, fps=30, rgb_kbps=2000,
         rgb = _as_u8(rgb, "rgb")
         if rgb.ndim != 4 or rgb.shape[3] != 4:
             raise ValueError("rgb must be (N, H, W, 4) RGBA")
-        if ids and rgb.shape[:3] != (N, H, W):
-            raise ValueError(f"rgb {rgb.shape[:3]} vs signals {(N, H, W)}")
+        if N is None:
+            N = rgb.shape[0]
+        elif rgb.shape[0] != N:
+            raise ValueError(f"rgb has {rgb.shape[0]} frames, expected {N} — streams may differ "
+                             "in resolution but share the one frame grid")
         rgb_p = rgb.ctypes.data_as(u8p)
-        if not ids:
-            N, H, W = rgb.shape[:3]
+
+    # The file-level geometry: the primary display stream's when there is RGB (that is the
+    # resolution probes and plain players see), the first signal's otherwise. Streams at any
+    # other size get their own width/height in the metadata (format v4).
+    if rgb_items:
+        H, W = (int(d) for d in rgb_items[0][1].shape[1:3])
+    elif rgb is not None:
+        H, W = (int(d) for d in rgb.shape[1:3])
+    else:
+        H, W = (int(d) for d in arrays[0].shape[1:3])
+    mixed = (any(tuple(a.shape[1:3]) != (H, W) for a in arrays)
+             or any(tuple(a.shape[1:3]) != (H, W) for _, a in (rgb_items or []))
+             or (rgb is not None and tuple(rgb.shape[1:3]) != (H, W)))
 
     def fill_spec(c, i, sid, with_view):
         sp = specs.get(sid, {})
@@ -455,7 +521,44 @@ def encode(signals=None, specs=None, rgb=None, rgbs=None, fps=30, rgb_kbps=2000,
 
     out, out_len = u8p(), _Z()
     has_view = any("view" in (specs.get(sid) or {}) for sid in ids)
-    if c_hdr is not None or rgb_items is not None or has_view:
+    if mixed:
+        # Any stream at its own resolution goes through the format-v4 entry points. A single
+        # `rgb=` becomes the sole default stream, exactly as the *2 path treats it.
+        lib = _load_mixres()
+        if rgb is not None and rgb_items is None:
+            rgb_items = [("rgb", rgb)]
+        kbps_by_id = rgb_kbps if isinstance(rgb_kbps, dict) else {}
+        default_kbps = 2000 if isinstance(rgb_kbps, dict) else rgb_kbps
+        streams = _normalize_rgb_streams(
+            [(sid, kbps_by_id.get(sid)) for sid, _ in (rgb_items or [])], default_kbps)
+        c_rgbs = (_RgbSpec2 * len(streams))()
+        for i, (sid, kbps) in enumerate(streams):
+            c_rgbs[i].id = sid.encode("utf-8")
+            c_rgbs[i].kbps = kbps
+            h_, w_ = rgb_items[i][1].shape[1:3]
+            if (h_, w_) != (H, W):
+                c_rgbs[i].width, c_rgbs[i].height = int(w_), int(h_)
+        c_specs3 = (_SignalSpec3 * len(ids))()
+        for i, sid in enumerate(ids):
+            fill_spec(c_specs3, i, sid, with_view=True)
+            h_, w_ = arrays[i].shape[1:3]
+            if (h_, w_) != (H, W):
+                c_specs3[i].width, c_specs3[i].height = int(w_), int(h_)
+        if c_hdr is not None:
+            rgba16_ptrs = (u16p * len(streams))(*(a.ctypes.data_as(u16p) for _, a in rgb_items))
+            rc = lib.dc_encode_multi_hdr3(
+                rgba16_ptrs, c_rgbs, len(streams), ctypes.byref(c_hdr),
+                c_specs3 if ids else None, len(ids), W, H, N, fps,
+                ctypes.byref(out), ctypes.byref(out_len),
+            )
+        else:
+            rgba_ptrs = (u8p * len(streams))(*(a.ctypes.data_as(u8p) for _, a in (rgb_items or [])))
+            rc = lib.dc_encode_multi3(
+                rgba_ptrs if streams else None, c_rgbs if streams else None, len(streams),
+                c_specs3 if ids else None, len(ids), W, H, N, fps,
+                ctypes.byref(out), ctypes.byref(out_len),
+            )
+    elif c_hdr is not None or rgb_items is not None or has_view:
         lib = _load_hdr() if c_hdr is not None else _load_multi_rgb()
         kbps_by_id = rgb_kbps if isinstance(rgb_kbps, dict) else {}
         default_kbps = 2000 if isinstance(rgb_kbps, dict) else rgb_kbps
@@ -538,7 +641,20 @@ def _normalize_stream_signals(signals):
                 raise ValueError(f"signal {sid!r}: inverse_depth requires near and far")
             _check_inverse_depth(sp["near"], sp["far"], sp.get("levels", LEVELS_FULL))
             sp["inverse_depth"] = True
+        _check_spec_dims(sp, f"signal {sid!r}")
     return items
+
+
+def _check_spec_dims(sp, what):
+    """Validate a spec's optional per-stream `width`/`height` (format v4) in place."""
+    w, h = sp.get("width"), sp.get("height")
+    if (w is None) != (h is None):
+        raise ValueError(f"{what}: give width and height together, or neither")
+    if w is not None:
+        for name, v in (("width", w), ("height", h)):
+            if not isinstance(v, (int, np.integer)) or v <= 0:
+                raise ValueError(f"{what} {name} must be a positive integer (got {v!r})")
+        sp["width"], sp["height"] = int(w), int(h)
 
 
 class StreamEncoder:
@@ -564,9 +680,26 @@ class StreamEncoder:
         self._specs = _normalize_stream_signals(signals)
         default_kbps = 2000 if isinstance(rgb_kbps, dict) else int(rgb_kbps)
         kbps_by_id = rgb_kbps if isinstance(rgb_kbps, dict) else {}
+        rgb_dims = {}   # id -> (width, height) for streams with their own geometry (v4)
         if rgbs is not None:
-            items = list(rgbs.items()) if isinstance(rgbs, dict) else [
-                (r, None) if isinstance(r, str) else tuple(r) for r in rgbs]
+            if isinstance(rgbs, dict):
+                items = list(rgbs.items())
+            else:
+                items = []
+                for r in rgbs:
+                    if isinstance(r, str):
+                        items.append((r, None))
+                    elif isinstance(r, dict):
+                        d = dict(r)
+                        sid, kbps = d.pop("id", None), d.pop("kbps", None)
+                        _check_spec_dims(d, f"rgb stream {sid!r}")
+                        if "width" in d:
+                            rgb_dims[sid] = (d.pop("width"), d.pop("height"))
+                        if d:
+                            raise ValueError(f"unknown rgb stream key(s) {sorted(d)} for {sid!r}")
+                        items.append((sid, kbps))
+                    else:
+                        items.append(tuple(r))
             self._rgb_streams = _normalize_rgb_streams(
                 [(sid, kbps if kbps is not None else kbps_by_id.get(sid)) for sid, kbps in items],
                 default_kbps)
@@ -583,21 +716,39 @@ class StreamEncoder:
         self._on_chunk = on_chunk
         self._cues = bool(cues)
         self._n = 0
+        # A stream whose declared geometry merely restates the encoder's is not "its own":
+        # drop it, so such an encoder writes the same v3 file it always did.
+        for _, sp in self._specs:
+            if sp.get("width") == self.width and sp.get("height") == self.height:
+                del sp["width"], sp["height"]
+        self._rgb_dims = {sid: dims for sid, dims in rgb_dims.items()
+                          if dims != (self.width, self.height)}
+        self._mixres = (bool(self._rgb_dims)
+                        or any("width" in sp for _, sp in self._specs))
         # The single-stream, no-view, SDR path keeps using the pre-0.7.0 entry points, so this
         # wrapper still drives an older native core for everything it could already do.
-        self._multi = (rgbs is not None or self._hdr is not None
+        self._multi = (rgbs is not None or self._hdr is not None or self._mixres
                        or any("view" in sp for _, sp in self._specs))
 
         lib = self._lib = _load_stream()
         h = _P()
         self._text_track = text_track
         if self._multi:
-            _load_hdr() if self._hdr is not None else _load_multi_rgb()
-            c_rgbs = (_RgbSpec * len(self._rgb_streams))()
+            if self._mixres:
+                _load_mixres()
+            if self._hdr is not None:
+                _load_hdr()          # binds dc_stream_add_frame16, shared by both create paths
+            else:
+                _load_multi_rgb()    # binds dc_stream_add_frame2, ditto
+            rgb_spec_t = _RgbSpec2 if self._mixres else _RgbSpec
+            sig_spec_t = _SignalSpec3 if self._mixres else _SignalSpec2
+            c_rgbs = (rgb_spec_t * len(self._rgb_streams))()
             for i, (sid, kbps) in enumerate(self._rgb_streams):
                 c_rgbs[i].id = sid.encode("utf-8")
                 c_rgbs[i].kbps = kbps
-            c_specs = (_SignalSpec2 * len(self._specs))()
+                if self._mixres and sid in self._rgb_dims:
+                    c_rgbs[i].width, c_rgbs[i].height = self._rgb_dims[sid]
+            c_specs = (sig_spec_t * len(self._specs))()
             for i, (sid, sp) in enumerate(self._specs):
                 c_specs[i].id = sid.encode("utf-8")
                 c_specs[i].data = None
@@ -607,8 +758,20 @@ class StreamEncoder:
                 c_specs[i].levels = sp.get("levels", LEVELS_FULL)
                 view = sp.get("view")
                 c_specs[i].view = view.encode("utf-8") if view else None
+                if self._mixres and "width" in sp:
+                    c_specs[i].width, c_specs[i].height = sp["width"], sp["height"]
             text_c = str(text_track).encode("utf-8") if text_track else None
-            if self._hdr is not None:
+            if self._mixres and self._hdr is not None:
+                rc = lib.dc_stream_create_hdr3(
+                    self.width, self.height, self.fps,
+                    c_rgbs, len(self._rgb_streams), ctypes.byref(self._hdr),
+                    1 if self._cues else 0, c_specs, len(c_specs), text_c, ctypes.byref(h))
+            elif self._mixres:
+                rc = lib.dc_stream_create3(
+                    self.width, self.height, self.fps,
+                    c_rgbs if self._rgb_streams else None, len(self._rgb_streams),
+                    1 if self._cues else 0, c_specs, len(c_specs), text_c, ctypes.byref(h))
+            elif self._hdr is not None:
                 rc = lib.dc_stream_create_hdr(
                     self.width, self.height, self.fps,
                     c_rgbs, len(self._rgb_streams), ctypes.byref(self._hdr),
@@ -681,9 +844,9 @@ class StreamEncoder:
                 raise ValueError(f"signal {sid!r}: pass an array, {{'u16': …}} or {{'float': …}}")
         else:
             arr = _as_u16(payload, f"signal {sid!r}")
-        if arr.shape != (self.height, self.width):
-            raise ValueError(f"signal {sid!r} has shape {arr.shape}, "
-                             f"expected {(self.height, self.width)}")
+        want = (spec.get("height", self.height), spec.get("width", self.width))
+        if arr.shape != want:
+            raise ValueError(f"signal {sid!r} has shape {arr.shape}, expected {want}")
         return arr
 
     # ── the API ──
@@ -740,9 +903,10 @@ class StreamEncoder:
                 raise ValueError(f"frame {self._n} is missing rgb stream {sid!r}; every declared "
                                  "stream must be written on every frame")
             rgba = as_rgb(rgbs[sid], f"rgb stream {sid!r}")
-            if rgba.shape != (self.height, self.width, 4):
+            w, h = self._rgb_dims.get(sid, (self.width, self.height))
+            if rgba.shape != (h, w, 4):
                 raise ValueError(f"rgb stream {sid!r} has shape {rgba.shape}, "
-                                 f"expected {(self.height, self.width, 4)} RGBA")
+                                 f"expected {(h, w, 4)} RGBA")
             rgb_planes.append(rgba)
 
         c_planes = (u16p * len(planes))(*(p.ctypes.data_as(u16p) for p in planes))
@@ -843,6 +1007,12 @@ def create_encoder(width, height, signals=None, fps=30, has_rgb=False, rgb_kbps=
     auxiliary planes. RGB presence is declared here rather than inferred, because the header —
     including the track plan — is written before the first frame arrives.
 
+    A spec may carry its own `width`/`height` (format v4) for a signal at a different
+    resolution than the take — e.g. LiDAR depth at 256x192 beside 1920x1440 video; its frames
+    are then `(height, width)` planes of that size. RGB streams do the same through dict
+    entries in `rgbs`: `rgbs=["cam0", {"id": "guide", "width": 320, "height": 240}]`. The
+    encoder's own W, H remain the primary stream's — the resolution players see.
+
     Each frame's signal payload is `(H, W)` uint16 codes, `{"u16": codes}`, or `{"float": z}` for
     a signal with an inverse-depth range (quantized for you, as the browser encoder does). Every
     declared signal, and `rgb` when `has_rgb`, must be present on every frame.
@@ -884,7 +1054,10 @@ def probe(data):
     """Return dict(width, height, frames, fps, near, far, levels, has_rgb, rgbs, signals).
 
     ``has_rgb`` stays a bool; ``rgbs`` lists every RGB stream (``[{id, track, codec}]``,
-    primary first — one synthesized default entry for a pre-v3 file with RGB)."""
+    primary first — one synthesized default entry for a pre-v3 file with RGB). ``width`` and
+    ``height`` are the file's header resolution (the primary stream's); a stream at its own
+    resolution (format v4) says so via ``width``/``height`` keys on its ``rgbs``/``signals``
+    entry."""
     buf = _buf(data)
     W, H, N, fps, levels, rgb = (ctypes.c_int() for _ in range(6))
     near, far = ctypes.c_double(), ctypes.c_double()
@@ -949,7 +1122,10 @@ def decode_signal(data, signal_id, _n_frames=None):
     """
     info = probe(data)
     N = _decode_frames(info, data, _n_frames)
-    H, W = info["height"], info["width"]
+    # The signal's own geometry (format v4) when it declares one, the file's otherwise.
+    entry = next((s for s in info["signals"] if s.get("id") == signal_id), {})
+    H = entry.get("height") or info["height"]
+    W = entry.get("width") or info["width"]
     out = _out_buffer((N, H, W), np.uint16)
     buf = _buf(data)
     sid = signal_id.encode("utf-8")
@@ -969,9 +1145,11 @@ def decode_rgb(data, stream=None, _n_frames=None):
     if not info["has_rgb"]:
         raise RuntimeError("file has no RGB track")
     N = _decode_frames(info, data, _n_frames)
-    H, W = info["height"], info["width"]
     entry = (info["rgbs"][0] if stream is None
              else next((r for r in info["rgbs"] if r.get("id") == stream), None))
+    # The stream's own geometry (format v4) when it declares one, the file's otherwise.
+    H = (entry or {}).get("height") or info["height"]
+    W = (entry or {}).get("width") or info["width"]
     buf = _buf(data)
     if entry is not None and entry.get("hdr"):
         out = _out_buffer((N, H, W, 4), np.uint16)

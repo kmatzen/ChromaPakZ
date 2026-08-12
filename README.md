@@ -14,6 +14,8 @@ normals, or any other `W×H` `uint16` plane — all kept in sync. Its design goa
 - **multiple lossless uint16 signals** (depth, object IDs, …) share one container, frame-aligned;
 - **multiple synchronized RGB streams** for stereo / multi-camera rigs — one per camera, same clusters,
   same timeline;
+- **each stream at its own resolution** — depth at sensor size (256×192 LiDAR) beside full-resolution
+  video, frame-aligned all the same;
 - the display track can be **8-bit SDR or 10-bit HDR10/HLG** (VP9 profile 2, BT.2020, with the WebM
   `Colour` element players actually read).
 
@@ -66,7 +68,7 @@ its encoder — `encode failed (2)` / "the RGB encoder could not be opened". Che
 | **Container** | WebM / Matroska, multi-track. The primary RGB stream is track 1, so any player shows it; depth tracks are ignored by players that don't know them. A Duration, a Cues index, and ~1 s RGB keyframes make it **seekable** in `<video>` (depth stays single-keyframe — it isn't what `<video>` plays). |
 | **RGB tracks** | Normal, viewable video streams: 8-bit VP9, YUV 4:2:0, BT.709 full-range — or, for HDR, VP9 profile 2, 10-bit, BT.2020 broadcast-range with a WebM `Colour` element. One per camera for stereo / multi-camera rigs (`rgbs`); legacy readers see the primary. |
 | **Lossless signals** | Each signal: optional quant (e.g. inverse-depth for float depth) → **uint16** → **triangle-fold 8+8** → two **VP9 lossless** tracks. Add object IDs, labels, etc. as additional signal pairs. |
-| **Metadata** | v3 — `rgbs[]` (every RGB stream) + `signals[]` (each signal: `id`, tracks, scheme, quant). |
+| **Metadata** | v4 — `rgbs[]` (every RGB stream) + `signals[]` (each signal: `id`, tracks, scheme, quant); any entry may carry its own `width`/`height` (files whose streams all share the file resolution stay v3, byte-identical). |
 
 **Inverse-depth quantization** spends precision where it matters (near surfaces), matching how stereo/ToF
 sensors behave. Float can't be stored losslessly in 16 bits, so this quantization *is* the format's defined

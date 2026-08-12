@@ -101,9 +101,27 @@ await enc.addFrame({ rgbs: { cam0, cam1 }, signals: { … } });
 
 Decoded frames gain `frame.rgbs` (`{ id: plane }`) beside the legacy `frame.rgb` (= the primary),
 and the batch `decode()` returns a per-stream `rgbs` series. All streams share the encoder's
-`W`×`H` and the frame grid; the per-frame contiguity rule above applies to each stream. A signal
+frame grid; the per-frame contiguity rule above applies to each stream. A signal
 spec may carry `view: '<rgb id>'` — an informational hint (recorded in the metadata, interpreted
 by nothing) naming the camera frame the signal lives in.
+
+### Per-stream resolution (format v4)
+
+Any signal spec — and any `rgbs` entry given as an object — may carry its own `width`/`height`
+(both together, positive integers) for a stream at a different resolution than the encoder's
+`W`×`H`, e.g. depth at sensor resolution beside full-size video:
+
+```javascript
+createEncoder({ W: 1920, H: 1440, hasRgb: true,
+                signals: [{ id: 'depth', near, far, width: 256, height: 192 }] });
+createEncoder({ W, H, signals, rgbs: ['cam0', { id: 'guide', width: 320, height: 240 }] });
+```
+
+Planes for such a stream are sized by its own geometry (`width*height` samples, `*4` bytes for
+RGBA). On the decode side each stream comes back at its own size; `dec.width`/`dec.height` stay
+the file-level (primary) resolution, and a stream's own is on its `metadata.rgbs[i]` /
+`metadata.signals[i]` entry. Declaring a stream at exactly `W`×`H` is the default, not a
+difference — such files keep writing `"version": 3` byte-identically.
 
 ### HDR display tracks (read side only)
 
@@ -137,9 +155,11 @@ so `addText` usually returns no bytes of its own.
 
 ### Plane sizes
 
-Every plane handed to `addFrame()` must match the encoder's geometry exactly: `W*H` samples for a
-signal (`u16` or `float`), `W*H*4` bytes for `rgb` (RGBA). A mismatch throws before any encoder is
-touched, so the rejected frame is not counted and the encoder stays usable for the next one.
+Every plane handed to `addFrame()` must match its stream's geometry exactly: `W*H` samples for a
+signal (`u16` or `float`), `W*H*4` bytes for `rgb` (RGBA) — where W/H are the stream's own
+`width`/`height` when its spec declared one (format v4), the encoder's otherwise. A mismatch
+throws before any encoder is touched, so the rejected frame is not counted and the encoder stays
+usable for the next one.
 
 ### Concurrency
 
@@ -213,6 +233,15 @@ numbering, the first stream being the primary one legacy readers decode; `rgb_kb
 `{id: kbps}` dict), then `add_frame(rgbs={"cam0": a, "cam1": b}, signals=…)` with every declared
 stream on every frame. A spec may carry `view: "<rgb id>"` — an informational hint naming the
 camera frame a signal lives in, recorded in the metadata and interpreted by nothing.
+
+Streams need not share a resolution (format v4). In batch `encode()` it is inferred: each
+signal/stream array carries its own `(H, W)`, only the frame count `N` must agree, and the
+file's header resolution is the primary RGB stream's (the first signal's without RGB) — so
+`encode({"depth": d_256x192}, rgb=rgb_1920x1440)` just works. In `create_encoder()` geometry is
+declared: a signal spec may carry `width`/`height`, and an `rgbs` entry may be a dict
+(`rgbs=["cam0", {"id": "guide", "width": 320, "height": 240}]`); frames then pass planes at
+each stream's own size. Decoders return each stream at its own shape, and `probe()`'s
+`rgbs`/`signals` entries carry `width`/`height` where a stream differs from the file's.
 
 `hdr=` makes every RGB stream an HDR display track (VP9 profile 2, 10-bit, BT.2020, WebM
 `Colour` element): `{"transfer": "pq"|"hlg", "max_cll"?, "max_fall"?, "mastering"?:
@@ -305,7 +334,8 @@ quantize float depth with `quantize_inverse()` first.
 | Function | Purpose |
 |---|---|
 | `dc_encode_multi` / `dc_encode_multi2` / `dc_encode_multi_hdr` | RGB (one / N streams / N HDR streams) + N signals |
-| `dc_stream_create` / `_create_ex` / `_create2` / `_create_hdr` / `_header` / `_add_frame` / `_add_frame2` / `_add_frame16` / `_add_text` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording (`_ex` adds the timed-text track; `_add_text` writes its cues) |
+| `dc_encode_multi3` / `dc_encode_multi_hdr3` | As `_multi2`/`_multi_hdr`, with per-stream geometry (format v4) |
+| `dc_stream_create` / `_create_ex` / `_create2` / `_create_hdr` / `_create3` / `_create_hdr3` / `_header` / `_add_frame` / `_add_frame2` / `_add_frame16` / `_add_text` / `_finish` / `_destroy` | Frame-at-a-time encode for live recording (`_ex` adds the timed-text track; `_add_text` writes its cues; `_create3`/`_create_hdr3` take per-stream geometry) |
 | `dc_decode_signal` | Decode by id |
 | `dc_get_metadata` | CHROMAPAKZ JSON |
 | `dc_probe` / `dc_decode_rgb` / `dc_decode_rgb_id` / `dc_decode_rgb16` | Header + RGB (primary / by stream id / 10-bit HDR) |
@@ -316,6 +346,11 @@ untouched, and `dc_probe`'s `has_rgb` out-param now counts streams (still 0/1 fo
 The `*_hdr` / `*16` entry points (0.8.0) add the 10-bit HDR display path: `dc_hdr_meta_t`
 describes transfer/light-levels/ST 2086 mastering, RGB planes cross the ABI as uint16 10-bit
 codes, and the 8- and 10-bit forms refuse each other's streams (error 7 on decode, 1 on encode).
+The `*3` entry points take `dc_rgb_spec2_t` / `dc_signal_spec3_t` — the `*2` structs plus a
+per-stream `width`/`height` (both 0 = the file default W/H; format v4) — and that spec's plane
+pointers are then sized by its own geometry. The decode entry points need no new forms: they
+resolve each stream's geometry from the metadata, so the caller's buffer is sized by the
+stream's own width×height (from `dc_get_metadata`) rather than `dc_probe`'s file-level pair.
 
 Every entry point returns `0` on success and a nonzero code on failure — none of them throw, and
 none of them abort on NULL or degenerate arguments. Codes `1`–`8` are per-function, documented on
@@ -352,7 +387,7 @@ int dc_decode_rgb(const uint8_t* webm, size_t len,
 | Code | Meaning |
 |---|---|
 | `9` (`DC_ERR_CAPACITY`) | the track decodes to more frames than the capacity holds — the header under-declared `frames`, or a block carried a VP9 superframe |
-| `10` (`DC_ERR_GEOMETRY`) | a decoded frame is not the `W×H` I420 the metadata declares — 8-bit for the SDR entry points, 10-bit for `dc_decode_rgb16` |
+| `10` (`DC_ERR_GEOMETRY`) | a decoded frame is not the I420 geometry the metadata declares for that stream (its own `width`×`height` under v4, the file's otherwise) — 8-bit for the SDR entry points, 10-bit for `dc_decode_rgb16` |
 
 Neither ever writes past `*_cap`. Frames the file does not actually contain are left untouched,
 so zero the buffer first if you read all of it back — the Python bindings do.

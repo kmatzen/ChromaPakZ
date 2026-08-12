@@ -28,8 +28,23 @@ export const DEFAULT_RGB_ID = 'rgb';
 export const rgbSlotKey = id => `rgb:${JSON.stringify(id)}`;
 
 /**
+ * A spec's optional per-stream geometry (format v4): `width`/`height` together or not at all,
+ * both positive integers. Returns `{ width, height }` or null for "the file default".
+ */
+function specDims(spec, what){
+  const w=spec.width, h=spec.height;
+  if(w===undefined && h===undefined) return null;
+  if(w===undefined || h===undefined)
+    throw new Error(`${what}: give width and height together, or neither`);
+  if(!Number.isInteger(w) || w<=0 || !Number.isInteger(h) || h<=0)
+    throw new Error(`${what}: width/height must be positive integers (got ${w}x${h})`);
+  return { width: w, height: h };
+}
+
+/**
  * Normalize createEncoder's `rgbs` declaration — an array of ids (strings) or
- * `{ id, kbps? }` entries — into `[{ id, kbps }]`, order preserved (it fixes track numbering).
+ * `{ id, kbps?, width?, height? }` entries — into `[{ id, kbps, width, height }]`, order
+ * preserved (it fixes track numbering). width/height null = the file default (v4 otherwise).
  */
 export function normalizeRgbSpecs(rgbs){
   if(!Array.isArray(rgbs)) throw new Error('rgbs must be an array of stream ids or { id, kbps } entries');
@@ -40,7 +55,8 @@ export function normalizeRgbSpecs(rgbs){
     if(typeof id !== 'string' || !id) throw new Error('each rgb stream needs a non-empty string id');
     if(seen.has(id)) throw new Error(`duplicate rgb stream id "${id}"`);
     seen.add(id);
-    out.push({ id, kbps: spec.kbps ?? null });
+    const dims=specDims(spec, `rgb stream "${id}"`);
+    out.push({ id, kbps: spec.kbps ?? null, width: dims?.width ?? null, height: dims?.height ?? null });
   }
   return out;
 }
@@ -53,6 +69,7 @@ export function normalizeRgbSpecs(rgbs){
 export function planRgbs(specs){
   return specs.map((s, i)=>({
     id: s.id, track: i+1, codec: VP9, kbps: s.kbps ?? null,
+    width: s.width ?? null, height: s.height ?? null,
     trackName: i===0 ? 'rgb' : `rgb-${s.id}`,
   }));
 }
@@ -84,11 +101,17 @@ export function normalizeMetadata(meta){
   // rgbs[] has been resolved: neither signals nor RGB means nothing to decode.
   if(!Array.isArray(meta.signals))
     throw new Error('metadata must include signals[] (v2)');
+  // Per-stream geometry (v4) survives normalization only whole and positive — a half-declared
+  // or degenerate one falls back to the file's W/H, the shape every pre-v4 reader would assume.
+  const ownDims=e=>Number.isInteger(e.width) && e.width>0 && Number.isInteger(e.height) && e.height>0
+    ? { width: e.width, height: e.height } : null;
   const signals=meta.signals.map(s=>{
     const quant=s.quant && typeof s.quant === 'object'
       ? { ...s.quant, type: s.quant.type ?? (s.quant.near !== undefined ? QUANT_INVERSE_DEPTH : null) }
       : s.quant === QUANT_INVERSE_DEPTH ? { type: QUANT_INVERSE_DEPTH, near: s.near, far: s.far, levels: s.levels } : s.quant;
-    return { ...s, tracks: { hi: s.tracks.hi, lo: s.tracks.lo }, quant };
+    const entry={ ...s, tracks: { hi: s.tracks.hi, lo: s.tracks.lo }, quant };
+    if(!ownDims(entry)){ delete entry.width; delete entry.height; }
+    return entry;
   });
   // rgbs[] (v3) is authoritative when present; a legacy `rgb` (v2, always the sole stream)
   // is folded into a one-entry list under the default id so every reader path below sees
@@ -97,6 +120,7 @@ export function normalizeMetadata(meta){
     ? meta.rgbs.filter(r=>r && r.track).map((r, i)=>({
         id: typeof r.id === 'string' && r.id ? r.id : (i===0 ? DEFAULT_RGB_ID : `rgb${i}`),
         track: r.track, codec: r.codec,
+        ...(ownDims(r) ?? {}),
         ...(r.hdr ? { hdr: r.hdr } : {}) }))
     : meta.rgb ? [{ id: DEFAULT_RGB_ID, track: meta.rgb.track ?? RGB_TRACK, codec: meta.rgb.codec }] : [];
   if(!signals.length && !rgbs.length)
@@ -139,6 +163,9 @@ export function planSignals(specs, rgbCount){
       tracks: { hi, lo },
       trackNames: { hi: `signal-${id}-hi`, lo: `signal-${id}-lo` },
       quant,
+      // Optional per-signal geometry (format v4) — a depth map at a lower resolution than the
+      // take. Absent = the encoder's W/H, as every signal was before v4.
+      ...(specDims(raw, `signal "${id}"`) ?? {}),
       // Optional, semantically inert hint: the id of the RGB stream whose camera frame this
       // signal lives in. Recorded in the metadata for downstream consumers; never interpreted.
       view: typeof raw.view === 'string' && raw.view ? raw.view : null,
@@ -156,19 +183,26 @@ function coerceRgbPlan(rgbPlan){
 export function buildTracksFromPlan(W, H, rgbPlan, signals){
   const tracks=[];
   for(const r of coerceRgbPlan(rgbPlan))
-    tracks.push({ number:r.track, codecID:'V_VP9', name:r.trackName, width:W, height:H });
+    tracks.push({ number:r.track, codecID:'V_VP9', name:r.trackName, width:r.width ?? W, height:r.height ?? H });
   for(const s of signals){
-    tracks.push({ number:s.tracks.hi, codecID:'V_VP9', name:s.trackNames.hi, width:W, height:H });
-    tracks.push({ number:s.tracks.lo, codecID:'V_VP9', name:s.trackNames.lo, width:W, height:H });
+    const sw=s.width ?? W, sh=s.height ?? H;
+    tracks.push({ number:s.tracks.hi, codecID:'V_VP9', name:s.trackNames.hi, width:sw, height:sh });
+    tracks.push({ number:s.tracks.lo, codecID:'V_VP9', name:s.trackNames.lo, width:sw, height:sh });
   }
   return tracks;
 }
 
 export function buildFileMetadata({ W, H, fps, n, hasRgb, rgbs, signals, streaming=false }){
   const rgbPlan=coerceRgbPlan(rgbs ?? hasRgb);
+  // A stream's own geometry (v4) is recorded only when it actually differs from the file's —
+  // one that merely restates W/H is the default, so such files stay byte-identical v3 output.
+  // Key placement (after `tracks`/`codec`) mirrors the C++ writer exactly.
+  const dimsOf=e=>e.width && e.height && !(e.width===W && e.height===H)
+    ? { width: e.width, height: e.height } : null;
   const sigMeta=signals.map(s=>({
     id: s.id,
     tracks: { hi: s.tracks.hi, lo: s.tracks.lo },
+    ...(dimsOf(s) ?? {}),
     codec: s.codec,
     lossless: s.lossless,
     scheme: s.scheme,
@@ -177,14 +211,17 @@ export function buildFileMetadata({ W, H, fps, n, hasRgb, rgbs, signals, streami
     quant: s.quant,
     view: s.view ?? undefined,
   }));
+  const anyDims=signals.some(s=>dimsOf(s)) || rgbPlan.some(r=>dimsOf(r));
   // v3 keeps the legacy `rgb` key pointing at the primary stream (always equal to rgbs[0]),
   // so pre-multi-RGB readers decode it exactly as before; `rgbs` is what v3 readers use.
   return {
-    version: 3, width: W, height: H, fps,
+    version: anyDims ? 4 : 3, width: W, height: H, fps,
     frames: streaming ? null : n,
     streaming: streaming || undefined,
     rgb: rgbPlan.length ? { track: rgbPlan[0].track, codec: VP9 } : null,
-    rgbs: rgbPlan.length ? rgbPlan.map(r=>({ id: r.id, track: r.track, codec: r.codec })) : undefined,
+    rgbs: rgbPlan.length
+      ? rgbPlan.map(r=>({ id: r.id, track: r.track, codec: r.codec, ...(dimsOf(r) ?? {}) }))
+      : undefined,
     signals: sigMeta,
   };
 }
