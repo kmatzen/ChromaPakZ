@@ -1139,14 +1139,16 @@ struct TrackEncoder {
   int W=0, H=0;
   int keyEvery=0;      // force a keyframe every N frames; 0 = only the first frame
   int64_t pushed=0;    // frames handed to libvpx, including the terminating flush
+  bool realtime=false; // live-capture profile: REALTIME deadline + faster speed steps
 
   TrackEncoder()=default;
   TrackEncoder(const TrackEncoder&)=delete;
   TrackEncoder& operator=(const TrackEncoder&)=delete;
   ~TrackEncoder(){ if(haveImg) vpx_img_free(&img); if(haveCtx) vpx_codec_destroy(&ctx); }
 
-  EncStatus init(int W_, int H_, int fps, bool lossless, int kbps, int keyEvery_, bool hdr10_=false){
-    W=W_; H=H_; rgba=!lossless; keyEvery=keyEvery_; hdr10=hdr10_;
+  EncStatus init(int W_, int H_, int fps, bool lossless, int kbps, int keyEvery_, bool hdr10_=false,
+                 bool realtime_=false){
+    W=W_; H=H_; rgba=!lossless; keyEvery=keyEvery_; hdr10=hdr10_; realtime=realtime_;
     vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
     vpx_codec_enc_cfg_t cfg{}; if(vpx_codec_enc_config_default(iface,&cfg,0)) return ENC_FAIL;
     cfg.g_w=W; cfg.g_h=H; cfg.g_timebase.num=1; cfg.g_timebase.den=fps;
@@ -1188,14 +1190,28 @@ struct TrackEncoder {
       // losslessly: cpu-used=1 89.7 ms/frame at 39.1 KiB, cpu-used=6 58.9 ms at
       // 40.1 KiB — 1.5x faster for 2.5% more bytes. 7..9 give nothing further.
       // Capture is frame-budget bound, so the time matters more than the bytes.
-      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 6);
+      // Realtime raises the speed step to 9: under VP9E_SET_LOSSLESS the
+      // reconstruction is bit-exact at every setting, so this is time vs bytes
+      // only. Measured on the capture geometry (256x192 depth+confidence,
+      // noisy planes, Apple-silicon arm64): GOOD+6 36.9 ms/frame ->
+      // REALTIME+9 7.7 ms — 4.8x — for a few percent more bytes. Batch keeps
+      // GOOD+6: a converter is not frame-budget bound, and its bytes are
+      // archival.
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, realtime ? 9 : 6);
     }else{
       // Lossy, so unlike the lossless path this trades picture quality, not just
       // size: on a real take, cpu-used=2 gives 42.75 dB PSNR and =4 gives 40.75 dB,
       // for ~7 ms/frame. Capture is frame-budget bound and the RGB track is the
       // colour reference beside bit-exact depth, so the milliseconds win. Past 4 is
       // pointless — cpu-used=6 measured both slower and worse.
-      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 4);
+      // Lossy speed. Realtime uses 8: the deadline switch itself costs the
+      // quality (960x720@2000kbps: 38.6 dB GOOD+4 -> ~31.8 dB at any realtime
+      // speed step), after which 8 is simply the fastest (40.5 -> 9.9
+      // ms/frame, 4.1x). The quality is bought back with bitrate, which is the
+      // caller's knob: rt+8@6000kbps measured 39.2 dB — above the old
+      // baseline — at 3x the old speed. Batch keeps GOOD+4 and its measured
+      // 42.75 dB tradeoff; converter output is watched, not raced.
+      vpx_codec_control(&ctx, VP8E_SET_CPUUSED, realtime ? 8 : 4);
       vpx_codec_control(&ctx, VP9E_SET_COLOR_SPACE, hdr10?VPX_CS_BT_2020:VPX_CS_BT_709);
     }
     // SDR/signal tracks are full-range on purpose (packed luma must not be rescaled); the HDR
@@ -1239,7 +1255,7 @@ struct TrackEncoder {
     vpx_enc_frame_flags_t fl = (pushed==0 || (keyEvery>0 && pushed%keyEvery==0)) ? VPX_EFLAG_FORCE_KF : 0;
     vpx_codec_pts_t pts=(vpx_codec_pts_t)pushed;
     pushed++;
-    if(vpx_codec_encode(&ctx,in,pts,1,fl,VPX_DL_GOOD_QUALITY)) return false;
+    if(vpx_codec_encode(&ctx,in,pts,1,fl, realtime?VPX_DL_REALTIME:VPX_DL_GOOD_QUALITY)) return false;
     const vpx_codec_cx_pkt_t* pkt; vpx_codec_iter_t it=nullptr;
     while((pkt=vpx_codec_get_cx_data(&ctx,&it))) if(pkt->kind==VPX_CODEC_CX_FRAME_PKT){
       outFrames.emplace_back((uint8_t*)pkt->data.frame.buf, (uint8_t*)pkt->data.frame.buf+pkt->data.frame.sz);
@@ -1907,14 +1923,16 @@ static int streamCreateImpl(int W, int H, int fps,
     auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
     int kbps=rgbSpecs[i].kbps;
     if(enc->init(dimOr(rgbSpecs[i].width,W),dimOr(rgbSpecs[i].height,H),fps,
-                 /*lossless=*/false,kbps?kbps:2000,/*keyEvery=*/fps,hdr.enabled)) return 2;
+                 /*lossless=*/false,kbps?kbps:2000,/*keyEvery=*/fps,hdr.enabled,
+                 /*realtime=*/true)) return 2;
     h->slots.push_back({h->rgbMeta[i].track, std::move(enc), 0});
   }
   for(auto& sm : h->sigMeta){
     int sw=dimOr(sm.width,W), sh=dimOr(sm.height,H);
     for(int track : {sm.track_hi, sm.track_lo}){
       auto enc=std::unique_ptr<TrackEncoder>(new TrackEncoder());
-      if(EncStatus st=enc->init(sw,sh,fps,/*lossless=*/true,0,/*keyEvery=*/fps>0?fps:30))
+      if(EncStatus st=enc->init(sw,sh,fps,/*lossless=*/true,0,/*keyEvery=*/fps>0?fps:30,
+                                /*hdr10=*/false,/*realtime=*/true))
         return st==ENC_NO_LOSSLESS?DC_ERR_CODEC:3;
       h->slots.push_back({track, std::move(enc), 0});
     }
