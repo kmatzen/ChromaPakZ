@@ -4,6 +4,38 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.11.0 — 2026-08-12
+
+Streaming encodes now run a realtime profile; batch encodes are unchanged.
+
+### Changed — the streaming encoder targets the frame budget, not the archive
+
+`dc_stream_*` encoders (live capture: WurldCam, the browser recorder's native
+sibling) now encode with the REALTIME deadline, cpu-used 8 on lossy RGB and 9
+on lossless planes. Batch (`encode`, the converters) keeps GOOD_QUALITY and its
+measured tradeoffs — a converter is not racing a sensor, and its bytes are
+archival.
+
+Measured on Apple-silicon arm64 at the LiDAR-capture geometry (960x720 RGB +
+256x192 depth + confidence, noisy planes):
+
+|                              | before | after | speedup |
+|------------------------------|--------|-------|---------|
+| full streaming pipeline      | 47.4 ms/frame | 12.7 ms | 3.7x |
+| lossy RGB 960x720            | 32.2 ms | 7.3-10.4 ms | 3-4x |
+| lossless signals 256x192 x2  | 25.0 ms | 6.1 ms | 4.1x |
+
+On an iPhone 15 Pro this moves a real capture from ~19 fps effective (half the
+frames dropped by backpressure) to the full sensor rate at 960x720.
+
+Two things did not change. Lossless stays bit-exact: `VP9E_SET_LOSSLESS` gates
+fidelity at every speed step, so realtime costs a few percent of compression
+ratio, never a bit of data — reverified by round-trip. And lossy quality is a
+bitrate question now rather than a deadline question: at the same bitrate the
+realtime deadline costs ~7 dB PSNR, but at 6000 kbps it measures 39.2 dB —
+above the old 2000 kbps baseline's 38.6 — while still 3x faster. Callers that
+stream lossy RGB should raise their bitrate accordingly; WurldCam does.
+
 ## 0.10.0 — 2026-08-12
 
 ### Added — per-stream resolution (format v4)
