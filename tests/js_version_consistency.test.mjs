@@ -50,10 +50,34 @@ test('pyproject derives the version from the package rather than re-declaring it
 test('every published path in package.json exists', () => {
   for (const entry of pkg.files)
     assert.ok(existsSync(join(root, entry)), `package.json "files" entry missing on disk: ${entry}`);
-  for (const [name, target] of Object.entries(pkg.exports))
-    assert.ok(existsSync(join(root, target)), `package.json export "${name}" -> missing ${target}`);
+  for (const [name, target] of Object.entries(pkg.exports)) {
+    // A subpath may map straight to a file, or to a conditions object ({ types, default, ... }) —
+    // every condition it names must resolve to a real file either way.
+    const targets = typeof target === 'string' ? [target] : Object.values(target);
+    for (const t of targets)
+      assert.ok(existsSync(join(root, t)), `package.json export "${name}" -> missing ${t}`);
+  }
   assert.ok(existsSync(join(root, pkg.main)), `"main" -> missing ${pkg.main}`);
   assert.ok(existsSync(join(root, pkg.module)), `"module" -> missing ${pkg.module}`);
+  assert.ok(existsSync(join(root, pkg.types)), `"types" -> missing ${pkg.types}`);
+});
+
+test('the main entry\'s .d.ts declares every named export chromapakz.js has', () => {
+  const src = read('src/chromapakz.js');
+  const dts = read('src/chromapakz.d.ts');
+  // Named exports only: `export function foo`/`export const foo` at the top level, plus every
+  // name re-exported via `export { a, b } from './x.js'`. Good enough to catch "added an export,
+  // forgot the .d.ts" without hand-parsing ES module syntax.
+  const names = new Set();
+  for (const m of src.matchAll(/^export\s+(?:async\s+)?function\s+(\w+)/gm)) names.add(m[1]);
+  for (const m of src.matchAll(/^export\s+const\s+(\w+)/gm)) names.add(m[1]);
+  for (const m of src.matchAll(/^export\s*\{([^}]+)\}/gm))
+    for (const part of m[1].split(',')) {
+      const name = part.trim().split(/\s+as\s+/).pop().trim();
+      if (name) names.add(name);
+    }
+  for (const name of names)
+    assert.ok(new RegExp(`\\b${name}\\b`).test(dts), `src/chromapakz.d.ts is missing export "${name}"`);
 });
 
 test('test discovery is glob-driven, not a hand-maintained list', () => {

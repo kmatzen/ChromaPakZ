@@ -35,7 +35,7 @@ async function readRGBA(frame, W, H){
 const makeFrameFor = (kind) => kind==='rgba' ? rgbaFrame : lumaFrame;
 const readFnFor    = (kind) => kind==='rgba' ? readRGBA  : readLuma;
 
-export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, keyEvery=Infinity }){
+export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, keyEvery=Infinity, realtime=false }){
   const makeFrame=makeFrameFor(kind);
   const planeBytes=kind==='rgba' ? W*H*4 : W*H;
   // waitOut is a *queue*: a single slot would be overwritten by a second push() issued before the
@@ -52,7 +52,7 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
     const chunk={ key:c.type==='key', timeMs:Math.round(c.timestamp/1000), data };
     if(waitOut.length) waitOut.shift().res(chunk); else outQ.push(chunk);
   }, error:fail });
-  enc.configure(encoderConfig({ lossless, W, H, fps, bitrate }));
+  enc.configure(encoderConfig({ lossless, W, H, fps, bitrate, realtime }));
   return {
     async push(src){
       if(err) throw err;
