@@ -195,6 +195,27 @@ createDecoder(bytes, { backend: 'auto' });            // same option; also on de
 With no WebCodecs at all (e.g. Node), `'auto'` resolves to WASM. Rebuild the WASM artifacts with
 `npm run build:wasm` (needs an activated Emscripten SDK).
 
+### `realtime`: trading archival bytes for encode speed
+
+```javascript
+createEncoder({ W, H, signals, realtime: true });
+await encode({ W, H, signals, frames, realtime: true });
+```
+
+By default every track is encoded GOOD_QUALITY at the codec's default speed step — the archival
+profile: smallest bytes for the time spent, on the assumption a batch/offline encode is watched,
+not raced. Live-capture streaming encoders (native `dc_stream_*`, WurldCam) already run the
+opposite profile — REALTIME deadline, fastest speed step — because they're racing a sensor's frame
+budget instead (see CHANGELOG.md 0.11.0). `realtime: true` opts *this* encoder into that same
+profile, for callers who are frame-budget bound even though they're not live-capturing — for
+example, encoding per-frame render AOVs (depth, object ID) where wall-clock matters more than file
+size.
+
+Signal tracks are unaffected in fidelity: `VP9E_SET_LOSSLESS` makes reconstruction bit-exact at
+every speed step, so `realtime` only trades a few percent more bytes for the time. An RGB track
+does lose picture quality at a given bitrate under REALTIME — raise `rgbKbps` to compensate if you
+enable it there too.
+
 ---
 
 ## Python (`python/chromapakz`)

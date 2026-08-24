@@ -5,11 +5,11 @@
 export const CODEC = 'vp09.00.10.08';
 
 /**
- * @param {{lossless:boolean, W:number, H:number, fps?:number, bitrate?:number}} o
+ * @param {{lossless:boolean, W:number, H:number, fps?:number, bitrate?:number, realtime?:boolean}} o
  * @returns {VideoEncoderConfig}
  */
-export function encoderConfig({ lossless, W, H, fps=30, bitrate }){
-  const cfg = { codec:CODEC, width:W, height:H, framerate:fps, latencyMode:'quality' };
+export function encoderConfig({ lossless, W, H, fps=30, bitrate, realtime=false }){
+  const cfg = { codec:CODEC, width:W, height:H, framerate:fps, latencyMode: realtime ? 'realtime' : 'quality' };
   if(lossless) cfg.bitrateMode='quantizer';
   else cfg.bitrate=bitrate||2_000_000;
   return cfg;

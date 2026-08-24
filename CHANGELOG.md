@@ -4,6 +4,35 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.12.0 — 2026-08-24
+
+### Added — `realtime` opts a batch/streaming encode into the fast profile too
+
+`createEncoder`/`encode` (browser `chromapakz.js`) take a new `realtime` option. Off (the
+default), every track keeps the 0.11.0 archival profile: GOOD_QUALITY at the codec's default
+speed step. On, every track — RGB and signals alike — encodes with the REALTIME deadline at the
+fastest speed step, the same profile the live-capture streaming encoders already use.
+
+This is for callers who are frame-budget bound without being live capture: per-frame render AOVs
+(depth, object ID) encoded through the npm package, where wall-clock is what's optimized and the
+bytes are disposable rather than archival — exactly the batch case the 0.11.0 entry below
+deliberately left alone. A downstream caller measured the WASM fallback path (720p depth signal)
+going from ~12s/clip at the default GOOD_QUALITY profile to well under 1s with `realtime:true`.
+Signal tracks stay bit-exact regardless (`VP9E_SET_LOSSLESS` fixes reconstruction at every speed
+step, so this only trades a few percent more bytes for the time); an RGB track does lose picture
+quality at a given bitrate — raise `rgbKbps` if you turn it on there too. See docs/API.md.
+
+Ships as source for now: the WASM fallback's speed-step change lives in `native/wasm/dc_vp9.cpp`,
+which needs `npm run build:wasm` (Emscripten) re-run before `src/backend/wasm/vp9-encode.wasm`
+picks it up — `scripts/check-wasm-fresh.sh` / `.github/workflows/wasm.yml` catch and rebuild it.
+
+### Added — TypeScript declarations for the browser library's main entry
+
+`src/chromapakz.d.ts` types every export of `chromapakz` (createEncoder/encode, createDecoder/
+decode, the quant/pack helpers, and the re-exported webm.js/signals.js utilities), wired up via
+package.json's `types` field and the `"."` export's `types` condition. A consumer under a
+`no-explicit-any` lint rule no longer has to widen this import to `any` to use it.
+
 ## 0.11.0 — 2026-08-12
 
 Streaming encodes now run a realtime profile; batch encodes are unchanged.

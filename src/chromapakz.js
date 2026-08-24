@@ -147,8 +147,14 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
  * @param rgbs — declare multiple RGB streams (stereo / multi-camera): an array of stream ids or
  *   `{ id, kbps? }` entries, order fixing track numbers. Mutually exclusive with hasRgb. Frames
  *   then carry `rgbs: { id: plane }` (`rgb:` stays sugar for the first stream).
+ * @param realtime — encode every track (RGB and signals alike) with the REALTIME deadline at the
+ *   fastest speed step, the same profile the live-capture streaming encoders use, instead of the
+ *   default GOOD_QUALITY archival profile. Signal tracks stay bit-exact either way — lossless
+ *   coding is unaffected by the speed step — so this only costs a few percent more bytes there;
+ *   an RGB track also loses picture quality at a given bitrate (raise rgbKbps to compensate).
+ *   Default false. See CHANGELOG.md 0.11.0 for the streaming case this mirrors.
  */
-export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, rgbs=null, textTrack=null, hdr=null }){
+export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, rgbs=null, textTrack=null, hdr=null, realtime=false }){
   const specList=resolveSignalSpecs(signals);
   if(hdr!==null)
     throw new Error('createEncoder: HDR display tracks are not supported by the browser encoder '
@@ -218,8 +224,8 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
       const be=await losslessBackend();
       const sw=s.width ?? W, sh=s.height ?? H;
       return sigEnc[s.id]={
-        hi: be.createTrackEncoder({ kind:'luma', lossless:true, W: sw, H: sh, fps, keyEvery:rgbKeyEvery }),
-        lo: be.createTrackEncoder({ kind:'luma', lossless:true, W: sw, H: sh, fps, keyEvery:rgbKeyEvery }),
+        hi: be.createTrackEncoder({ kind:'luma', lossless:true, W: sw, H: sh, fps, keyEvery:rgbKeyEvery, realtime }),
+        lo: be.createTrackEncoder({ kind:'luma', lossless:true, W: sw, H: sh, fps, keyEvery:rgbKeyEvery, realtime }),
       };
     })();
   }
@@ -229,7 +235,7 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
       const be=await lossyBackend();
       return rgbEnc[r.id]=be.createTrackEncoder({
         kind:'rgba', lossless:false, W: r.width ?? W, H: r.height ?? H, fps,
-        bitrate: r.kbps ?? rgbKbps, keyEvery:rgbKeyEvery });
+        bitrate: r.kbps ?? rgbKbps, keyEvery:rgbKeyEvery, realtime });
     })();
   }
 
@@ -464,14 +470,14 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   }
 }
 
-export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000, rgbs=null, onChunk=null }){
+export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000, rgbs=null, onChunk=null, realtime=false }){
   if(!signals?.length) throw new Error('encode: signals[] required');
   if(!frames?.length) throw new Error('encode: frames[] required');
   if(rgbs===null && frames.some(f=>f.rgbs && Object.keys(f.rgbs).length))
     throw new Error('encode: frames carry named rgb streams — declare them with encode({ rgbs:[...] })');
   // Every frame is known here, so RGB presence is declared rather than inferred from frame 0 —
   // a clip whose RGB starts mid-sequence plans its track numbers correctly.
-  const enc=createEncoder({ W, H, fps, signals, rgbKbps, onChunk,
+  const enc=createEncoder({ W, H, fps, signals, rgbKbps, onChunk, realtime,
     ...(rgbs!==null ? { rgbs } : { hasRgb: frames.some(f=>!!f.rgb) }) });
   for(const fr of frames) await enc.addFrame(fr);
   return enc.finish();

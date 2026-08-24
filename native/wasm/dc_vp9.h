@@ -23,7 +23,11 @@ typedef struct dcvp9_enc dcvp9_enc;
 // kind: 0 = luma (8-bit Y plane, lossless QP=0 — for signal tracks)
 //       1 = rgba (RGBA in, lossy VP9 at `bitrate_kbps`, BT.709 full-range — for the RGB track)
 // key_every: force a keyframe every N frames (lossy only; <=0 ⇒ keyframe on frame 0 only).
-dcvp9_enc* dcvp9_enc_new(int W, int H, int fps, int kind, int bitrate_kbps, int key_every);
+// fast: 0 = GOOD_QUALITY deadline at the default speed step (archival: smallest bytes for the
+//       time spent) — 1 = the REALTIME deadline at the fastest speed step, trading bytes (lossy:
+//       also picture quality) for encode time. Mirrors the profile native/chromapakz.cpp already
+//       uses for live capture; see its TrackEncoder::init() for the measurements.
+dcvp9_enc* dcvp9_enc_new(int W, int H, int fps, int kind, int bitrate_kbps, int key_every, int fast);
 
 // Encode one frame (luma: W*H bytes; rgba: W*H*4 bytes). force_key requests a keyframe.
 // Returns 0 on success. Resulting packet(s) are queued; pull with dcvp9_enc_next().
