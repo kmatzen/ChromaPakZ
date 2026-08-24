@@ -47,6 +47,7 @@ struct dcvp9_enc {
   int W, H, fps, kind, key_every;
   long idx=0;                 // frame counter → pts + time_ms
   bool ok=true;
+  bool fast=false;            // REALTIME deadline + fastest speed step, vs GOOD_QUALITY + default
   vpx_codec_ctx_t ctx{};
   vpx_image_t img{};
   std::deque<Packet> out;
@@ -55,11 +56,11 @@ struct dcvp9_enc {
 
 extern "C" {
 
-dcvp9_enc* dcvp9_enc_new(int W, int H, int fps, int kind, int bitrate_kbps, int key_every){
+dcvp9_enc* dcvp9_enc_new(int W, int H, int fps, int kind, int bitrate_kbps, int key_every, int fast){
   if(W<=0||H<=0) return nullptr;
   if(fps<=0) fps=30;
   auto* e=new dcvp9_enc();
-  e->W=W; e->H=H; e->fps=fps; e->kind=kind;
+  e->W=W; e->H=H; e->fps=fps; e->kind=kind; e->fast=!!fast;
   e->key_every = (kind==1) ? (key_every>0?key_every:fps) : 0;  // luma: keyframe only on frame 0
 
   vpx_codec_iface_t* iface=vpx_codec_vp9_cx();
@@ -77,9 +78,14 @@ dcvp9_enc* dcvp9_enc_new(int W, int H, int fps, int kind, int bitrate_kbps, int 
     // Gate on lossless: a libvpx that rejects this control would encode the packed signal planes
     // lossy while the container metadata still claims "lossless":true. Fail the encoder instead.
     if(vpx_codec_control(&e->ctx, VP9E_SET_LOSSLESS, 1)){ e->ok=false; return e; }
-    vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, 1);   // speed only
+    // Speed-only either way (VP9E_SET_LOSSLESS makes reconstruction bit-exact at every step, as
+    // in native/chromapakz.cpp): `fast` trades encode time for a few percent more bytes, never
+    // fidelity, so it costs nothing a caller who asked for it would not accept.
+    vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, e->fast ? 9 : 1);
   }else{
-    vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, 2);
+    // Lossy, so `fast` trades picture quality too — see native/chromapakz.cpp's realtime profile
+    // for the measured tradeoff. Only a caller that opted in gets it.
+    vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, e->fast ? 8 : 2);
     vpx_codec_control(&e->ctx, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
   }
   vpx_codec_control(&e->ctx, VP9E_SET_COLOR_RANGE, VPX_CR_FULL_RANGE);
@@ -112,7 +118,8 @@ int dcvp9_enc_encode(dcvp9_enc* e, const uint8_t* plane, int force_key){
   }
   bool key = force_key || e->idx==0 || (e->key_every>0 && (e->idx % e->key_every)==0);
   vpx_enc_frame_flags_t fl = key ? VPX_EFLAG_FORCE_KF : 0;
-  if(vpx_codec_encode(&e->ctx, &e->img, (vpx_codec_pts_t)e->idx, 1, fl, VPX_DL_GOOD_QUALITY)){ e->ok=false; return 2; }
+  unsigned long deadline = e->fast ? VPX_DL_REALTIME : VPX_DL_GOOD_QUALITY;
+  if(vpx_codec_encode(&e->ctx, &e->img, (vpx_codec_pts_t)e->idx, 1, fl, deadline)){ e->ok=false; return 2; }
   e->idx++;
   enc_drain(e);
   return 0;
@@ -120,7 +127,8 @@ int dcvp9_enc_encode(dcvp9_enc* e, const uint8_t* plane, int force_key){
 
 int dcvp9_enc_flush(dcvp9_enc* e){
   if(!e||!e->ok) return 1;
-  if(vpx_codec_encode(&e->ctx, nullptr, (vpx_codec_pts_t)e->idx, 1, 0, VPX_DL_GOOD_QUALITY)) return 2;
+  unsigned long deadline = e->fast ? VPX_DL_REALTIME : VPX_DL_GOOD_QUALITY;
+  if(vpx_codec_encode(&e->ctx, nullptr, (vpx_codec_pts_t)e->idx, 1, 0, deadline)) return 2;
   enc_drain(e);
   return 0;
 }

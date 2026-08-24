@@ -9,7 +9,7 @@ const getModule = () => (modP ??= Module());
 
 export const id = 'wasm-encode';
 
-export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, keyEvery=Infinity }){
+export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, keyEvery=Infinity, realtime=false }){
   const cKind = kind==='rgba' ? 1 : 0;
   const kbps = Math.max(1, Math.round((bitrate||2_000_000)/1000));   // bitrate is bps; C wants kbps
   const keyEveryC = Number.isFinite(keyEvery) ? keyEvery : 0;        // 0 ⇒ keyframe on frame 0 only
@@ -22,7 +22,7 @@ export function createTrackEncoder({ kind='luma', lossless, W, H, fps, bitrate, 
   function ensure(){
     return readyP ??= (async()=>{
       const m = await getModule();
-      const h = m._dcvp9_enc_new(W, H, fps, cKind, kbps, keyEveryC);
+      const h = m._dcvp9_enc_new(W, H, fps, cKind, kbps, keyEveryC, realtime?1:0);
       if(!h) throw new Error('dcvp9_enc_new failed');
       mod = m; handle = h;
       inPtr = m._malloc(planeBytes);
