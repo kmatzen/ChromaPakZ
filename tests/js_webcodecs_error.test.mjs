@@ -122,3 +122,16 @@ test('probe/production config parity', async () => {
 
 });
 
+test('realtime:true selects the REALTIME latencyMode, off by default', async () => {
+    MODE='immediate';
+    configs.length=0;
+    const def=createTrackEncoder({ kind:'luma', lossless:true, W, H, fps:FPS });
+    await def.push(plane()); await def.close();
+    assert.equal(configs[0].latencyMode, 'quality', 'default: quality (archival) latencyMode');
+
+    configs.length=0;
+    const fast=createTrackEncoder({ kind:'luma', lossless:true, W, H, fps:FPS, realtime:true });
+    await fast.push(plane()); await fast.close();
+    assert.equal(configs[0].latencyMode, 'realtime', 'realtime:true: realtime latencyMode');
+});
+

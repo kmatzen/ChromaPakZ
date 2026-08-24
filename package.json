@@ -1,13 +1,17 @@
 {
   "name": "chromapakz",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Lossless RGB + bit-exact auxiliary signals (depth, object IDs, …) in one WebM (VP9). WebCodecs in the browser, with a per-operation WASM (libvpx) fallback.",
   "type": "module",
   "sideEffects": false,
   "main": "./src/chromapakz.js",
   "module": "./src/chromapakz.js",
+  "types": "./src/chromapakz.d.ts",
   "exports": {
-    ".": "./src/chromapakz.js",
+    ".": {
+      "types": "./src/chromapakz.d.ts",
+      "default": "./src/chromapakz.js"
+    },
     "./signals": "./src/signals.js",
     "./webm": "./src/webm.js",
     "./core": "./src/chromapakz-core.js",

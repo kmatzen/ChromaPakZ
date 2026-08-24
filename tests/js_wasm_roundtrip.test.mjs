@@ -46,3 +46,19 @@ test('wasm backend: uint16 signal survives encode -> decode bit-exactly', async 
   }
   console.log(`wasm round-trip: ${N} frames, ${W}x${H}, ${bytes.length} bytes — bit-exact`);
 });
+
+test('wasm backend: realtime:true stays bit-exact (lossless is speed-step invariant)', async () => {
+  const seq = makeSeq();
+  const enc = createEncoder({ W, H, fps: 30, signals: [{ id: 'raw' }], backend: 'wasm', realtime: true });
+  for (const u16 of seq) await enc.addFrame({ signals: { raw: { u16 } } });
+  const bytes = await enc.finish();
+
+  const dec = createDecoder(bytes, { backend: 'wasm' });
+  const out = [];
+  for await (const frame of dec) out.push(frame.signals.raw.u16);
+  await dec.close();
+
+  assert.equal(out.length, N, 'frame count');
+  for (let i = 0; i < N; i++)
+    assert.ok(out[i].every((v, k) => v === seq[i][k]), `realtime frame ${i} not bit-exact`);
+});
