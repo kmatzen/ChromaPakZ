@@ -4,6 +4,16 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## 0.12.1 — 2026-09-28
+
+### Added — prebuilt wheels for musl-based Linux
+
+PyPI now carries `musllinux_1_2` wheels for x86_64 and aarch64 alongside the existing
+`manylinux_2_28` wheels, across CPython 3.9–3.14. Alpine users therefore install the same tested,
+self-contained native core as glibc-based Linux users instead of compiling libvpx and ChromaPakZ
+locally. Release publishing is gated on the complete 30-wheel matrix, and scheduled CI exercises
+both Linux libc families before release day.
+
 ## 0.12.0 — 2026-08-24
 
 ### Added — `realtime` opts a batch/streaming encode into the fast profile too
