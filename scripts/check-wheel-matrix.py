@@ -20,7 +20,14 @@ def wheel_key(path: Path) -> tuple[str, str]:
     match = re.search(r"-(cp3\d+)-[^-]+-([^-]+)\.whl$", path.name)
     if not match:
         raise ValueError(f"cannot read wheel tags from {path.name}")
-    return match.group(1), match.group(2)
+    python, platform_tag = match.groups()
+    # auditwheel can emit a dot-separated compatibility tag such as
+    # manylinux_2_27_x86_64.manylinux_2_28_x86_64. Treat the wheel as covering our declared
+    # target when exactly one component is in the release matrix.
+    supported = [platform for platform in platform_tag.split(".") if platform in PLATFORMS]
+    if len(supported) != 1:
+        raise ValueError(f"{path.name} matches {len(supported)} supported platform tags")
+    return python, supported[0]
 
 
 def main() -> int:
