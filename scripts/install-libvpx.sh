@@ -53,9 +53,14 @@ fi
 PM=""
 command -v dnf >/dev/null 2>&1 && PM=dnf
 [ -z "$PM" ] && command -v yum >/dev/null 2>&1 && PM=yum
+[ -z "$PM" ] && command -v apk >/dev/null 2>&1 && PM=apk
 # EPEL provides yasm on EL; install deps individually so a single missing package doesn't abort the
 # whole transaction (and leave us with no assembler — libvpx needs nasm or yasm).
-if [ -n "$PM" ]; then
+if [ "$PM" = "apk" ]; then
+  # musllinux images are Alpine-based. build-base supplies make/gcc/g++, and pkgconf provides the
+  # pkg-config command expected by both this script and CMake.
+  apk add --no-cache build-base pkgconf curl tar nasm >/dev/null
+elif [ -n "$PM" ]; then
   for p in pkgconfig epel-release; do $PM install -y "$p" >/dev/null 2>&1 || true; done
 fi
 
@@ -76,7 +81,7 @@ if pkg-config --exists vpx; then
 fi
 
 echo "building libvpx from source"
-if [ -n "$PM" ]; then
+if [ -n "$PM" ] && [ "$PM" != "apk" ]; then
   for p in make gcc gcc-c++ curl tar nasm yasm; do $PM install -y "$p" >/dev/null 2>&1 || true; done
 fi
 # aarch64 libvpx needs no x86 assembler; only gate on one when the target actually requires it.
