@@ -56,10 +56,14 @@ version present on one registry has to mean the same commit on the other:
 |---|---|---|
 | Linux `x86_64` | `manylinux_2_28` | `ubuntu-latest` |
 | Linux `aarch64` | `manylinux_2_28` | `ubuntu-24.04-arm` (native arm64 — no QEMU) |
+| Linux `x86_64` (musl/Alpine) | `musllinux_1_2` | `ubuntu-latest` |
+| Linux `aarch64` (musl/Alpine) | `musllinux_1_2` | `ubuntu-24.04-arm` (native arm64 — no QEMU) |
 | macOS `arm64`, 13.0+ | `macosx_13_0_arm64` | `macos-latest` |
 
-Not built: macOS `x86_64`, Windows, musllinux, and 32-bit Linux (`manylinux_2_28` has no i686
-image) — those fall back to a source build from the sdist. `archs = "auto64"` in `pyproject.toml`
+That is 30 wheels per release: six CPython versions across five platform/architecture targets.
+The release refuses to publish if any combination is missing. Not built: macOS `x86_64`, Windows,
+and 32-bit Linux (`manylinux_2_28` has no i686 image) — those fall back to a source build from the
+sdist. `archs = "auto64"` in `pyproject.toml`
 states the 64-bit-only intent rather than inheriting whatever cibuildwheel's `auto` means in a
 given release.
 
@@ -171,5 +175,9 @@ libvpx too (`install-libvpx.sh` configures for `uname -m`), and cibuildwheel can
   x86_64 is not.
 - **Linux aarch64** uses the native `ubuntu-24.04-arm` runner rather than QEMU — emulating a from-source
   libvpx build costs hours. If that runner label changes, update the `wheels` matrix in `release.yml`.
+- **musllinux** uses Alpine-based build containers. `install-libvpx.sh` installs its toolchain with
+  `apk` and builds the same static, PIC, high-bit-depth libvpx used by the glibc wheels. The weekly
+  wheel dry-run builds one CPython version for both manylinux and musllinux so provisioning failures
+  surface before release day.
 - Windows wheels are not configured (libvpx on MSVC is fiddly); add a `[tool.cibuildwheel.windows]`
   `before-all` (e.g. vcpkg) when needed.

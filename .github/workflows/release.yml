@@ -65,7 +65,8 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-24.04-arm is a native arm64 runner — manylinux aarch64 wheels without QEMU
-        # emulation (which would make the from-source libvpx build take hours).
+        # emulation (which would make the from-source libvpx build take hours). Each Linux runner
+        # builds both manylinux (glibc) and musllinux (musl/Alpine) wheels.
         #
         # macOS is arm64 only, and not by choice: macos-13 was the last Intel image and GitHub
         # retired it in December 2025. The label still resolves, so a job requesting it queues
@@ -84,6 +85,22 @@ jobs:
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
+
+  wheel-matrix:
+    name: verify complete wheel matrix
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: wheelhouse
+          merge-multiple: true
+      # 6 CPython versions x (manylinux + musllinux on two architectures, plus macOS arm64).
+      # This prevents a green partial matrix from silently publishing after one build selector
+      # or artifact path changes.
+      - run: python scripts/check-wheel-matrix.py wheelhouse
 
   sdist:
     needs: [version-guard]
@@ -114,7 +131,7 @@ jobs:
   # permanent.
   publish:
     name: publish to PyPI
-    needs: [wheels, sdist, publish-npm]
+    needs: [wheel-matrix, sdist, publish-npm]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi                 # configure a GitHub Environment named "pypi"
@@ -137,7 +154,7 @@ jobs:
   # published would leave a version on one registry that can never exist on the other.
   publish-npm:
     name: publish to npm
-    needs: [wheels, sdist]
+    needs: [wheel-matrix, sdist]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: npm                  # configure a GitHub Environment named "npm"

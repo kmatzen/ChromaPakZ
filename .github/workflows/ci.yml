@@ -235,13 +235,17 @@ jobs:
           /tmp/sdistenv/bin/chromapakz-ingest --help > /dev/null
 
   wheels-dry-run:
-    name: cibuildwheel dry-run (libvpx provisioning)
+    name: cibuildwheel dry-run (${{ matrix.platform }} provisioning)
     # A broken scripts/install-libvpx.sh or a runner-image bump used to be discovered mid-release,
     # because cibuildwheel only ran on `release: published`. One representative build, weekly.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [manylinux, musllinux]
     steps:
       - uses: actions/checkout@v4
-      - uses: pypa/cibuildwheel@v2.21
+      - uses: pypa/cibuildwheel@v4.1
         env:
-          CIBW_BUILD: cp312-manylinux_x86_64
+          CIBW_BUILD: cp312-${{ matrix.platform }}_x86_64
