@@ -74,7 +74,9 @@ export interface CreateEncoderOptions {
   /** Called with each WebM chunk as it becomes final — network/streaming mode. Omit to buffer. */
   onChunk?: ((chunk: Uint8Array) => void) | null;
   backend?: 'auto' | 'webcodecs' | 'wasm';
-  /** Reserve a single default RGB track up front. Mutually exclusive with `rgbs`. */
+  /** Reserve a single default RGB track up front. Mutually exclusive with `rgbs`. Declaring it is
+   *  what makes `signals: []` legal (an RGB-only container); with no declared RGB track an empty
+   *  `signals` is refused, since the file would carry no tracks at all. */
   hasRgb?: boolean | null;
   /** Declare multiple/named RGB streams up front. Mutually exclusive with `hasRgb`. */
   rgbs?: RgbSpec[] | null;

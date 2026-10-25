@@ -102,5 +102,54 @@ test('batch encode() sees every frame, so it declares rgb itself', async () => {
 
 });
 
+test('signals:[] is legal when an RGB track is declared (RGB-only container)', async () => {
+    const enc=createEncoder({ W, H, fps:30, signals:[], backend:BACKEND, hasRgb:true });
+    await enc.addFrame({ rgb: rgba(0) });
+    await enc.addFrame({ rgb: rgba(1) });
+    const bytes=await enc.finish();
+
+    const meta=normalizeMetadata(demux(bytes).metadata);
+    assert.deepEqual(meta.signals, [], 'RGB-only container declares no signal tracks');
+    assert.equal(meta.rgb?.track, 1, 'rgb keeps track 1');
+
+    const dec=createDecoder(bytes, { backend:BACKEND });
+    assert.equal(dec.frameCount, 2, 'both frames round-trip');
+    const f0=await dec.readFrame();
+    assert.equal(f0?.rgb?.length, W*H*4, 'rgb decodes');
+    assert.deepEqual(Object.keys(f0?.signals ?? {}), [], 'no signals on the decoded frame');
+    assert.ok(await dec.readFrame(), 'frame 1 decodes');
+    assert.equal(await dec.readFrame(), null, 'stream ends');
+    await dec.close();
+});
+
+test('named rgbs[] declare the track too; an empty declaration does not', async () => {
+    const enc=createEncoder({ W, H, fps:30, signals:[], backend:BACKEND, rgbs:[{ id:'rgb' }] });
+    await enc.addFrame({ rgb: rgba(0) });
+    assert.ok((await enc.finish()).length>0, 'rgbs:[{id}] satisfies signals[] for an RGB-only file');
+
+    assert.throws(() => createEncoder({ W, H, fps:30, signals:[], backend:BACKEND, rgbs:[] }),
+      /signals\[\] required/, 'rgbs:[] declares zero tracks, so signals[] is still required');
+});
+
+test('signals:[] is still refused when nothing declares an RGB track', async () => {
+    assert.throws(() => createEncoder({ W, H, fps:30, signals:[], backend:BACKEND }),
+      /signals\[\] required/, 'omitted hasRgb infers nothing at create time');
+    assert.throws(() => createEncoder({ W, H, fps:30, signals:[], backend:BACKEND, hasRgb:false }),
+      /signals\[\] required/, 'hasRgb:false declares no track');
+    await rejects(()=>encode({ W, H, fps:30, signals:[], frames:[{ signals:{} }] }),
+      /signals\[\] required/, 'encode(): neither signals nor rgb declares a track');
+});
+
+test('batch encode() accepts an RGB-only clip', async () => {
+    const bytes=await encode({ W, H, fps:30, signals:[], frames:[{ rgb: rgba(0) }, { rgb: rgba(1) }] });
+    const meta=normalizeMetadata(demux(bytes).metadata);
+    assert.deepEqual(meta.signals, [], 'encode(): no signal tracks');
+    assert.equal(meta.rgb?.track, 1, 'encode(): rgb planned on track 1');
+
+    const dec=createDecoder(bytes, { backend:BACKEND });
+    assert.equal(dec.frameCount, 2, 'encode(): both frames round-trip');
+    await dec.close();
+});
+
 console.log('all passed');
 

@@ -46,9 +46,9 @@ export {
 // libvpx fallback), selected per operation by src/backend/select.js. Tracks are described by
 // `kind`: 'luma' (8-bit Y plane, lossless for signals) or 'rgba' (lossy preview RGB).
 
-function resolveSignalSpecs(signals){
-  if(!signals?.length) throw new Error('createEncoder: signals[] required');
-  return signals;
+function resolveSignalSpecs(signals, hasRgbTrack){
+  if(!signals?.length && !hasRgbTrack) throw new Error('createEncoder: signals[] required');
+  return signals ?? [];
 }
 
 function makeFrameReader({ meta, W, H, blocks, getBackend }){
@@ -155,7 +155,6 @@ function makeFrameReader({ meta, W, H, blocks, getBackend }){
  *   Default false. See CHANGELOG.md 0.11.0 for the streaming case this mirrors.
  */
 export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChunk=null, backend='auto', hasRgb=null, rgbs=null, textTrack=null, hdr=null, realtime=false }){
-  const specList=resolveSignalSpecs(signals);
   if(hdr!==null)
     throw new Error('createEncoder: HDR display tracks are not supported by the browser encoder '
       + '— encode HDR with the native/Python encoder; browsers play the result in <video>');
@@ -167,6 +166,8 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
   const declaredRgbs = rgbs!==null ? normalizeRgbSpecs(rgbs)
     : hasRgb===null ? null
     : hasRgb ? [{ id: DEFAULT_RGB_ID, kbps: null }] : [];
+  // A declared RGB track is a track, so an otherwise-empty signals[] still yields a real container.
+  const specList=resolveSignalSpecs(signals, declaredRgbs!==null && declaredRgbs.length>0);
   let n=0, sawDefaultRgb=false;
   let signalPlan=null, rgbPlan=null;  // frozen together: track numbers derive from both
   const rgbEnc={};  // rgb stream id → encoder          (resolved; read synchronously by finish())
@@ -471,8 +472,10 @@ export function createEncoder({ W, H, fps=30, signals, rgbKbps=2_000_000, onChun
 }
 
 export async function encode({ W, H, fps=30, signals, frames, rgbKbps=2_000_000, rgbs=null, onChunk=null, realtime=false }){
-  if(!signals?.length) throw new Error('encode: signals[] required');
   if(!frames?.length) throw new Error('encode: frames[] required');
+  // frames carrying rgb declare the RGB track, and that alone satisfies the signals[] contract.
+  if(!signals?.length && rgbs===null && !frames.some(f=>!!f.rgb))
+    throw new Error('encode: signals[] required (frames declare no rgb track)');
   if(rgbs===null && frames.some(f=>f.rgbs && Object.keys(f.rgbs).length))
     throw new Error('encode: frames carry named rgb streams — declare them with encode({ rgbs:[...] })');
   // Every frame is known here, so RGB presence is declared rather than inferred from frame 0 —
