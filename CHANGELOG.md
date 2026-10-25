@@ -4,6 +4,16 @@ Notable changes per release. Versions are shared by the Python package (PyPI `ch
 browser library (npm `chromapakz`), which are cut from the same tag — so a version present on one
 registry means the same commit on the other.
 
+## Unreleased
+
+### Added — RGB-only containers
+
+`createEncoder({ signals: [], hasRgb: true })` (and `encode()` over frames that carry rgb) now
+produces a container with just an RGB track. It used to throw `signals[] required`, so a caller
+needing a plain video track — a color-guidance or preview clip — had no way to encode one and had
+to pad the file with a dummy signal. An empty `signals` is still refused when nothing declares an
+RGB track, since such a file would carry no tracks at all.
+
 ## 0.12.1 — 2026-09-28
 
 ### Added — prebuilt wheels for musl-based Linux
