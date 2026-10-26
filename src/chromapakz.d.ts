@@ -127,7 +127,7 @@ export interface EncodeOptions {
   realtime?: boolean;
 }
 
-/** Batch helper: encode every frame in one call. Requires explicit `signals` and `frames`. */
+/** Batch helper: encode every frame in one call. Requires `frames`; `signals` may be empty when a frame carries `rgb`. */
 export function encode(options: EncodeOptions): Promise<Uint8Array>;
 
 export interface DecodedSignal {
