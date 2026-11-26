@@ -57,8 +57,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.12"]
         include:
-          # requires-python is >=3.9 and wheels build cp39–cp313; cover both ends of that range.
-          - os: ubuntu-latest
+          # requires-python is >=3.9 and wheels build cp39–cp313; cover both ends of that range. The
+          # 3.9 end pins ubuntu-24.04: GitHub's Python manifest ships no 3.9 build for Ubuntu 26.04.
+          - os: ubuntu-24.04
             python: "3.9"
           - os: ubuntu-latest
             python: "3.13"
@@ -139,7 +140,8 @@ jobs:
       fail-fast: false
       matrix:
         engine: [chromium, firefox, webkit]
-    runs-on: ubuntu-latest
+    # Playwright has no ubuntu26.04-x64 build yet, so its install step fails; pin the supported image.
+    runs-on: ubuntu-24.04
     # All three gate. firefox/webkit were advisory only because they had never run here; they have
     # now, green, on every run of this branch — and they are the engines that actually exercise the
     # fallback (under backend:'auto' both fetch vp9-encode.wasm *and* vp9-decode.wasm, where
@@ -167,7 +169,8 @@ jobs:
 
   webcodecs:
     name: in-browser VP9 lossless (Chromium WebCodecs)
-    runs-on: ubuntu-latest
+    # Same Playwright/Ubuntu 26.04 gap as the vite browser job above.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
